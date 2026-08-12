@@ -28,6 +28,22 @@ Client ID**, **Certificate ID**.
 
 ---
 
+## Repository layout — read this before cloning or troubleshooting
+
+The working tree lives in the OneDrive-synced `PO Agent` folder, but **`.git` is a FILE, not a directory.** It contains one line:
+
+```
+gitdir: C:/dev/po-agent.git
+```
+
+Created with `git init --separate-git-dir "C:\dev\po-agent.git"` so the git database stays **outside** OneDrive — syncing git internals mid-write is a known corruption risk. Everything behaves normally from inside the folder (`git status`, `git log`, `git push`), but **it looks broken if you don't know this**: anything that tests for a `.git` *directory* will report "not a repository", and deleting that small file orphans the history (recoverable — recreate it with the same line).
+
+Remote: `https://github.com/Straight-Down/po-agent-pipeline.git`, **private, and it must stay private** — the tracked vendor corpus contains real supplier pricing, a named inspector and customer contact details. `.gitattributes` marks pdf/xlsx/png/docx as binary; without it Git's text heuristic rewrites a generated PDF's bytes on checkout and silently invalidates the validation corpus.
+
+The secrets this document produces — the private key and the API key — are **not** in the repository and are covered by `.gitignore` patterns as defence in depth. They live at `%USERPROFILE%\.po-agent\`.
+
+---
+
 ## Step 1 — Enable the features
 
 **Setup > Company > Enable Features > SuiteCloud** subtab.

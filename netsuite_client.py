@@ -215,6 +215,17 @@ class NetSuiteConfig:
 
     @property
     def suiteql_url(self) -> str:
+        """
+        SuiteQL endpoint. NOT used by `resolve_po_internal_id` -- the SuiteQL
+        fallback was removed once the `?q=` path was confirmed working. Kept
+        because SuiteQL is available to this role (the same SuiteAnalytics
+        Workbook permission gates it) and may be useful for future reporting reads.
+
+        If you do use it: NetSuite's SuiteQL REST endpoint does NOT support
+        parameter binding -- sending {"q": "... = ?", "params": [...]} returns
+        400 INVALID_CONTENT. That mistake is what made the old fallback fail in a
+        misleading way. Do not work around it with string interpolation.
+        """
         return f"https://{self.host}/services/rest/query/v1/suiteql"
 
     @classmethod
@@ -585,24 +596,25 @@ class NetSuiteClient:
 
     def resolve_po_internal_id(self, po_number: str) -> str:
         """
-        Map a human PO number (tranId, e.g. "1662") to its internal record id
-        (e.g. "8489541").
+        Map a PO's `tranId` to its internal record id (e.g. "PO0001662" -> "8489541").
 
-        *** KNOWN BLOCKER FOR PHASE 2 (found 2026-08-04) ***
-        Every strategy below hits a record COLLECTION endpoint, and the
-        least-privilege "PO Update" role is refused those -- see
-        `probe_collection_listing`. Phase 1 does not care (its write path is
-        given an internal id directly), but this must be resolved with a
-        NetSuite admin before Phase 2 can match parsed vendor lines to POs by
-        PO number. Do not widen the role to fix it without checking first.
+        **This takes a tranId, not a bare vendor PO number.** Vendor packing slips
+        print `1662`; NetSuite stores `PO0001662`, and `?q=tranId IS "1662"`
+        returns 200 with zero matches -- it executes correctly and matches
+        nothing. Turning a printed PO number into a tranId is a separate
+        format-transformation problem, deliberately not solved here: the prefix
+        and digit padding come from Setup > Company > Auto-Generated Numbers and
+        must be read from that setup rather than inferred from one sample. See
+        RUNBOOK section 6 for the open item.
 
-        The exact accepted quoting for the record-collection `q=` parameter
-        isn't something we could verify without live credentials, so try the
-        documented form, then the unquoted variant, then SuiteQL. Whichever
-        works is recorded in `last_lookup_strategy` so the first live run
-        settles it for good. SuiteQL is last because it can require additional
-        permissions beyond REST Web Services, which would muddy the
-        least-privilege-role finding this phase is trying to establish.
+        Both `q=` quoting forms are confirmed working and equivalent (each returns
+        totalResults=1 for PO0001662), so quoting is optional. The quoted form is
+        tried first and whichever succeeds is recorded in `last_lookup_strategy`.
+
+        Requires `Reports > SuiteAnalytics Workbook` on the role: that permission
+        gates every record COLLECTION endpoint, `?q=` filtering included. Without
+        it this returns 400 USER_ERROR while single-record GET/PATCH by internal
+        id keeps working -- that asymmetry is the diagnostic signature.
         """
         if po_number in self._po_id_cache:
             return self._po_id_cache[po_number]
@@ -611,7 +623,6 @@ class NetSuiteClient:
         attempts = [
             ("record q= (quoted)", lambda: self._lookup_via_record_query(f'tranId IS "{po_number}"')),
             ("record q= (unquoted)", lambda: self._lookup_via_record_query(f"tranId IS {po_number}")),
-            ("suiteql", lambda: self._lookup_via_suiteql(po_number)),
         ]
 
         errors = []
@@ -632,8 +643,12 @@ class NetSuiteClient:
             errors.append(f"{label}: no match")
 
         raise NetSuiteError(
-            f"Could not resolve PO number {po_number!r} to an internal id in account {config.account_id}.\n"
+            f"Could not resolve tranId {po_number!r} to an internal id in account "
+            f"{config.account_id}.\n"
             + "\n".join(f"  - {e}" for e in errors)
+            + "\n\nIf this was a bare vendor PO number (e.g. '1662'), it is not a tranId -- "
+            "NetSuite stores these prefixed and zero-padded (e.g. 'PO0001662'), so the query "
+            "will execute and match nothing. See RUNBOOK section 6."
         )
 
     def _lookup_via_record_query(self, q: str) -> Optional[str]:
@@ -643,20 +658,6 @@ class NetSuiteClient:
             return None
         if len(items) > 1:
             raise NetSuiteError(f"PO lookup {q!r} matched {len(items)} records; refusing to guess which one.")
-        return str(items[0]["id"])
-
-    def _lookup_via_suiteql(self, po_number: str) -> Optional[str]:
-        response = self._request(
-            "POST",
-            self._require_live("lookup").suiteql_url,
-            headers={"Prefer": "transient"},
-            json={"q": "SELECT id FROM transaction WHERE type = 'PurchOrd' AND tranid = ?", "params": [po_number]},
-        )
-        items = response.json().get("items", [])
-        if not items:
-            return None
-        if len(items) > 1:
-            raise NetSuiteError(f"SuiteQL matched {len(items)} POs for tranId {po_number}; refusing to guess.")
         return str(items[0]["id"])
 
     def get_purchase_order_record(self, internal_id: str) -> dict:
@@ -854,12 +855,15 @@ class NetSuiteClient:
         """
         Can this role list/search the purchaseOrder collection?
 
-        This is what `resolve_po_internal_id` needs in order to turn a human PO
-        number ("1662") into an internal id ("8489541"). Confirmed refused under
-        the least-privilege "PO Update" role in sandbox on 2026-08-04 (HTTP 400,
-        USER_ERROR) even with Lists > Items and Lists > Vendors granted --
-        NetSuite's REST collection endpoints appear to need a search-type
-        permission that record-level View does not confer.
+        This is what `resolve_po_internal_id` needs in order to turn a tranId
+        ("PO0001662") into an internal id ("8489541").
+
+        RESOLVED 2026-08-11: collection access requires `Reports > SuiteAnalytics
+        Workbook` on the role -- confirmed by bisect as the sole cause. Until it
+        was added this returned 400 USER_ERROR while single-record GET/PATCH by
+        internal id worked fine. Retained as a live check because that exact
+        asymmetry is the signature to look for if it regresses (a sandbox refresh
+        rebuilding the role would do it).
 
         Non-fatal by design: returns a verdict instead of raising, so callers
         can report it as a finding rather than dying on it.

@@ -1096,6 +1096,60 @@ def test_sheet_selection(tmp: Path) -> None:
     check(ac._find_size_header_row(pk) is not None, "reuses the existing size-header seek")
 
 
+def test_size_header_canonical(tmp: Path) -> None:
+    section("size-header detection handles full-width and spaced labels")
+    import openpyxl
+
+    import attachment_classifier as ac
+    from canonical import canonical
+
+    def sheet_with(header_cells, path):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "PACKING"
+        ws.append(["SAMPLE VENDOR CO., LTD."])
+        ws.append(["PACKING LIST"])
+        for _ in range(18):  # push the header below the preview window
+            ws.append([None])
+        ws.append(["C/NO.", "COLOR"] + list(header_cells) + ["TOTAL"])
+        ws.append([1, "BLK", 10, 20, 30, 60])
+        wb.save(path)
+        return [g for g in ce.read_workbook_grids(path) if not g.is_empty][0]
+
+    # ASCII baseline -- must still work.
+    g = sheet_with(["S", "M", "L"], tmp / "hdr_ascii.xlsx")
+    check(ac._find_size_header_row(g) is not None, "ASCII size header still found",
+          str(ac._find_size_header_row(g)))
+
+    # THE POINT: full-width size labels. Before canonicalization these were
+    # invisible to the detector, so a real packing sheet could look sizeless --
+    # which now cascades to NoPackingSheetFound and manual entry.
+    g = sheet_with(["\uff33", "\uff2d", "\uff2c"], tmp / "hdr_fullwidth.xlsx")
+    check(ac._find_size_header_row(g) is not None,
+          "FULL-WIDTH size header (\uff33\uff2d\uff2c) is found", str(ac._find_size_header_row(g)))
+
+    g = sheet_with(["\uff12\uff38", "\uff13\uff38", "XL"], tmp / "hdr_fw_2x.xlsx")
+    check(ac._find_size_header_row(g) is not None,
+          "full-width 2X/3X recognised", str(ac._find_size_header_row(g)))
+
+    # Spacing and case variants.
+    g = sheet_with(["  S  ", "m", "One  Size"], tmp / "hdr_spaced.xlsx")
+    check(ac._find_size_header_row(g) is not None,
+          "padded / lowercase / double-spaced 'One  Size' recognised",
+          str(ac._find_size_header_row(g)))
+
+    # Negative control: a row of unrelated words must NOT look like a size header.
+    g = sheet_with(["WIDTH", "HEIGHT", "DEPTH"], tmp / "hdr_none.xlsx")
+    check(ac._find_size_header_row(g) is None, "unrelated headers are not mistaken for sizes",
+          str(ac._find_size_header_row(g)))
+
+    check(canonical("\uff12\uff38") in ac._SIZE_TOKENS_CANON,
+          "the canonical token set contains the folded form of 2X")
+    check(len(ac._SIZE_TOKENS_CANON) == len({canonical(t) for t in ac._SIZE_TOKENS}),
+          "canonical token set is derived from _SIZE_TOKENS, not duplicated by hand")
+
+
+
 def test_canonical_form(tmp: Path) -> None:
     section("canonical form covers the CLASS, not just the double space")
     from canonical import canonical, canonical_key, same
@@ -2111,7 +2165,8 @@ def main() -> int:
             test_deterministic_validation, test_shipping_advice_routing,
             test_shipping_date_label_anchoring, test_pdf_layout_rendering,
             test_multidoc_call_shape, test_attachment_classifier_offline,
-            test_canonical_form, test_verbatim_source_preserved,
+            test_canonical_form, test_size_header_canonical,
+            test_verbatim_source_preserved,
             test_matcher_canonical_both_sides,
             test_line_aggregation, test_aggregation_wired_into_parsers,
             test_matcher_paula_rulings, test_sheet_selection, test_closed_po_line,

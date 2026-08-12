@@ -42,6 +42,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+from canonical import canonical
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,12 @@ _SIZE_TOKENS = {
     "2XL", "3XL", "4XL", "OS", "ONE SIZE",
 }
 
+#: The same vocabulary in canonical form. Comparing vendor cell text against our
+#: vocabulary is the same class of problem as the matcher sites, so it goes
+#: through the same canonical form: a sheet writing "２Ｘ" (full-width) or
+#: "One  Size" (double space) must still be recognised.
+_SIZE_TOKENS_CANON = {canonical(t) for t in _SIZE_TOKENS}
+
 #: How many size labels must appear on one row for it to be the size header.
 _SIZE_HEADER_MIN_TOKENS = 3
 
@@ -259,12 +266,20 @@ def _find_size_header_row(grid: Any) -> Optional[int]:
     top of the sheet therefore shows no size evidence and the classifier
     concludes, correctly but uselessly, that it cannot see any. Finding this row
     puts the decisive evidence in front of it instead.
+
+    Cell text is compared in CANONICAL form. This is vendor-supplied text being
+    matched against our own vocabulary, so it belongs to the same class as the
+    matcher's comparisons: a full-width "２Ｘ" or a double-spaced "One  Size"
+    would otherwise go unrecognised. The stakes rose once a missing packing sheet
+    became a routed outcome -- an unrecognised size header can make a real packing
+    sheet look sizeless, which cascades to NoPackingSheetFound and sends an entire
+    document to manual entry.
     """
     for index, row in enumerate(grid.rows, start=1):
         hits = {
-            str(cell).strip().upper()
+            canonical(cell)
             for cell in row
-            if cell and str(cell).strip().upper() in _SIZE_TOKENS
+            if cell and canonical(cell) in _SIZE_TOKENS_CANON
         }
         if len(hits) >= _SIZE_HEADER_MIN_TOKENS:
             return index

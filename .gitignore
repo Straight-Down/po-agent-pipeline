@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# Secrets — never commit
+# ---------------------------------------------------------------------------
+# The NetSuite private key and the Anthropic API key both live OUTSIDE this
+# folder (%USERPROFILE%\.po-agent\), so they are not at risk here. These
+# patterns are defence in depth in case one is ever generated in-tree.
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+*.cer
+*.crt
+*.der
+*.jks
+*.keystore
+credentials
+credentials.json
+
+# Real vendor documents containing banking details live outside the project at
+# %USERPROFILE%\.po-agent\vendor-documents-private\ — see RUNBOOK §6 item 1.
+# Scoped to the project root: fixtures/ holds the SYNTHETIC stand-in, which the
+# attachment-classifier tests need and which contains no real banking details.
+/*Payment Request*.pdf
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Generated / transient output
+# ---------------------------------------------------------------------------
+# parse_packing_slip.py's default CSV output, and ad-hoc extraction dumps.
+proposed_updates.csv
+*.tmp.xlsx
+vendor_results/
+
+# ---------------------------------------------------------------------------
+# Editor / OS noise
+# ---------------------------------------------------------------------------
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+# Office lock files — OneDrive folders collect these whenever a doc is open.
+~$*

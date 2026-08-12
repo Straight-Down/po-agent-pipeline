@@ -1,0 +1,13 @@
+# Phase 1 -- NetSuite M2M auth + REST write-back
+cryptography>=44.0        # RSA keypair + self-signed X.509 cert generation
+PyJWT[crypto]>=2.9        # signed JWT client assertion (PS256/RS256)
+requests>=2.32            # NetSuite REST calls
+python-dotenv>=1.0        # load .env config
+
+# Phase 1 (cont'd) -- Claude-assisted extraction, the primary parsing path
+anthropic>=0.120           # structured outputs (client.beta.messages.parse) + pydantic
+                           # pydantic comes in as an anthropic dependency
+
+# Document reading -- also used by the Phase 0 prototypes (parse_packing_slip.py)
+openpyxl>=3.1              # xlsx cell grids
+pdfplumber>=0.11           # PDF text layer

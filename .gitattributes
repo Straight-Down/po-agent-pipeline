@@ -1,0 +1,33 @@
+# Binary files must NEVER go through line-ending conversion.
+#
+# Why this file exists: on the first `git add`, Git classified
+# fixtures/...(synthetic).pdf as TEXT and warned that "LF will be replaced by
+# CRLF the next time Git touches it". A reportlab-generated PDF has no early NUL
+# bytes, so Git's text/binary heuristic guesses wrong — and rewriting bytes in a
+# PDF or xlsx corrupts it. That would silently invalidate the validation corpus
+# on clone, which is precisely what tracking these files is meant to prevent.
+#
+# The vendor documents behind the 20/20 hand-verified accuracy result are only
+# meaningful if they are byte-identical to what was tested.
+
+*.pdf   binary
+*.xlsx  binary
+*.xlsm  binary
+*.xls   binary
+*.docx  binary
+*.doc   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.zip   binary
+*.p12   binary
+*.pfx   binary
+
+# SVG is genuinely text (XML) — diffable, safe to normalize.
+*.svg   text
+
+# Keep certificates/keys byte-exact if one is ever tracked deliberately.
+*.pem   -text
+*.cer   -text
+*.crt   -text

@@ -45,6 +45,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+from canonical import canonical_key
 from claude_extractor import (
     ClaudeExtractor,
     DocumentUnreadable,
@@ -681,9 +682,12 @@ def _compare_line_sets(primary: list[dict], secondary: list[dict], label: str) -
     """Aggregate both line sets by key and report any disagreement."""
 
     def agg(lines: list[dict]) -> dict:
+        # Canonical key: a cross-check between two documents must not report a
+        # disagreement merely because one printed "NEW  INDIGO" and the other
+        # "NEW INDIGO".
         out: dict[tuple, int] = {}
         for ln in lines:
-            key = (ln["po_number"], ln["style_number"], ln["color"], ln["size"])
+            key = canonical_key(ln["po_number"], ln["style_number"], ln["color"], ln["size"])
             out[key] = out.get(key, 0) + (ln.get("quantity") or 0)
         return out
 

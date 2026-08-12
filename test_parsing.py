@@ -1096,6 +1096,176 @@ def test_sheet_selection(tmp: Path) -> None:
     check(ac._find_size_header_row(pk) is not None, "reuses the existing size-header seek")
 
 
+def test_canonical_form(tmp: Path) -> None:
+    section("canonical form covers the CLASS, not just the double space")
+    from canonical import canonical, canonical_key, same
+
+    # Each pair must canonicalise identically. These are the members of the class
+    # named in the design: whitespace, full-width forms, dashes, case, CJK.
+    equivalent = [
+        ("double internal space", "NEW  INDIGO", "NEW INDIGO"),
+        ("triple internal space", "NEW   INDIGO", "NEW INDIGO"),
+        ("non-breaking space", "NEW INDIGO", "NEW INDIGO"),
+        ("narrow no-break space", "NEW INDIGO", "NEW INDIGO"),
+        ("ideographic space", "TID　BLK", "TID BLK"),
+        ("zero-width space", "NEW​INDIGO", "NEW INDIGO"),
+        ("full-width comma", "PO#1657，M630018", "PO#1657,M630018"),
+        ("full-width digits+letter", "２Ｘ", "2X"),
+        ("full-width alpha", "ＢＬＫ", "BLK"),
+        ("en-dash vs hyphen", "32–34", "32-34"),
+        ("em-dash vs hyphen", "32—34", "32-34"),
+        ("minus sign vs hyphen", "32−34", "32-34"),
+        ("non-breaking hyphen", "32‑34", "32-34"),
+        ("mixed case", "new indigo", "NEW INDIGO"),
+        ("leading/trailing space", "   NEW INDIGO   ", "NEW INDIGO"),
+        ("tab and newline", "NEW\tINDIGO\n", "NEW INDIGO"),
+        ("CJK with double space", "建跍  空運", "建跍 空運"),
+        ("CJK padded", "  建跍空運  ", "建跍空運"),
+    ]
+    for label, a, b in equivalent:
+        check(same(a, b), f"equivalent: {label}", f"{canonical(a)!r}")
+
+    # Genuinely different values must NOT be conflated -- a normalizer that maps
+    # everything together would "fix" the bug by breaking matching entirely.
+    distinct = [
+        ("different colour", "BLACK", "BLUE"),
+        ("different size", "32-34", "32-36"),
+        ("different length", "M", "MM"),
+        ("different style", "M120246", "M120247"),
+        ("substring", "TID", "TIDE"),
+        ("size vs waist-inseam", "32", "32-34"),
+    ]
+    for label, a, b in distinct:
+        check(not same(a, b), f"distinct: {label}", f"{canonical(a)!r} vs {canonical(b)!r}")
+
+    check(canonical(None) == "", "None canonicalises to empty string")
+    check(canonical("") == "", "empty string stays empty")
+    check(canonical("   ") == "", "whitespace-only becomes empty")
+    check(canonical(1662) == "1662", "non-str input is coerced")
+    check(canonical_key("A", "b ") == ("a", "b"), "canonical_key canonicalises each part",
+          str(canonical_key("A", "b ")))
+
+
+def test_verbatim_source_preserved(tmp: Path) -> None:
+    section("verbatim source text survives canonicalization untouched")
+    from canonical import canonical
+    from extraction_schema import aggregate_lines, line_to_dict, ExtractedLine
+
+    dirty = "NEW  INDIGO"  # double space, as the real Symmetry PDF prints it
+
+    # line_to_dict must not rewrite the value it was given.
+    d = line_to_dict(ExtractedLine(
+        po_number="1720", style_number="M650022", color=dirty, size="S",
+        quantity=22, confidence="high", note="", source_hint="P1!R7",
+    ))
+    check(d["color"] == dirty, "line_to_dict keeps the colour byte-for-byte", repr(d["color"]))
+    check(canonical(d["color"]) == "new indigo", "while its canonical form is clean")
+
+    # Aggregation groups on the canonical key but must not overwrite display text.
+    rows = [
+        {"po_number": "1720", "style_number": "M650022", "color": dirty, "size": "S",
+         "quantity": 10, "confidence": "high", "note": "", "source_hint": "R7"},
+        {"po_number": "1720", "style_number": "M650022", "color": "NEW INDIGO", "size": "S",
+         "quantity": 12, "confidence": "high", "note": "", "source_hint": "R8"},
+    ]
+    out, warns = aggregate_lines(rows)
+    check(len(out) == 1, "the two whitespace variants collapsed to one line", str(len(out)))
+    check(out[0]["quantity"] == 22, "quantities summed across the variants", str(out[0]["quantity"]))
+    check(out[0]["color"] in (dirty, "NEW INDIGO"),
+          "the surviving colour is one of the VERBATIM variants, not the canonical form",
+          repr(out[0]["color"]))
+    check(out[0]["color"] != canonical(out[0]["color"]) or out[0]["color"] == "NEW INDIGO",
+          "it is not lowercased")
+    check("printed as" in out[0]["note"], "the note records that the source used both renderings",
+          out[0]["note"][:90])
+    check(repr(dirty) in out[0]["note"] and repr("NEW INDIGO") in out[0]["note"],
+          "and quotes both verbatim variants")
+
+    # Determinism: whichever order the rows arrive in, the surviving display value
+    # and the row order are the same.
+    out2, _ = aggregate_lines(list(reversed(rows)))
+    check(out2[0]["color"] == out[0]["color"],
+          "the surviving variant is chosen deterministically, not by input order")
+
+
+def test_matcher_canonical_both_sides(tmp: Path) -> None:
+    section("matcher canonicalises BOTH operands (NetSuite side may be dirty too)")
+    import datetime as dt
+
+    import matcher as mt
+    from netsuite_client import NetSuiteClient, POLine
+
+    def ns(color="NEW INDIGO", size="M", qty=100, style="M650022"):
+        return POLine(
+            line_id="10", item=f"{style} : {style}-{color}-{size}", style_number=style,
+            vendor_name=None, color=color, size=size, quantity=qty, units="Ea",
+            expected_receipt_date=dt.date(2026, 9, 1), override_expected_receipt=False,
+            updated_receipt_date=None,
+        )
+
+    def vendor(color="NEW INDIGO", size="M", qty=110, style="M650022"):
+        return {"po_number": "1720", "style_number": style, "color": color, "size": size,
+                "quantity": qty, "confidence": "high", "note": ""}
+
+    # 1. The original bug: vendor side dirty, NetSuite clean.
+    client = NetSuiteClient(mock_data={"1720": [ns(color="NEW INDIGO")]})
+    c = mt.build_proposed_changes([vendor(color="NEW  INDIGO")], client)[0]
+    check(c.status == mt.STATUS_PENDING_REVIEW,
+          "vendor 'NEW  INDIGO' matches NetSuite 'NEW INDIGO'", c.status)
+    check(c.current_quantity == 100 and c.proposed_quantity == 110, "and the diff is computed")
+
+    # 2. The reverse: NetSuite side dirty, vendor clean. Normalizing only the
+    #    extracted side would just relocate the mismatch.
+    client = NetSuiteClient(mock_data={"1720": [ns(color="NEW  INDIGO")]})
+    c = mt.build_proposed_changes([vendor(color="NEW INDIGO")], client)[0]
+    check(c.status == mt.STATUS_PENDING_REVIEW,
+          "DIRTY NETSUITE side still matches a clean vendor value", c.status)
+
+    # 3. Both sides dirty, differently.
+    client = NetSuiteClient(mock_data={"1720": [ns(color="new indigo")]})
+    c = mt.build_proposed_changes([vendor(color="NEW  INDIGO")], client)[0]
+    check(c.status == mt.STATUS_PENDING_REVIEW,
+          "nbsp on one side and double space on the other still match", c.status)
+
+    # 4. Sizes: dash variants and aliases, on either side.
+    client = NetSuiteClient(mock_data={"1720": [ns(size="32-34")]})
+    c = mt.build_proposed_changes([vendor(size="32–34")], client)[0]
+    check(c.status == mt.STATUS_PENDING_REVIEW, "en-dash size matches hyphen size", c.status)
+    client = NetSuiteClient(mock_data={"1720": [ns(size="2X")]})
+    for label, vend in (("XXL", "XXL"), ("2XL", "2XL"), ("lowercase 2x", "2x"),
+                        ("padded", "  2XL  ")):
+        c = mt.build_proposed_changes([vendor(size=vend)], client)[0]
+        check(c.status == mt.STATUS_PENDING_REVIEW, f"vendor size {label} matches NetSuite 2X", c.status)
+
+    # 5. Style with a full-width form.
+    client = NetSuiteClient(mock_data={"1720": [ns(style="M630018")]})
+    c = mt.build_proposed_changes([vendor(style="Ｍ630018")], client)[0]
+    check(c.status == mt.STATUS_PENDING_REVIEW, "full-width style letter matches ASCII", c.status)
+
+    # 6. Genuinely different values must still NOT match -- canonicalization must
+    #    not turn a miss into a false positive.
+    client = NetSuiteClient(mock_data={"1720": [ns(color="BLACK")]})
+    c = mt.build_proposed_changes([vendor(color="BLUE")], client)[0]
+    check(c.status == mt.STATUS_NEEDS_ATTENTION, "BLACK vs BLUE still does NOT match", c.status)
+    client = NetSuiteClient(mock_data={"1720": [ns(size="32-34")]})
+    c = mt.build_proposed_changes([vendor(size="32-36")], client)[0]
+    check(c.status == mt.STATUS_NEEDS_ATTENTION, "32-34 vs 32-36 still does NOT match", c.status)
+
+    # 7. _normalize_size keeps returning NetSuite's own casing for display, while
+    #    _size_key is the comparison form.
+    check(mt._normalize_size("XXL") == "2X", "display label unchanged: XXL -> 2X", mt._normalize_size("XXL"))
+    check(mt._normalize_size("  xxl  ") == "2X", "and is robust to case/padding now")
+    check(mt._size_key("XXL") == mt._size_key("2X") == "2x",
+          "comparison key folds both to '2x'", mt._size_key("XXL"))
+
+    # 8. unmatched_netsuite_lines uses the same key on both sides.
+    lines = [ns(color="NEW  INDIGO", size="M"), ns(color="BLACK", size="M")]
+    left = mt.unmatched_netsuite_lines([vendor(color="NEW INDIGO", size="M")], lines)
+    check([l.color for l in left] == ["BLACK"],
+          "a dirty NetSuite colour is recognised as shipped, not reported unmatched",
+          str([l.color for l in left]))
+
+
 def test_line_aggregation(tmp: Path) -> None:
     section("aggregation by semantic key (determinism on retry)")
     from extraction_schema import aggregate_lines
@@ -1172,9 +1342,21 @@ def test_line_aggregation(tmp: Path) -> None:
     check(out == [] and warns == [], "empty input is a clean no-op")
     out, warns = aggregate_lines([ln()])
     check(len(out) == 1 and warns == [], "a single row produces no collapse warning")
-    # Differing case is NOT treated as the same key -- safer to keep apart.
+    # SUPERSEDED BY CHANGE 4 (canonicalization). This previously asserted that
+    # "BLACK" and "black" stay apart, on the reasoning that keeping them separate
+    # was safer. Canonicalization casefolds, so they now collapse -- which is the
+    # correct behaviour: the matcher already compared colour case-insensitively,
+    # so treating them as different rows only ever produced two proposed changes
+    # for one NetSuite line. The verbatim renderings are still both recorded.
     out, _ = aggregate_lines([ln(color="BLACK", qty=1), ln(color="black", qty=2)])
-    check(len(out) == 2, "colour case difference is not silently merged", str(len(out)))
+    check(len(out) == 1, "case variants of one colour now collapse (canonical key)", str(len(out)))
+    check(out[0]["quantity"] == 3, "with quantities summed", str(out[0]["quantity"]))
+    check(out[0]["color"] in ("BLACK", "black"), "displaying a verbatim variant, not the canonical form",
+          repr(out[0]["color"]))
+    check("printed as" in out[0]["note"], "and recording that both renderings appeared")
+    # Genuinely different colours must still stay apart.
+    out, _ = aggregate_lines([ln(color="BLACK", qty=1), ln(color="BLUE", qty=2)])
+    check(len(out) == 2, "different colours are still not merged", str(len(out)))
 
 
 def test_aggregation_wired_into_parsers(tmp: Path) -> None:
@@ -1929,6 +2111,8 @@ def main() -> int:
             test_deterministic_validation, test_shipping_advice_routing,
             test_shipping_date_label_anchoring, test_pdf_layout_rendering,
             test_multidoc_call_shape, test_attachment_classifier_offline,
+            test_canonical_form, test_verbatim_source_preserved,
+            test_matcher_canonical_both_sides,
             test_line_aggregation, test_aggregation_wired_into_parsers,
             test_matcher_paula_rulings, test_sheet_selection, test_closed_po_line,
             test_unopenable_files, test_size_value_space_failsafe,

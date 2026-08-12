@@ -1000,9 +1000,13 @@ class ClaudeExtractor:
         legitimately recurs across cartons, and whether those should be summed or
         are a double-read is a judgement for a human, not a silent decision here.
         """
-        seen: dict[tuple[str, str, str, str], int] = {}
+        from canonical import canonical_key
+
+        seen: dict[tuple[str, ...], int] = {}
         for line in merged.lines:
-            key = (line.po_number, line.style_number, line.color, line.size)
+            # Canonical key, so a duplicate is still spotted when two rows differ
+            # only by internal whitespace or a dash form.
+            key = canonical_key(line.po_number, line.style_number, line.color, line.size)
             seen[key] = seen.get(key, 0) + 1
         dupes = [k for k, n in seen.items() if n > 1]
         if dupes:

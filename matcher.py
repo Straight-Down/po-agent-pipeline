@@ -42,6 +42,7 @@ import datetime as dt
 from dataclasses import asdict, dataclass
 from typing import Optional
 
+from canonical import canonical
 from netsuite_client import (
     NS_EXPECTED_RECEIPT_DATE,
     NS_OVERRIDE_EXPECTED_RECEIPT,
@@ -89,8 +90,30 @@ class DateNotConfirmed(Exception):
     """
 
 
+#: SIZE_ALIASES keyed by canonical form, so " xxl ", "XXL" and a full-width
+#: variant all resolve. Derived rather than hand-maintained, so SIZE_ALIASES stays
+#: the single editable source of truth.
+_SIZE_ALIASES_CANON = {canonical(k): v for k, v in SIZE_ALIASES.items()}
+
+
 def _normalize_size(size: str) -> str:
-    return SIZE_ALIASES.get(size.strip().upper(), size.strip())
+    """
+    Vendor size label -> NetSuite's canonical label (e.g. "XXL" -> "2X").
+
+    Returns NetSuite's own casing, because that is what a human reading a review
+    row expects to see. Use `_size_key` for comparisons, never this.
+    """
+    return _SIZE_ALIASES_CANON.get(canonical(size), str(size).strip())
+
+
+def _size_key(size: str) -> str:
+    """
+    Comparison key for a size: resolve the vendor alias, then canonicalise.
+
+    Applied to BOTH sides of a match, so "XXL", "2XL", "2x" and full-width or
+    dash variants all key alike -- and so do NetSuite's own stored values.
+    """
+    return canonical(_normalize_size(size))
 
 
 @dataclass
@@ -233,14 +256,17 @@ def _find_matching_line(vendor_line: dict, ns_lines: list[POLine]) -> Optional[P
     custcol_cmo_parentitem.refName) plus exact color/size refName match, with the
     vendor's size label normalized to NetSuite's convention first.
     """
-    style = str(vendor_line.get("style_number") or "").strip()
-    color = str(vendor_line.get("color") or "").strip()
-    size = _normalize_size(str(vendor_line.get("size") or ""))
+    style = canonical(vendor_line.get("style_number"))
+    color = canonical(vendor_line.get("color"))
+    size = _size_key(vendor_line.get("size"))
     for line in ns_lines:
+        # BOTH operands are canonicalised. Normalising only the extracted side
+        # would relocate the mismatch rather than fix it -- there is no guarantee
+        # NetSuite's stored colour is clean either.
         if (
-            line.style_number.strip() == style
-            and line.color.strip().upper() == color.upper()
-            and _normalize_size(line.size) == size
+            canonical(line.style_number) == style
+            and canonical(line.color) == color
+            and _size_key(line.size) == size
         ):
             return line
     return None
@@ -380,9 +406,9 @@ def unmatched_netsuite_lines(
     """
     shipped = {
         (
-            str(vl.get("style_number") or "").strip(),
-            str(vl.get("color") or "").strip().upper(),
-            _normalize_size(str(vl.get("size") or "")),
+            canonical(vl.get("style_number")),
+            canonical(vl.get("color")),
+            _size_key(vl.get("size")),
         )
         for vl in vendor_lines
     }
@@ -390,9 +416,9 @@ def unmatched_netsuite_lines(
         line
         for line in ns_lines
         if (
-            line.style_number.strip(),
-            line.color.strip().upper(),
-            _normalize_size(line.size),
+            canonical(line.style_number),
+            canonical(line.color),
+            _size_key(line.size),
         )
         not in shipped
     ]

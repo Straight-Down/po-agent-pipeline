@@ -35,6 +35,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from canonical import canonical
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -281,11 +282,14 @@ def aggregate_lines(
             # Sizeless rows are kept individually and stay flagged; see rules above.
             passthrough.append(dict(line))
             continue
+        # Canonical key: two rows whose colour differs only by internal
+        # whitespace, dash form or case are the SAME line and must collapse. The
+        # verbatim values in the row dict are left untouched.
         key = (
-            str(line.get("po_number") or "").strip(),
-            str(line.get("style_number") or "").strip(),
-            str(line.get("color") or "").strip(),
-            size,
+            canonical(line.get("po_number")),
+            canonical(line.get("style_number")),
+            canonical(line.get("color")),
+            canonical(size),
         )
         if key not in collapsible:
             collapsible[key] = []
@@ -319,6 +323,21 @@ def aggregate_lines(
             if hint and hint not in hints:
                 hints.append(hint)
 
+        # A merged row still shows VERBATIM vendor text, never the canonical
+        # form. Where the source printed one value several ways (e.g.
+        # "NEW  INDIGO" and "NEW INDIGO"), pick the variant deterministically and
+        # record every rendering -- so the displayed value is stable across runs
+        # and the discrepancy stays visible for audit instead of being erased.
+        for field_name in ("po_number", "style_number", "color", "size"):
+            variants = sorted({str(g.get(field_name) or "") for g in group})
+            first[field_name] = variants[0]
+            if len(variants) > 1:
+                notes.append(
+                    f"{field_name} printed as "
+                    + " and ".join(repr(v) for v in variants)
+                    + " in the source; canonically the same value"
+                )
+
         first.update(
             quantity=total,
             confidence=confidence,
@@ -332,13 +351,16 @@ def aggregate_lines(
         )
 
     def sort_key(line: dict) -> tuple:
+        # Sorted on the CANONICAL form, so row order cannot shift because the
+        # extractor rendered a colour with one space on one run and two on the
+        # next. Row order is part of idempotency, not just row count.
         return (
-            str(line.get("po_number") or "").strip(),
-            str(line.get("style_number") or "").strip(),
-            str(line.get("color") or "").strip(),
-            str(line.get("size") or "").strip(),
+            canonical(line.get("po_number")),
+            canonical(line.get("style_number")),
+            canonical(line.get("color")),
+            canonical(line.get("size")),
             int(line.get("quantity") or 0),
-            str(line.get("source_hint") or ""),
+            canonical(line.get("source_hint")),
         )
 
     out = sorted(merged + passthrough, key=sort_key)

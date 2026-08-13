@@ -170,6 +170,27 @@ class POLine:
     item_internal_id: Optional[str] = None  # Item record id, for future use
     raw: dict = field(default_factory=dict)  # untouched REST payload, for debugging
 
+    #: NetSuite's per-line `isOpen` — whether the line can still be updated.
+    #: **This is NOT the complement of `closed`.** A line can be neither open nor
+    #: closed: on a Fully Billed PO every line has isClosed=False (nobody ticks the
+    #: per-line Closed box) AND isOpen=False (nothing is outstanding). Use
+    #: `is_open` to decide whether a line can still receive an update, and `closed`
+    #: only for the deliberate-close check. Reading `isClosed` as "not open"
+    #: already produced one wrong conclusion on this data.
+    #:
+    #: Defaults True so a hand-built line (mocks, demos) is a live line unless it
+    #: says otherwise. The live path never reaches the default — `_map_line` always
+    #: sets it, and does so conservatively: a missing `isOpen` reads as False, so
+    #: an unexpected payload flags for review rather than writing blind. NetSuite
+    #: returned it on all 367 lines of the 25 most recent sandbox POs.
+    is_open: bool = True
+
+    #: Receipt/billing progress and price. Carried so a human resolving an
+    #: ambiguous match can see which line is actually being received against.
+    quantity_received: Optional[float] = None
+    quantity_billed: Optional[float] = None
+    rate: Optional[float] = None
+
     @property
     def line_number(self) -> int:
         """The sublist line as the integer NetSuite's API actually wants."""
@@ -327,6 +348,16 @@ def _ref_id(value: Any) -> Optional[str]:
     if isinstance(value, dict) and value.get("id") is not None:
         return str(value["id"])
     return None
+
+
+def _to_number(value: Any) -> Optional[float]:
+    """NetSuite returns these as numbers or numeric strings; None stays None."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _to_bool(value: Any) -> bool:
@@ -740,6 +771,10 @@ class NetSuiteClient:
             override_expected_receipt=_to_bool(raw.get(NS_OVERRIDE_EXPECTED_RECEIPT)),
             updated_receipt_date=_parse_ns_date(raw.get(NS_UPDATED_RECEIPT_DATE)),
             closed=_to_bool(raw.get("isClosed")),
+            is_open=_to_bool(raw.get("isOpen")),
+            quantity_received=_to_number(raw.get("quantityReceived")),
+            quantity_billed=_to_number(raw.get("quantityBilled")),
+            rate=_to_number(raw.get("rate")),
             po_internal_id=po_internal_id,
             item_internal_id=_ref_id(raw.get("item")),
             raw=raw,

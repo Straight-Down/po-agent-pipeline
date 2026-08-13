@@ -39,7 +39,7 @@ a flag. Attention flags are reserved for genuinely unexpected mismatches.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 from canonical import canonical
@@ -68,6 +68,10 @@ STATUS_PENDING_REVIEW = "PENDING_REVIEW"
 STATUS_NO_CHANGE = "NO_CHANGE"
 STATUS_NEEDS_ATTENTION = "NEEDS_ATTENTION"
 
+#: One extracted line matched SEVERAL open NetSuite lines. The tool does not pick
+#: and does not sum -- a human chooses. See `_resolve_target_line`.
+STATUS_NEEDS_RESOLUTION = "NEEDS_RESOLUTION"
+
 
 class LineClosed(Exception):
     """
@@ -76,6 +80,16 @@ class LineClosed(Exception):
     `netsuite_client` has always read `isClosed` into `POLine.closed`; nothing
     checked it before proposing a change. Now the diff engine flags such lines
     `NEEDS_ATTENTION` and this makes the write path refuse them outright.
+    """
+
+
+class LineAmbiguous(Exception):
+    """
+    Raised when a write is built for a change whose target line was never chosen.
+
+    `(PO, style, colour, size)` is not unique per NetSuite line, so an extracted
+    line can match several open lines. The engine refuses to guess; this makes
+    that refusal structural rather than advisory.
     """
 
 
@@ -159,6 +173,14 @@ class ProposedChange:
     #: written to automatically — `to_netsuite_fields()` refuses.
     line_closed: bool = False
 
+    #: Every NetSuite line whose canonical key matched, when the match was not a
+    #: clean 1:1. Populated for NEEDS_RESOLUTION (several open lines) and for the
+    #: no-open-line case, so a human has what they need to decide without going
+    #: back to NetSuite. Deliberately excludes custcol_sd_fg_excluderepspark:
+    #: that field is managed by hand and this tool neither reads, writes nor
+    #: displays it.
+    candidate_lines: list = field(default_factory=list)
+
     # -- derived state ------------------------------------------------------
 
     @property
@@ -219,6 +241,14 @@ class ProposedChange:
         the normal case: quantity can be approved on its own without Paula having
         yet decided the receipt date.
         """
+        if self.status == STATUS_NEEDS_RESOLUTION:
+            raise LineAmbiguous(
+                f"PO {self.po_number} {self.style_number} {self.color}-{self.size}: this key "
+                f"matches {len(self.candidate_lines)} open NetSuite lines and no target was "
+                "chosen. Refusing to build a write. A human picks the line; the engine must "
+                "not guess, and must never sum the candidates into one."
+            )
+
         if self.line_closed:
             raise LineClosed(
                 f"PO {self.po_number} {self.style_number} {self.color}-{self.size} (line "
@@ -250,26 +280,125 @@ class ProposedChange:
         return asdict(self)
 
 
-def _find_matching_line(vendor_line: dict, ns_lines: list[POLine]) -> Optional[POLine]:
+def _candidate_payload(line: POLine) -> dict:
     """
-    Match on exact style_number (from custcol_sd_tmpl_style /
-    custcol_cmo_parentitem.refName) plus exact color/size refName match, with the
+    What a human needs to choose between candidate lines.
+
+    Deliberately excludes `custcol_sd_fg_excluderepspark` -- that field is managed
+    manually by Paula and is outside this tool's scope entirely.
+    """
+    return {
+        "line_id": line.line_id,
+        "quantity": line.quantity,
+        "quantity_received": line.quantity_received,
+        "quantity_billed": line.quantity_billed,
+        "expected_receipt_date": _iso_or_none(line.expected_receipt_date),
+        "override_expected_receipt": line.override_expected_receipt,
+        "updated_receipt_date": _iso_or_none(line.updated_receipt_date),
+        "rate": line.rate,
+        "is_open": line.is_open,
+    }
+
+
+def _find_matching_lines(vendor_line: dict, ns_lines: list[POLine]) -> list[POLine]:
+    """
+    ALL NetSuite lines whose canonical key matches -- not the first one.
+
+    Matches on exact style_number (from custcol_sd_tmpl_style /
+    custcol_cmo_parentitem.refName) plus exact colour/size refName, with the
     vendor's size label normalized to NetSuite's convention first.
+
+    `(PO, style, colour, size)` is **not unique per NetSuite PO line**: across
+    1,659 POs, 64 carry duplicate-key lines. They are created during receiving
+    rather than at PO entry (0 of 89 Pending Receipt POs have them, versus 4 of 17
+    Partially Received), so this pipeline meets them disproportionately -- a second
+    packing slip against a partially-received PO is exactly the case it exists for.
+
+    The previous `_find_matching_line` returned the first match and silently
+    ignored the rest, which meant one line was updated and its twin left stale
+    with no flag.
     """
     style = canonical(vendor_line.get("style_number"))
     color = canonical(vendor_line.get("color"))
     size = _size_key(vendor_line.get("size"))
-    for line in ns_lines:
+    return [
+        line
+        for line in ns_lines
         # BOTH operands are canonicalised. Normalising only the extracted side
         # would relocate the mismatch rather than fix it -- there is no guarantee
         # NetSuite's stored colour is clean either.
-        if (
-            canonical(line.style_number) == style
-            and canonical(line.color) == color
-            and _size_key(line.size) == size
-        ):
-            return line
-    return None
+        if canonical(line.style_number) == style
+        and canonical(line.color) == color
+        and _size_key(line.size) == size
+    ]
+
+
+def _resolve_target_line(
+    candidates: list[POLine],
+) -> tuple[Optional[POLine], Optional[str], list[POLine]]:
+    """
+    Decide which of several matching NetSuite lines to update.
+
+    Returns `(target, problem, ambiguous_lines)`. `target` is the line to write to,
+    or None when there is nothing safe to write. `problem` is the reason, phrased
+    for a reviewer. `ambiguous_lines` is non-empty *only* when a human has to pick
+    between open lines — that is what separates NEEDS_RESOLUTION from the ordinary
+    NEEDS_ATTENTION cases.
+
+    The rule, and why each branch is what it is:
+
+    - **Filter to `is_open`.** Only an open line can still receive an update.
+      Deliberately `is_open`, NOT `not closed`: on a Fully Billed PO every line has
+      isClosed=False (nobody ticks the per-line Closed box) *and* isOpen=False, so
+      reading the Closed checkbox as "open" reports settled lines as live. That
+      mistake has already been made once, on this data.
+    - **Exactly one open line** — that is the target, however many closed or
+      already-received twins sit beside it. 24 of the 25 duplicate groups on the
+      live population land here.
+    - **No open line** — no update, flagged. Did not occur on the live population,
+      but it has to be a defined outcome rather than an exception. A deliberately
+      closed line keeps its own wording and still sets `line_closed`, so the
+      structural refusal in `to_netsuite_fields()` stays alive.
+    - **Two or more open lines** — NEEDS_RESOLUTION. No pick, no sum.
+
+    **No tiebreaker, deliberately.** `quantity_received` looks like it would settle
+    the one live ambiguous case (50 units received 0 versus 200 units received
+    100), and it probably would — but that is n=1, and the failure mode of a wrong
+    automatic pick is silent: the wrong line is updated and the right one goes
+    stale with nothing to notice. Flagging costs a human one decision every few
+    weeks. If a rule emerges from the choices Paula actually makes, encode it then,
+    with evidence. The receipt figures are surfaced in `candidate_lines` so a
+    person can read them; branching on them is a different thing.
+    """
+    if not candidates:
+        return None, None, []
+
+    open_lines = [line for line in candidates if line.is_open]
+
+    if len(open_lines) == 1:
+        return open_lines[0], None, []
+
+    if not open_lines:
+        if all(line.closed for line in candidates):
+            # Same wording as the single-line closed path, which this supersedes
+            # once NetSuite reports a closed line as isOpen=False.
+            return None, (
+                "PO line is closed in NetSuite; vendor data references it but no automatic "
+                "change proposed"
+            ), []
+        ids = ", ".join(str(line.line_id) for line in candidates)
+        return None, (
+            f"{len(candidates)} NetSuite line(s) match this style/colour/size "
+            f"(line {ids}) but none is open, so none can be updated — the PO has "
+            "most likely been received, billed or closed already"
+        ), []
+
+    ids = ", ".join(str(line.line_id) for line in open_lines)
+    return None, (
+        f"{len(open_lines)} open NetSuite lines match this style/colour/size "
+        f"(line {ids}). The tool does not choose between them and does not sum them "
+        "— pick the line this shipment belongs against"
+    ), open_lines
 
 
 def _iso_or_none(value: Optional[dt.date]) -> Optional[str]:
@@ -327,7 +456,9 @@ def build_proposed_changes(
         confidence = str(vl.get("confidence") or "high").lower()
         note = str(vl.get("note") or "")
         ns_lines = ns_lines_by_po.get(po_number, [])
-        match = _find_matching_line(vl, ns_lines)
+        # ALL matching lines, not just the first — the key is not unique per line.
+        candidates = _find_matching_lines(vl, ns_lines)
+        match, resolution_problem, ambiguous_lines = _resolve_target_line(candidates)
 
         change = ProposedChange(
             po_number=po_number,
@@ -344,9 +475,23 @@ def build_proposed_changes(
             vendor_eta=reference_eta,
             extraction_confidence=confidence,
             extraction_note=note,
+            # Populated only when the match was not a clean 1:1, so a reviewer can
+            # decide without opening NetSuite. Never the RepSpark field.
+            candidate_lines=(
+                [_candidate_payload(line) for line in candidates]
+                if resolution_problem
+                else []
+            ),
         )
 
         reasons: list[str] = []
+        if resolution_problem:
+            reasons.append(resolution_problem)
+        if match is None and candidates and all(line.closed for line in candidates):
+            # Nothing writable and the candidates were deliberately closed. Keep
+            # the structural guard alive: to_netsuite_fields() must still refuse,
+            # not merely be advised against by a status field.
+            change.line_closed = True
         if match is not None and match.closed:
             # NetSuite rejects edits to a closed line anyway, but the point is to
             # never even stage one: a closed line means someone deliberately
@@ -362,10 +507,11 @@ def build_proposed_changes(
                 "shipment could not be resolved to style/colour/size lines from an acceptable "
                 "source document — manual entry required"
             )
-        if match is None:
+        if match is None and not candidates:
             # Genuinely unexpected: the vendor shipped something this PO has no
             # line for. NOT the same as a PO line missing from the packing list,
-            # which produces no record at all.
+            # which produces no record at all — and not the same as lines matching
+            # but none being writable, which `resolution_problem` already covers.
             reasons.append(
                 f"no NetSuite line on PO {po_number or '(unknown)'} matches "
                 f"{change.style_number}/{change.color}/{change.size} "
@@ -379,7 +525,11 @@ def build_proposed_changes(
             reasons.append("vendor line has no quantity")
 
         if reasons:
-            change.status = STATUS_NEEDS_ATTENTION
+            # NEEDS_RESOLUTION is the narrow case: several open lines, a human
+            # picks one. Everything else that blocks a write stays NEEDS_ATTENTION.
+            change.status = (
+                STATUS_NEEDS_RESOLUTION if ambiguous_lines else STATUS_NEEDS_ATTENTION
+            )
             change.attention_reason = "; ".join(reasons)
         elif change.quantity_changed:
             change.status = STATUS_PENDING_REVIEW

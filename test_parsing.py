@@ -1598,6 +1598,270 @@ def test_closed_po_line(tmp: Path) -> None:
           "and builds its write fine", str(open_line.to_netsuite_fields(include_dates=False)))
 
 
+def test_duplicate_key_resolution(tmp: Path) -> None:
+    section("one key -> several NetSuite lines (never pick silently, never sum)")
+    import datetime as dt
+
+    import matcher as mt
+    from netsuite_client import NetSuiteClient, POLine
+
+    # Shapes taken from real sandbox POs. The values are reproduced; the records
+    # themselves are synthetic so the suite stays offline.
+    def ns(line_id, qty, *, is_open=True, recv=0.0, billed=0.0, closed=False,
+           erd=dt.date(2026, 9, 1), override=False, upd=None, rate=12.5,
+           style="A320001", color="WHT", size="ALL"):
+        return POLine(
+            line_id=line_id, item=f"{style} : {style}-{color}-{size}",
+            style_number=style, vendor_name=None, color=color, size=size,
+            quantity=qty, units="Ea", expected_receipt_date=erd,
+            override_expected_receipt=override, updated_receipt_date=upd,
+            closed=closed, is_open=is_open, quantity_received=recv,
+            quantity_billed=billed, rate=rate,
+        )
+
+    def vendor(qty, style="A320001", color="WHT", size="ALL", po="1649"):
+        return {"po_number": po, "style_number": style, "color": color, "size": size,
+                "quantity": qty, "confidence": "high", "note": ""}
+
+    def one(lines, vl):
+        return mt.build_proposed_changes([vl], NetSuiteClient(mock_data={"1649": lines}))[0]
+
+    # -- PO0001620 shape: two lines, same key, different dates, override differs.
+    #    One is open. That one is the target, and the date fields play no part in
+    #    choosing it.
+    c = one(
+        [ns("6", 6, is_open=False, erd=dt.date(2025, 10, 6), override=True,
+            upd=dt.date(2025, 10, 6)),
+         ns("42", 5, is_open=True, erd=dt.date(2025, 9, 16), override=False)],
+        vendor(11),
+    )
+    check(c.status == mt.STATUS_PENDING_REVIEW,
+          "PO0001620 shape: the single OPEN line of the pair is targeted", c.status)
+    check(c.line_id == "42", "and it is the open one, not simply the first", str(c.line_id))
+    check(c.current_quantity == 5,
+          "current quantity is that ONE line's, never the pair summed", str(c.current_quantity))
+    check(c.candidate_lines == [], "a resolved match carries no candidate payload")
+
+    # -- PO0001514 shape: same date on both lines, quantities 20 and 3. Only the
+    #    open one can be written to; the closed twin is not added to it.
+    c = one(
+        [ns("3", 20, is_open=False, recv=20.0, billed=20.0),
+         ns("31", 3, is_open=True)],
+        vendor(9),
+    )
+    check(c.status == mt.STATUS_PENDING_REVIEW,
+          "PO0001514 shape: identical dates, one open line -> normal change", c.status)
+    check(c.line_id == "31" and c.current_quantity == 3,
+          "targets the open line; 20 + 3 is never staged as 23", f"{c.line_id}/{c.current_quantity}")
+    check(c.to_netsuite_fields(include_dates=False) == {"quantity": 9},
+          "and the write is a plain quantity update on that one line",
+          str(c.to_netsuite_fields(include_dates=False)))
+
+    # -- PO0001649: the genuinely ambiguous one. 50 units received 0, 200 units
+    #    received 100, both open, both due the same day. The tool must not choose.
+    ambiguous = [
+        ns("1", 50, is_open=True, recv=0.0, billed=0.0, erd=dt.date(2026, 7, 1), override=False),
+        ns("2", 200, is_open=True, recv=100.0, billed=100.0, erd=dt.date(2026, 7, 1), override=True),
+    ]
+    c = one(ambiguous, vendor(58))
+    check(c.status == mt.STATUS_NEEDS_RESOLUTION,
+          "PO0001649: two open lines -> NEEDS_RESOLUTION", c.status)
+    check(c.line_id is None, "no line was picked", str(c.line_id))
+    check(c.current_quantity is None,
+          "and no line's quantity was adopted as 'current'", str(c.current_quantity))
+    check(c.proposed_quantity == 58, "the vendor quantity is preserved verbatim for the reviewer")
+    check("does not choose" in c.attention_reason and "1, 2" in c.attention_reason,
+          "the reason names both line ids and says the tool will not choose",
+          c.attention_reason[:90])
+
+    # NEVER summed on the NetSuite side. This is the whole point of change 5:
+    # extraction-side duplicates are the same style/colour/size counted twice in
+    # one document (sum them), NetSuite-side duplicates are two separate PO lines
+    # (never sum them).
+    check(250 not in {c.current_quantity, c.proposed_quantity},
+          "50 + 200 is nowhere in the staged change")
+    check([p["quantity"] for p in c.candidate_lines] == [50, 200],
+          "both candidate quantities are surfaced separately, not combined",
+          str([p["quantity"] for p in c.candidate_lines]))
+
+    # The payload is what a human decides from, so it has to carry the receipt
+    # figures that distinguish the lines.
+    payload = c.candidate_lines[1]
+    for field_name, expected in (("line_id", "2"), ("quantity", 200), ("quantity_received", 100.0),
+                                 ("quantity_billed", 100.0), ("expected_receipt_date", "2026-07-01"),
+                                 ("override_expected_receipt", True), ("rate", 12.5),
+                                 ("is_open", True)):
+        check(payload.get(field_name) == expected,
+              f"candidate payload carries {field_name}", f"{payload.get(field_name)!r}")
+    check("updated_receipt_date" in payload, "candidate payload carries updated_receipt_date")
+
+    # Scope boundary, asserted rather than trusted: custcol_sd_fg_excluderepspark
+    # is Paula's field. This tool does not read, write or display it. (It also
+    # failed as a discriminator -- it differs in only 25.5% of duplicate pairs.)
+    check(all("repspark" not in k.lower() for p in c.candidate_lines for k in p),
+          "the candidate payload does NOT carry custcol_sd_fg_excluderepspark")
+    check("repspark" not in str(mt.asdict(c)).lower(),
+          "nor does any other part of the staged change")
+
+    # A write must be structurally impossible, not merely discouraged.
+    expect_raises(
+        mt.LineAmbiguous,
+        lambda: c.to_netsuite_fields(include_dates=False),
+        "building a write for an unresolved change RAISES LineAmbiguous",
+    )
+    c.confirm_receipt_date("2026-09-10")
+    expect_raises(
+        mt.LineAmbiguous,
+        lambda: c.to_netsuite_fields(include_dates=True),
+        "still refuses once a receipt date has been confirmed",
+    )
+
+    # -- Three open lines resolve the same way as two.
+    c = one(ambiguous + [ns("3", 25, is_open=True)], vendor(58))
+    check(c.status == mt.STATUS_NEEDS_RESOLUTION and len(c.candidate_lines) == 3,
+          "three open lines -> NEEDS_RESOLUTION with all three surfaced",
+          f"{c.status}/{len(c.candidate_lines)}")
+
+    # -- No open line at all. Did not occur on the live population; must be a
+    #    defined outcome rather than a crash.
+    c = one([ns("1", 50, is_open=False, recv=50.0, billed=50.0),
+             ns("2", 200, is_open=False, recv=200.0, billed=200.0)], vendor(58))
+    check(c.status == mt.STATUS_NEEDS_ATTENTION,
+          "no open line -> NEEDS_ATTENTION, not NEEDS_RESOLUTION", c.status)
+    check("none is open" in c.attention_reason, "reason says none is open", c.attention_reason[:80])
+    check(len(c.candidate_lines) == 2, "and both lines are still surfaced for the reviewer")
+    check(c.line_id is None, "nothing was targeted")
+
+    # -- A single line that is not open is not writable either. The open filter is
+    #    the general rule, not a duplicates-only special case.
+    c = one([ns("7", 40, is_open=False, recv=40.0, billed=40.0)], vendor(58))
+    check(c.status == mt.STATUS_NEEDS_ATTENTION,
+          "a lone NOT-OPEN line flags instead of proposing", c.status)
+    check("none is open" in c.attention_reason, "with the same reason", c.attention_reason[:80])
+
+    # -- Deliberately closed lines keep their own wording and their own guard.
+    #    NetSuite reports a closed line as isOpen=False, so this arrives through
+    #    the no-open branch, but the outcome must not degrade.
+    c = one([ns("7", 40, is_open=False, closed=True)], vendor(58))
+    check(c.line_closed, "a closed line still sets line_closed")
+    check("closed in NetSuite" in c.attention_reason,
+          "and still reads as closed, not merely 'not open'", c.attention_reason[:80])
+    expect_raises(
+        mt.LineClosed,
+        lambda: c.to_netsuite_fields(include_dates=False),
+        "and to_netsuite_fields still raises LineClosed",
+    )
+
+    # -- The ordinary case is untouched: one matching line, no duplicates.
+    c = one([ns("5", 12)], vendor(9))
+    check(c.status == mt.STATUS_PENDING_REVIEW and c.line_id == "5",
+          "a single open match still proposes normally", f"{c.status}/{c.line_id}")
+    check(c.candidate_lines == [], "and carries no candidate payload")
+
+    # -- Genuinely no match still reads as 'no line matches', not 'none is open'.
+    c = one([ns("5", 12, color="BLK")], vendor(9))
+    check(c.status == mt.STATUS_NEEDS_ATTENTION and "no NetSuite line" in c.attention_reason,
+          "an unmatched vendor line keeps its own distinct reason", c.attention_reason[:70])
+
+    # -- Duplicate NetSuite lines must not confuse the reporting helper either:
+    #    one vendor line covers BOTH twins, so neither is reported unshipped.
+    left = mt.unmatched_netsuite_lines([vendor(58)], ambiguous + [ns("9", 4, size="XL")])
+    check([l.line_id for l in left] == ["9"],
+          "unmatched_netsuite_lines treats both twins as shipped, not just the first",
+          str([l.line_id for l in left]))
+
+    # -- And the extraction side is UNCHANGED: two rows for the same key in one
+    #    document still sum. Same symptom, different problem, opposite answer.
+    from extraction_schema import aggregate_lines
+
+    rows = [{"po_number": "1649", "style_number": "A320001", "color": "WHT", "size": "ALL",
+             "quantity": 50, "confidence": "high", "note": "", "source_hint": "P1!R5"},
+            {"po_number": "1649", "style_number": "A320001", "color": "WHT", "size": "ALL",
+             "quantity": 8, "confidence": "high", "note": "", "source_hint": "P1!R9"}]
+    agg, _ = aggregate_lines(rows)
+    check(len(agg) == 1 and agg[0]["quantity"] == 58,
+          "extraction-side duplicates still sum to 58 (change 2 intact)",
+          str([(l["quantity"]) for l in agg]))
+
+
+def test_scope_boundaries(tmp: Path) -> None:
+    section("scope boundaries (things this tool must never do)")
+    import datetime as dt
+
+    import matcher as mt
+    from netsuite_client import NetSuiteClient, POLine
+
+    ns = POLine(
+        line_id="5", item="A320001 : A320001-WHT-ALL", style_number="A320001",
+        vendor_name=None, color="WHT", size="ALL", quantity=12, units="Ea",
+        expected_receipt_date=dt.date(2026, 9, 1), override_expected_receipt=False,
+        updated_receipt_date=None, is_open=True, quantity_received=0.0,
+        quantity_billed=0.0, rate=12.5,
+    )
+    client = NetSuiteClient(mock_data={"1649": [ns]})
+    vendor = {"po_number": "1649", "style_number": "A320001", "color": "WHT",
+              "size": "ALL", "quantity": 20, "confidence": "high", "note": ""}
+    c = mt.build_proposed_changes([vendor], client)[0]
+
+    # 1. The tool NEVER creates PO lines -- it only updates existing ones. A
+    #    vendor line with no NetSuite line is a flag, never an insert.
+    check(not [m for m in dir(client) if m.startswith(("create", "add_", "insert"))],
+          "the client exposes no create/insert method at all",
+          str([m for m in dir(client) if m.startswith(("create", "add_", "insert"))]))
+    orphan = mt.build_proposed_changes(
+        [{**vendor, "style_number": "W999999"}], client)[0]
+    check(orphan.status == mt.STATUS_NEEDS_ATTENTION and orphan.line_id is None,
+          "a vendor line with no NetSuite line flags -- it does not become a new line",
+          orphan.status)
+
+    # 2. The tool NEVER derives a date from a vendor document. The vendor's ETD/ETA
+    #    are carried as reference text only; a write that would include a date no
+    #    human confirmed raises rather than quietly omitting it.
+    dated = mt.build_proposed_changes([vendor], client, eta="2026/7/1 08:00", etd="2026/6/20 08:00")[0]
+    check(dated.vendor_eta == "2026-07-01" and dated.vendor_etd == "2026-06-20",
+          "vendor dates are carried for display", f"{dated.vendor_etd}/{dated.vendor_eta}")
+    check(not any("proposed" in f and "date" in f for f in mt.asdict(dated)),
+          "ProposedChange has no proposed_*_date field for a date to leak into",
+          str([f for f in mt.asdict(dated) if "date" in f]))
+    expect_raises(
+        mt.DateNotConfirmed,
+        lambda: dated.to_netsuite_fields(include_dates=True),
+        "a date write with only vendor dates available RAISES DateNotConfirmed",
+    )
+    check(dated.to_netsuite_fields(include_dates=False) == {"quantity": 20},
+          "the quantity-only write carries no date field of any kind",
+          str(dated.to_netsuite_fields(include_dates=False)))
+
+    # Once Paula confirms a date, the override mechanism is what gets written:
+    # custcol_override_expected_receipt = True plus custcol_sd_updatedreceiptdate.
+    dated.confirm_receipt_date("2026-09-10")
+    fields = dated.to_netsuite_fields(include_dates=True)
+    check(fields.get(mt.NS_OVERRIDE_EXPECTED_RECEIPT) is True,
+          "confirmed date sets custcol_override_expected_receipt = True")
+    check(fields.get(mt.NS_UPDATED_RECEIPT_DATE) == "2026-09-10",
+          "and writes the confirmed date to custcol_sd_updatedreceiptdate",
+          str(fields.get(mt.NS_UPDATED_RECEIPT_DATE)))
+    # OPEN QUESTION, recorded here rather than assumed either way: expectedReceiptDate
+    # is currently written too, with the same confirmed value. If the override
+    # mechanism alone is meant to drive it, this field should come out of the write
+    # -- that is Paula's call, not a refactor. This assertion pins today's behaviour
+    # so the decision is visible when it is made, not silently changed.
+    check(fields.get(mt.NS_EXPECTED_RECEIPT_DATE) == "2026-09-10",
+          "expectedReceiptDate ALSO carries the confirmed date (see comment: open question)",
+          str(fields.get(mt.NS_EXPECTED_RECEIPT_DATE)))
+
+    # 3. The tool NEVER touches custcol_sd_fg_excluderepspark. Paula manages it by
+    #    hand. It is not read, not written, not displayed -- including on the
+    #    resolution payload, where it would be the obvious thing to show.
+    for label, payload in (("the staged change", mt.asdict(c)),
+                           ("the write dict", dated.to_netsuite_fields(include_dates=True)),
+                           ("the quantity-only write", c.to_netsuite_fields(include_dates=False))):
+        check(all("repspark" not in str(k).lower() for k in payload),
+              f"no repspark field in {label}", str(list(payload)[:4]))
+    check("repspark" not in str(ns.raw).lower() and not hasattr(ns, "exclude_repspark"),
+          "and POLine does not model it either -- the field is never read from NetSuite")
+
+
 def test_unopenable_files(tmp: Path) -> None:
     section("corrupt / password-protected files flag, they don't crash the job")
     corrupt = HERE / "fixtures" / "corrupt_truncated.xlsx"
@@ -2170,6 +2434,7 @@ def main() -> int:
             test_matcher_canonical_both_sides,
             test_line_aggregation, test_aggregation_wired_into_parsers,
             test_matcher_paula_rulings, test_sheet_selection, test_closed_po_line,
+            test_duplicate_key_resolution, test_scope_boundaries,
             test_unopenable_files, test_size_value_space_failsafe,
             test_no_packing_sheet_becomes_manual_entry,
             test_manual_entry_path, test_matcher_handoff,

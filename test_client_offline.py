@@ -96,6 +96,10 @@ SAMPLE_LINE = {
     "custcol_product_color": {"id": "12", "refName": "TID"},
     "custcol_product_size": {"id": "6", "refName": "3X"},
     "isClosed": False,
+    "isOpen": True,
+    "quantityReceived": 0,
+    "quantityBilled": 0,
+    "rate": 18.75,
 }
 
 
@@ -235,6 +239,30 @@ def test_line_mapping() -> None:
 
     # A closed line must be visible so the test can refuse to write to it.
     check(client._map_line({**SAMPLE_LINE, "isClosed": True}, "1", None).closed, "closed line detected")
+
+    # isOpen decides whether a line can still be updated, and is NOT the
+    # complement of isClosed: a Fully Billed PO has lines with both False.
+    check(line.is_open, "isOpen mapped")
+    check(client._map_line({**SAMPLE_LINE, "isOpen": False}, "1", None).is_open is False,
+          "a not-open line is visible as such")
+    both_false = client._map_line({**SAMPLE_LINE, "isOpen": False, "isClosed": False}, "1", None)
+    check(both_false.is_open is False and both_false.closed is False,
+          "neither open NOR closed is representable -- reading isClosed as 'not open' "
+          "already produced one wrong conclusion")
+    check(client._map_line({k: v for k, v in SAMPLE_LINE.items() if k != "isOpen"}, "1", None).is_open is False,
+          "a MISSING isOpen reads as not-open, so an odd payload flags rather than writes blind")
+
+    # Receipt/billing figures and price: surfaced so a human can tell duplicate
+    # PO lines apart. Never used to choose between them automatically.
+    check(line.quantity_received == 0.0 and line.quantity_billed == 0.0,
+          "quantityReceived/quantityBilled mapped",
+          f"{line.quantity_received}/{line.quantity_billed}")
+    check(line.rate == 18.75, "rate mapped", str(line.rate))
+    partly = client._map_line({**SAMPLE_LINE, "quantityReceived": "100", "rate": None}, "1", None)
+    check(partly.quantity_received == 100.0, "numeric strings coerce", str(partly.quantity_received))
+    check(partly.rate is None, "and a null stays None rather than becoming 0.0", str(partly.rate))
+    check(client._map_line({**SAMPLE_LINE, "quantityBilled": "n/a"}, "1", None).quantity_billed is None,
+          "an unparseable number degrades to None, doesn't crash the read")
 
     # A malformed date must not take down the whole PO read.
     check(

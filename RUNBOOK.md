@@ -4,7 +4,7 @@
 
 **Audience:** assumes general technical competence, no prior context on this specific project. Where more depth exists elsewhere, this doc points to it rather than repeating it — `PO-Update-Automation-Architecture.md` is the full design rationale; this doc is the "how do I actually run/fix/hand this off" companion.
 
-**Last updated:** 2026-08-11
+**Last updated:** 2026-08-24
 
 ---
 
@@ -31,7 +31,7 @@ In short: the hard, uncertain part (can this reliably read messy vendor document
 
 ## 3. How email-to-PO matching works
 
-1. **Intake** (not yet built) will read new emails from Paula's inbox via Microsoft Graph API (direct access, decided 2026-08-10 — no shared mailbox).
+1. **Intake** (not yet built) will read new emails via Microsoft Graph API from a **new shared mailbox** (`shipments@`), app-only `Mail.Read` scoped to that one mailbox via RBAC for Applications. **This reverses the 2026-08-10 "direct access to Paula's inbox" decision** — `Mail.Read` is mailbox-level, not folder-level, so that route would have exposed her whole inbox. See §6 item 11.
 2. **Attachment triage** (`attachment_classifier.py`) looks at every attachment in the email and decides what it is — packing list, invoice, payment request, inspection report, shipping schedule. **Filenames are not trusted for this** — one real vendor's invoice was literally named "...PACKING LIST.pdf." Classification looks at document content instead (does this sheet/page actually break quantities out by size). Only the packing list gets parsed for shipment data; everything else is set aside.
 3. **Parsing** (`document_parsers.py`, `claude_extractor.py`, `parse_packing_slip.py`) extracts PO number, style, color, size, and quantity from the packing list.
    - If the file is a known, previously-validated format (currently just Inprotex), a fast deterministic parser handles it for free.
@@ -50,6 +50,10 @@ In short: the hard, uncertain part (can this reliably read messy vendor document
 - **A vendor's packing list that can't be resolved to individual size-level lines results in a manual-entry flag**, not a guess (no proportional splitting, no inference from another document).
 
 **Not yet confirmed:** if a single PO ships in two genuinely separate batches weeks apart (not just multiple styles on one PO), does the second batch's quantity replace what's in NetSuite, or add to it? The code currently replaces. Low urgency, worth asking Paula before this goes further.
+
+**One vendor line can match several NetSuite lines**, because `(PO, style, colour, size)` is not unique per PO line. One open line among them is targeted normally; several open lines produce `NEEDS_RESOLUTION` with every candidate's figures attached and **no** automatic choice. Full evidence and reasoning in §6 item 10 — including why NetSuite-side duplicates must never be summed while extraction-side duplicates must.
+
+**Dates are written as all three fields together**, same value: `expectedReceiptDate`, `custcol_override_expected_receipt = true`, `custcol_sd_updatedreceiptdate`. Tested 2026-08-12 — NetSuite does **not** derive `expectedReceiptDate` from the override pair (architecture doc §6), so omitting it would leave the field NetSuite actually schedules against stale.
 
 ## 5. Where everything lives
 
@@ -76,7 +80,7 @@ It was created with `git init --separate-git-dir "C:\dev\po-agent.git"` so the g
 
 Remote is `https://github.com/Straight-Down/po-agent-pipeline.git`, **private** — it must stay private, because the tracked vendor corpus contains real third-party commercial data (supplier unit prices, a named inspector, customer contact details). `.gitattributes` marks pdf/xlsx/png/docx as binary; without it Git's heuristic classified a generated PDF as text and would have rewritten its bytes on checkout, silently invalidating the validation corpus.
 
-## 6. Known limitations and open risks (as of 2026-08-12)
+## 6. Known limitations and open risks (as of 2026-08-24)
 
 Ranked by how much they matter. Items struck through are resolved, with the resolution recorded in place rather than deleted — the reasoning trail is the point.
 
@@ -101,7 +105,11 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
    **`SIZE_ALIASES` deliberately NOT extended.** No vendor document in the corpus contains a single non-letter size, so any mapping would be inference rather than evidence — a vendor might print `32x34`, `32/34`, `3232` or `32-34` for the same NetSuite value. Current behaviour on all 39 is `NEEDS_ATTENTION`: the fail-safe, working as designed. (The canonical-form normalizer does already fold en-dash/em-dash to ASCII hyphen, so `32–34` and `32-34` will key alike whenever such a sample does arrive.)
 
-   **Targeted ask for Paula:** *which vendors ship numerically-sized styles — pants/bottoms or footwear?* That is a far more answerable question than "send more packing slips", and one real slip for such a style turns this from inference into evidence.
+   **Targeted ask for Paula — ANSWERED 2026-08-24, and the answer rules out an approach.** Paula: **size scale is a property of the STYLE, not of the vendor** — the same vendor ships numerically-sized pants and letter-sized jackets, sometimes on the same PO. So size interpretation must **resolve per line**, against the style's own size run (`custcol_sd_tmpl_size_run`), and **cannot** be driven by a per-vendor profile. Any design that keys size handling off "which vendor sent this" is wrong before it is written. She is sending packing-slip examples for numerically-sized styles; until one arrives the 39 non-letter values stay at `NEEDS_ATTENTION`.
+
+   **A NetSuite data gap found while asking, for whoever maintains the size list:** the women's numeric group in `customlist_psgss_product_size` holds only **`0`, `2`, `4`**, while Paula described the scale as "2, 4, 6, etc". If vendors ship 6 and up, **those values do not exist in the list yet** — so the item records could not be created for them, let alone matched. That is a NetSuite data problem upstream of this pipeline, not something the matcher can normalize around.
+
+   **`ALL` — which field REST returns, read live 2026-08-24 (PO0001649 / A320001 / WHT):** `custcol_product_size` comes back as `{"id": "45", "refName": "ALL"}`. **REST's `refName` is the list value's NAME, not its abbreviation.** The list record itself holds `name = "ALL"`, `abbreviation = "A"`, so the two really are different and REST hands over the name. `matcher.py` compares `refName`, so it compares against `"ALL"` — the deliberate choice §6 called for, now made and recorded rather than inherited by accident. **The open half:** nothing yet says which form a *vendor* prints. If one prints `A`, or `OS`, or `ONE SIZE`, it will not match, and the fix is a `SIZE_ALIASES` entry rather than switching which NetSuite field is read — switching would break every other value, where name and abbreviation are identical. No vendor sample in the corpus contains a size-`ALL` line, so this is unmeasured, not safe.
 
    **Also recorded:** Inprotex uses `2XL`, `XXL` **and** `XXXL` in the *same file* for what NetSuite stores as `2X`/`3X` — three conventions from one vendor in one document. `SIZE_ALIASES` already covers all three.
 5. ~~**No handling yet for a corrupt or password-protected vendor file.**~~ **FIXED 2026-08-11.** All `openpyxl.load_workbook` / `pdfplumber.open` calls now go through `claude_extractor.open_workbook` / `open_pdf`, which raise `DocumentUnreadable` with a specific reason (truncated/corrupt zip, encrypted/password-protected, empty, wrong format, OS permission). Batch behaviour is the point: `build_source_documents` and attachment triage **flag the individual bad attachment and continue processing the rest** rather than aborting the shipment, and triage reports "could not open: &lt;reason&gt;" as its own condition, distinct from "has no size data". Two new fixtures cover it (`fixtures/corrupt_truncated.xlsx`, `fixtures/encrypted_password_protected.pdf`).
@@ -153,8 +161,43 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
    **Robustness requirement:** if **Allow Override** is enabled, tranIds are a *convention, not a guarantee* — someone can type an arbitrary one. The resolver must treat a non-conforming tranId as a **defined outcome** (flag for human resolution), never a crash or a silent wrong match.
 
    **Extraction risk worth naming now:** the bare-`nnnn` case cannot be found with a page-wide regex. Four-digit numbers also appear in these same documents as carton counts, quantities and style-number fragments. Recognising `1720` as a PO requires the **column-header context** (`PO NO`) — i.e. it is an extraction problem, not a post-processing one.
-10. **Paula's mailbox access is decided (direct Graph API) but not yet implemented.**
-11. **NetSuite's M2M certificate expires 2028-08-03** — calendar reminder only, no automated alert. Low urgency given the lead time, but worth a real alert once this is hosted on Azure rather than relying on memory.
+10. **NEW 2026-08-24 — `(PO, style, colour, size)` is NOT unique per NetSuite PO line.** The matcher's key can resolve to several lines. This was found by measurement, not review, and it is the assumption the whole matching design rested on.
+
+    **The evidence:**
+
+    | Measure | Value |
+    |---|---|
+    | POs carrying duplicate-key lines | **64 of 1,659 (3.9%)**, 451 surplus lines |
+    | Pending Receipt POs with duplicates | **0 of 89** |
+    | Partially Received POs with duplicates | 4 of 17 (24%) |
+
+    The **0 of 89** is the well-powered result and the important one: **these lines are created during receiving, not at PO entry.** Treat the 24% as directional only (n=17). The consequence is that this pipeline meets them **disproportionately** — a second packing slip landing against a partially-received PO is precisely the case the tool exists for, so its exposure is much higher than the 3.9% headline.
+
+    **On the live population** — the 5 POs a packing slip could still act on — there were **25 duplicate groups: 24 with exactly one open line, 1 with two.** Every live group had at least one open line.
+
+    **No single field discriminates the pair.** Across 435 pairs, two rough families: **date-driven (233)** and **non-date (202)**, the latter differing on `rate`, `description` or the RepSpark flag. That `rate` differs in **21%** matters: those pairs are separate commercial transactions at different prices, not a split of one order. And `custcol_sd_fg_excluderepspark` differs in only **25.5%** — it was **not** the discriminator, and it differs because a human sets it case by case. So "what is the second line?" has more than one answer, and no rule can be derived from the field data alone.
+
+    **The resolution rule as built (change 5, commit `40168d2`):** gather **all** matching lines → filter to `isOpen` → **exactly one** open line: target it → **zero**: flagged, no write → **two or more**: `NEEDS_RESOLUTION`, carrying every candidate's quantity, received, billed, dates and rate so a human decides with the facts in front of them. `LineAmbiguous` makes the refusal structural — `to_netsuite_fields()` cannot build a write for an unresolved change.
+
+    **No tiebreaker, ever.** `quantityReceived` looks like it would resolve the one live ambiguous case (50 units received 0 versus 200 units received 100) and it probably would — but that is **n=1**, and a wrong automatic pick **fails silently**: the wrong line is updated and the right one goes stale with nothing to notice. Surface the receipt figures for the human; never branch on them.
+
+    **The two problems that share a symptom and need opposite fixes** — this is the distinction to hold on to:
+
+    | | Extraction-side duplicates | NetSuite-side duplicates |
+    |---|---|---|
+    | What it is | one key across several carton rows in one document | one key, several PO lines |
+    | Correct handling | **SUM them** (change 2) | **NEVER sum them** (change 5) |
+    | Where | `extraction_schema.aggregate_lines` | `matcher._resolve_target_line` |
+
+    Both look like "the same style/colour/size twice". Applying either fix to the other's case is a silent data error: summing PO lines would write 250 where the answer is 50 or 200; refusing to sum carton rows would write one carton's quantity as the whole shipment. A test asserts both halves together so neither drifts into the other.
+
+    **OPEN — needs Paula:** what *is* the second line on `PO0001649` (`A320001`/`WHT`/`ALL`, 50 received 0 versus 200 received 100, both open, both due 2026-07-01)? Her answer is the only way to learn whether a rule exists. Who creates these lines and why is **out of scope for this tool** either way — it never creates PO lines.
+11. **Paula's mailbox access — DECISION CHANGED 2026-08-24. It is a new shared mailbox, not her inbox.** The earlier decision ("direct Graph API access to Paula's own mailbox", 2026-08-10) is **superseded**, and for a reason worth keeping: **Graph's `Mail.Read` application permission is mailbox-level, not folder-level.** There is no way to grant an app-only application access to one folder of a person's mailbox — granting it against Paula's account would expose her entire inbox to the service. Her inbox was therefore **explicitly rejected as the target**.
+
+    **What to build instead:** a new shared mailbox (`shipments@`), with app-only `Mail.Read` scoped to just that mailbox via **RBAC for Applications** — the mechanism that makes "this app, this one mailbox" expressible at all. Vendors are redirected there, or Paula forwards into it.
+
+    **Two different admin roles are involved, which is what makes this a scheduling problem rather than a task:** the app registration and tenant-wide admin consent need **Entra ID** admin rights (Application Administrator or Global Administrator); creating the shared mailbox and the RBAC-for-Applications scope needs **Exchange** admin rights. Confirm both exist, with names attached, before Phase 2 starts — missing admin access has already blocked this project three times (Integration record, then role permissions, twice).
+12. **NetSuite's M2M certificate expires 2028-08-03** — calendar reminder only, no automated alert. Low urgency given the lead time, but worth a real alert once this is hosted on Azure rather than relying on memory.
 
 ## 7. Design constraints discovered by testing
 
@@ -169,11 +212,15 @@ These are not open questions — they are settled constraints that later phases 
 - the Phase 3 **approval unit** must be defined deliberately — per PO, per shipment, or per line — rather than falling out of the implementation,
 - **write-back needs partial-failure semantics**: one approval can mean six PO writes, and the fifth can fail. What the audit log records, and what Paula sees, when three succeeded and one didn't, has to be decided before the write path is wired.
 
+**`transactionLine.isclosed` is NOT the complement of `isOpen`, and reading it as such produces confidently wrong numbers.** The per-line Closed checkbox is effectively unused in this account — nobody ticks it — so SuiteQL `isclosed = 'F'` reports the lines of a **Fully Billed** PO as fully open. That produced a stated count of **~1,024 "open POs"** which was simply wrong, and it was wrong in the most dangerous direction: a plausible number, quoted with confidence, that no one would think to question. **Use PO status for the business meaning of "open", and REST's per-line `isOpen` as the usable flag** — `isOpen` was present on all 367 lines of the 25 most recent sandbox POs. `POLine` now models both fields separately, with the trap named on the field itself, because a line can be **neither** open nor closed.
+
+**SuiteQL is not dependable for aggregates. Keep queries narrow.** `GROUP BY status` and `GROUP BY (tranid, id, item) HAVING COUNT(*) > 1` returned **HTTP 500 with three distinct error ids** across repeated attempts, while per-status `COUNT(*)` and a narrower `GROUP BY t.tranid` succeeded instantly. So the failure is about query shape, not load or permissions. **Phase 2 must not lean on aggregate SuiteQL**; compute aggregates client-side from narrow reads. One thing that did work exactly as designed: the change-3 transient-retry handler retried the 500s with backoff and then **reported the failure**, rather than silently returning an empty result set — demonstrated on a real fault rather than a simulated one, which is the harder test to arrange.
+
 **Not yet exercised against a real document:** the merge-note path (`color printed as 'X' and 'Y' in the source`) is covered by unit tests, but in every live run so far each individual run rendered a value consistently — the variation was *between* runs. So that code path has never fired on real input.
 
-## 8. Lessons learned — debugging NetSuite permissions
+## 8. Lessons learned — debugging and validating against NetSuite
 
-Written up because the permission investigation cost far more cycles than it should have.
+Written up because the permission investigation cost far more cycles than it should have. Items 5 and 6 are about *analysis* rather than permissions, and were added after two conclusions turned out to be artifacts of how the data was chosen.
 
 ### 1. A permission can read as "tested and eliminated" while never having been applied
 
@@ -205,6 +252,20 @@ Three tests in this codebase asserted incidental behaviour and had to be rewritt
 - a **`BLACK` / `black` separation** asserting the two must not merge, which protected nothing: the matcher already compared colour case-insensitively, so keeping them apart only ever produced two proposed changes for one NetSuite line.
 
 Neither was a regression; both were tests encoding accidents. Assert on **identity and intent** — "the row with an empty PO number", "the write contains only quantity" — not on position or incidental state. A test that breaks when a correct change lands is a cost, not a safety net.
+
+### 5. Choose the denominator that matches the decision
+
+The first duplicate-key analysis sampled POs by **surplus line count** — the worst offenders — which felt like going where the signal was. It was not. Selecting for the most surplus lines selects for POs that accumulated the most amendments, which selects for the **longest-lived**, which selects for **closed**. The resulting headline — "93% of duplicate groups have no open line" — was therefore close to **tautological**, and the entire practical conclusion rested on the single live PO that happened to fall into the sample.
+
+Re-running against **currently-open POs** — the population a packing slip can actually act on — inverted the picture: 24 of 25 groups had exactly one open line, and **every** live group had at least one. Same data, opposite operational reading.
+
+The lesson is not "sample randomly". It is: **the denominator has to be the population the decision applies to.** The decision here was "what should the matcher do when it meets one of these", so the denominator is POs the matcher can still meet.
+
+### 6. One validation target cannot prove a general case, however thoroughly it passes
+
+The whole parsing/matching phase was validated against **PO 8489541 (PO0001662)**. That PO has **41 lines, 41 distinct keys, one delivery date, and every override flag `False`.** It is a clean single-delivery PO — which means it **could not have surfaced the duplicate-key problem** no matter how carefully it was tested. The 77/77 and 20/20 results against it were real, and they said nothing whatsoever about the general case.
+
+Worth being precise about the failure: it was not insufficient rigour, it was **rigour aimed at one specimen**. A structural property of the corpus (does any PO have duplicate keys? do dates vary within a PO?) has to be checked **across** the population — one cheap aggregate query would have found this at the start of the phase rather than at the end of it. Before trusting a validation corpus again, ask what shapes it **structurally cannot contain**.
 
 ## 9. How to recover when something breaks
 

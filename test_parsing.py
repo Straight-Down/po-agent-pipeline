@@ -1841,13 +1841,14 @@ def test_scope_boundaries(tmp: Path) -> None:
     check(fields.get(mt.NS_UPDATED_RECEIPT_DATE) == "2026-09-10",
           "and writes the confirmed date to custcol_sd_updatedreceiptdate",
           str(fields.get(mt.NS_UPDATED_RECEIPT_DATE)))
-    # OPEN QUESTION, recorded here rather than assumed either way: expectedReceiptDate
-    # is currently written too, with the same confirmed value. If the override
-    # mechanism alone is meant to drive it, this field should come out of the write
-    # -- that is Paula's call, not a refactor. This assertion pins today's behaviour
-    # so the decision is visible when it is made, not silently changed.
+    # SETTLED 2026-08-12 by sandbox test, no longer an open question: NetSuite does
+    # NOT derive expectedReceiptDate from the override pair. PO 8489541 line 18 was
+    # PATCHed with the override flag and updated date ONLY, and expectedReceiptDate
+    # stayed at its old value. So all three must be written together with the same
+    # value -- omitting it would leave the field NetSuite actually schedules against
+    # stale while the flag claimed otherwise. See architecture doc section 6.
     check(fields.get(mt.NS_EXPECTED_RECEIPT_DATE) == "2026-09-10",
-          "expectedReceiptDate ALSO carries the confirmed date (see comment: open question)",
+          "expectedReceiptDate is written too -- NetSuite does not derive it from the pair",
           str(fields.get(mt.NS_EXPECTED_RECEIPT_DATE)))
 
     # 3. The tool NEVER touches custcol_sd_fg_excluderepspark. Paula manages it by

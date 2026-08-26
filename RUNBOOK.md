@@ -4,7 +4,7 @@
 
 **Audience:** assumes general technical competence, no prior context on this specific project. Where more depth exists elsewhere, this doc points to it rather than repeating it — `PO-Update-Automation-Architecture.md` is the full design rationale; this doc is the "how do I actually run/fix/hand this off" companion.
 
-**Last updated:** 2026-08-24
+**Last updated:** 2026-08-26
 
 ---
 
@@ -39,6 +39,8 @@ In short: the hard, uncertain part (can this reliably read messy vendor document
    - Anything the extractor isn't confident about gets flagged for manual review rather than guessed.
 4. **Matching** (`matcher.py`) takes those parsed lines and looks up the real NetSuite PO. It matches to the exact PO line using NetSuite's own custom fields (`custcol_sd_tmpl_style`, `custcol_product_color.refName`, `custcol_product_size.refName`), not by parsing the item's display name. Size labels get normalized first (e.g., vendor's "XXL" -> NetSuite's "2X") via `SIZE_ALIASES`.
 5. A PO line that doesn't appear in a given shipment's packing list is left alone entirely — no record, no flag. Paula confirmed POs routinely ship in batches, so this is the normal case, not an error.
+
+6. **Persistence** (`ingest.py`, built 2026-08-26) writes the whole shipment into the database in one transaction: the intake event, its source documents and their roles, one row per PO, one `proposed_changes` row per extracted line in whatever state the matcher assigned, candidate rows where a key matched several open lines, and an `audit_log` entry. Re-ingesting the same document is a no-op — content dedup is checked before the extractor runs, so a re-forward costs nothing. Schema and reasoning: `PO-Update-Automation-Schema-Rationale.md`.
 
 ## 4. How the diff/approval logic works
 
@@ -80,7 +82,7 @@ It was created with `git init --separate-git-dir "C:\dev\po-agent.git"` so the g
 
 Remote is `https://github.com/Straight-Down/po-agent-pipeline.git`, **private** — it must stay private, because the tracked vendor corpus contains real third-party commercial data (supplier unit prices, a named inspector, customer contact details). `.gitattributes` marks pdf/xlsx/png/docx as binary; without it Git's heuristic classified a generated PDF as text and would have rewritten its bytes on checkout, silently invalidating the validation corpus.
 
-## 6. Known limitations and open risks (as of 2026-08-24)
+## 6. Known limitations and open risks (as of 2026-08-26)
 
 Ranked by how much they matter. Items struck through are resolved, with the resolution recorded in place rather than deleted — the reasoning trail is the point.
 
@@ -197,7 +199,28 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
     **What to build instead:** a new shared mailbox (`shipments@`), with app-only `Mail.Read` scoped to just that mailbox via **RBAC for Applications** — the mechanism that makes "this app, this one mailbox" expressible at all. Vendors are redirected there, or Paula forwards into it.
 
     **Two different admin roles are involved, which is what makes this a scheduling problem rather than a task:** the app registration and tenant-wide admin consent need **Entra ID** admin rights (Application Administrator or Global Administrator); creating the shared mailbox and the RBAC-for-Applications scope needs **Exchange** admin rights. Confirm both exist, with names attached, before Phase 2 starts — missing admin access has already blocked this project three times (Integration record, then role permissions, twice).
-12. **NetSuite's M2M certificate expires 2028-08-03** — calendar reminder only, no automated alert. Low urgency given the lead time, but worth a real alert once this is hosted on Azure rather than relying on memory.
+12. **NEW 2026-08-26 — vendors print colour NAMES; NetSuite stores 3-letter colour CODES. This blocks matching for some vendors entirely.** Found by ingesting the real corpus end to end, which is the only way it could have been found: every synthetic fixture in the suite had assumed NetSuite stores the name.
+
+    **The measurement.** 33 real extracted lines from the Legendz xlsx and the Symmetry pair. **4 matched a NetSuite line; 29 did not.** The split is entirely along this axis:
+
+    | Vendor prints | Example | NetSuite has | Matched |
+    |---|---|---|---|
+    | a colour **code** | Legendz: `MLT`, `DKF` | `MLT`, `DKF` | **yes** — 4 of 4 |
+    | a colour **name** | Symmetry: `NEW INDIGO`, `BLACK`, `COCONUT` | `NIN`, `BLK`/`BLC`, `COC` | **no** — 0 of 25 |
+
+    **There is no name to map to, anywhere in NetSuite.** `customlist_psgss_product_color` holds **589 values in which `name` is identical to `abbreviation`** — both are the 3-letter code. The item's display name carries the code too (`M650022 : M650022-<product>-NIN-S`). So unlike the size list, where `ALL`/`A` differ and REST returns the name, there is simply no long-form colour anywhere in the account. A `SIZE_ALIASES`-style mapping cannot be derived from NetSuite data because the data does not contain it.
+
+    **Three candidate resolutions, none chosen — this needs Paula or Brandon:**
+    1. **A curated colour-alias table** (`NEW INDIGO` → `NIN`), maintained like `SIZE_ALIASES`. Straightforward, but 589 codes is a lot to seed by hand and a wrong guess silently mismatches rather than failing.
+    2. **A source of truth elsewhere** — RepSpark, the PLM system, or a product master may already hold code↔name pairs. If one does, this is an import rather than a data-entry project.
+    3. **Ask vendors to print the code.** Cheapest technically, slowest organisationally, and it does not fix historical documents.
+
+    **What NOT to do:** fuzzy-match `NEW INDIGO` to `NIN` by initials or substring. `BLK` and `BLC` both exist on one PO, and `COO` and `COC` are both live values — initial-matching would produce confident wrong matches on exactly the pairs that matter, and a wrong colour writes a quantity to the wrong SKU.
+
+    **Current behaviour is correct and safe:** a name-printing line becomes `NEEDS_ATTENTION` with the reason *"no NetSuite line on PO 1720 matches M650022/NEW INDIGO/2XL"*. Nothing is guessed. But it means the tool cannot yet do useful work for a name-printing vendor, which makes this a **v1 scope question**, not only a technical one.
+
+    **Also found in the same run:** the Legendz slip printed **both `DKF` and `DFK`** for what is presumably one colour. `DKF` exists in NetSuite; `DFK` does not. Either the vendor typo'd or the extractor transposed — worth checking against the document before assuming which, and a reminder that a 3-letter code has no redundancy to catch a transposition.
+13. **NetSuite's M2M certificate expires 2028-08-03** — calendar reminder only, no automated alert. Low urgency given the lead time, but worth a real alert once this is hosted on Azure rather than relying on memory.
 
 ## 7. Design constraints discovered by testing
 

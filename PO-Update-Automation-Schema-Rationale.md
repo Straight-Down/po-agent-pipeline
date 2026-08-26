@@ -131,7 +131,7 @@ The lines that succeeded keep `WRITTEN` **and their original approval timestamps
 
 "Why did this line change?" is one query — `SELECT * FROM audit_log WHERE change_id = ? ORDER BY occurred_at` — and it returns the ordered story for either workflow, with `write_attempts.payload_json` showing exactly what was asserted to NetSuite.
 
-**`audit_log` is append-only.** Nothing in the application may `UPDATE` or `DELETE` it. That is a discipline the schema cannot enforce on its own; if it ever needs teeth, the answer is a database role without those grants on that table, not a trigger.
+**`audit_log` is append-only.** Nothing in the application may `UPDATE` or `DELETE` it. That is a discipline the schema cannot enforce on its own; the answer is a database role without those grants on that table, not a trigger — **now a Phase 4 cutover item in the build plan**, because a constraint recorded only in a rationale doc is a constraint nobody implements.
 
 ---
 
@@ -182,7 +182,7 @@ Four boundaries, each asserted by a test in `test_schema.py` rather than only wr
 
 ## 12. The state machine
 
-Kept as **data** — `change_states` and `change_state_transitions`, seeded by migration 0001 — so the legal set ships with the schema and cannot drift from the code that reads it. `proposed_changes.state` has a foreign key to `change_states`, which makes a misspelled status an integrity error instead of a row nobody notices.
+Kept as **data** — `change_states` and `change_state_transitions`, seeded by migration 0001 — so the legal set ships with the schema and cannot drift from the code that reads it. **The runtime guard reads the table** (`schema.assert_transition`, called on every state write including the initial insert), which is what stops the seeding from being decoration: `CHANGE_STATE_TRANSITIONS` in `schema.py` is the *authoring* source that seeds the table, the table is the *runtime authority*, and a test asserts the two still agree. One authority, one drift check — rather than a constant and a table each quietly believing itself in charge. `proposed_changes.state` has a foreign key to `change_states`, which makes a misspelled status an integrity error instead of a row nobody notices.
 
 ### States
 
@@ -320,8 +320,27 @@ alembic revision --autogenerate -m "what changed"
 
 ---
 
+## 15a. What the first real ingest measured
+
+The schema's first contact with real data (2026-08-26, `ingest.py` against the Legendz xlsx and both Symmetry PDFs) is worth recording, because a schema's claims are cheap until rows land in it.
+
+| | Legendz | Symmetry (pair) |
+|---|---|---|
+| `shipments` | 1 | 1 |
+| `shipment_sources` | 1 PRIMARY | 1 PRIMARY + 1 CROSS_CHECK |
+| `shipment_pos` | 1 (`1657` → `PO0001657`) | 2 (`1720`, `1721`) |
+| `proposed_changes` | 8 | 25 |
+| `change_candidates` | 0 | 0 |
+| units | 1,049 | 1,669 |
+
+**Idempotency held on real documents.** Re-ingesting both shipments and then re-forwarding each under a new message id left `proposed_changes` at 33 rows with **identical ids and 0 new ids minted**, and the extractor was not called again. `messages`, `message_attachments` and `audit_log` did grow — correctly: a duplicate arriving is a fact worth recording, and the skip is audited.
+
+**Every line came back `NEEDS_ATTENTION`**, for two distinct and legitimate reasons: 29 because the vendor printed a colour *name* against NetSuite's colour *codes* (RUNBOOK §6 item 12, a new blocker this run found), and 4 because the extractor reported `medium` confidence with a specific note — *"Quantity read from the block subtotal row 14; PO, style and colour inferred from the block header in row 12."* Those 4 are the first real rows in the calibration corpus: the tool's claim recorded, awaiting a human verdict.
+
+**Columns with no producer, reported rather than defaulted:** `ns_item_internal_id` and `ns_line_is_open` (33/33 NULL — both exist on `POLine` but `matcher.ProposedChange` does not surface them), `extractor_prompt_version` (no such constant), `agreement_json` (the cross-check result is a warning string, not structured data). The human and approval columns are 33/33 NULL by design — that is the review step's job.
+
 ## 16. What this deliberately does not include
 
-Phase 2 item 3 is the schema. Not built here, and not implied by anything above: the polling job, the Graph client, the review UI, the write-back worker. The tables are ready for all four; none of them is snuck in.
+Phase 2 item 3 was the schema; item 4 (`ingest.py`) is the writer that fills it. Still not built, and not implied by anything above: the polling job, the Graph client, the review UI, the write-back worker. The tables are ready for all four; none of them is snuck in.
 
 One thing worth stating because its absence looks like an omission: **there is no queue table.** `proposed_changes.state` plus its index is the queue. At 10–20 shipments a week, a separate queue would be a second source of truth about the same rows.

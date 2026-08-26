@@ -267,6 +267,49 @@ The whole parsing/matching phase was validated against **PO 8489541 (PO0001662)*
 
 Worth being precise about the failure: it was not insufficient rigour, it was **rigour aimed at one specimen**. A structural property of the corpus (does any PO have duplicate keys? do dates vary within a PO?) has to be checked **across** the population — one cheap aggregate query would have found this at the start of the phase rather than at the end of it. Before trusting a validation corpus again, ask what shapes it **structurally cannot contain**.
 
+### 7. A change that requires mass-rewriting correct assertions is probably wrong
+
+A guard was proposed for change 6: compare each slip line's quantity against the
+matched PO line's outstanding quantity (`quantity - quantity_received`), and refuse
+to propose anything — quantity or date — unless they were equal. The reasoning was
+sound in isolation: a NetSuite line holds one quantity and one date, so a line
+whose quantity arrives in two batches cannot be represented, and writing a date on
+it over-promises stock to RepSpark.
+
+Running it against the suite before committing produced **22 failed checks across
+7 test functions, 5 of them crashing mid-run** — and **not one was a real
+regression.** Every fixture in the suite used a slip quantity that differed from
+the line's ordered quantity, because that difference was the thing being tested.
+The guard turned all of them into flags.
+
+That number was the finding. Twenty-two assertions of correct behaviour cannot all
+be wrong at once, so the change was. Two errors surfaced by looking at *why* each
+one failed, neither visible from the rule itself:
+
+- **It contradicted a settled ruling.** Over-shipment flags under the guard, while
+  Paula's ruling 6 (*"there are always extra units that we accept"*) says it is
+  normal and must not be flagged. Some of those failing tests asserted that ruling
+  by name.
+- **It removed the tool's main job, arithmetically.** With `quantity_received = 0`,
+  outstanding equals ordered, so "slip equals outstanding" means "nothing to update
+  but the date". The tool could only ever have proposed a quantity change on a line
+  that already had receipts against it. `demo_matcher.py`, built on the real PO 1662
+  case, went from 2 proposals to 0.
+
+And the premise did not hold either: the guard existed to stop a date being written
+before Paula saw the slip, but nothing is written without her approval, so there was
+no race to prevent. She knows a line split is coming because she arranges the air
+shipment herself.
+
+**The habit worth keeping:** when a change makes many tests fail, read the failures
+before fixing them. If they were all testing correct behaviour, the blast radius is
+telling you about the change, not about the tests. The temptation is to see 22 red
+lines as 22 chores. Here it was one piece of evidence, and rewriting the fixtures
+would have destroyed it — the tests would have gone green around a rule that had
+quietly disabled the feature. What shipped instead was the same numbers with no
+gate: `line_balance` on every change, so the review screen shows "ordered 300,
+received 0, this slip 128" and the human who can judge it does.
+
 ## 9. How to recover when something breaks
 
 | Symptom | Likely cause | What to do |

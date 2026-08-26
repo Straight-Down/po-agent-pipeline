@@ -396,11 +396,50 @@ CHANGE_STATE_TRANSITIONS: tuple[tuple[str, str, str, str], ...] = (
 )
 
 
-def is_legal_transition(from_state: str, to_state: str) -> bool:
-    """In-process check; the seeded table is the authority the app should query."""
-    return any(
-        f == from_state and t == to_state for f, t, _trigger, _actor in CHANGE_STATE_TRANSITIONS
-    )
+class IllegalTransition(Exception):
+    """
+    Raised when a state change is not in `change_state_transitions`.
+
+    Carries both states so the message is actionable without a lookup.
+    """
+
+
+def legal_transitions(conn) -> set[tuple[str, str]]:
+    """
+    The legal `(from, to)` pairs, **read from the database**.
+
+    This is the runtime authority, deliberately. `CHANGE_STATE_TRANSITIONS` above
+    is the *authoring* source: migration 0001 seeds the table from it, and
+    `test_schema.py` asserts the two still agree. But the check that actually runs
+    reads the table, because otherwise the table would be decoration -- seeded,
+    never consulted, free to drift from the code by a migration that touches one
+    and not the other. There is one runtime authority and it is the deployed
+    schema.
+
+    The result is small (about thirty rows) and read per call rather than cached;
+    at this volume the query is not worth a cache invalidation problem.
+    """
+    rows = conn.execute(
+        change_state_transitions.select().with_only_columns(
+            change_state_transitions.c.from_state, change_state_transitions.c.to_state
+        )
+    ).all()
+    return {(r.from_state, r.to_state) for r in rows}
+
+
+def assert_transition(conn, from_state: str, to_state: str) -> None:
+    """
+    Refuse a state change the seeded table does not allow.
+
+    Called on every write of `proposed_changes.state`, including the initial
+    insert (whose `from_state` is the `(insert)` sentinel).
+    """
+    if (from_state, to_state) not in legal_transitions(conn):
+        raise IllegalTransition(
+            f"{from_state} -> {to_state} is not a legal transition. The legal set lives in "
+            "change_state_transitions, seeded by migration 0001; add a row there (via a new "
+            "migration) rather than working around this."
+        )
 
 
 # ---------------------------------------------------------------------------

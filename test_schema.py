@@ -534,9 +534,11 @@ def test_quantity_without_date() -> None:
           "WRITTEN with the quantity applied and NO date -- a legal resting place",
           f"{row.state}, date_write_status={row.date_write_status}")
 
-    # WRITTEN is not terminal, and this is the transition that proves it.
-    check(sc.is_legal_transition(sc.STATE_WRITTEN, sc.STATE_APPROVED),
-          "WRITTEN -> APPROVED is legal, for a date supplied later")
+    # WRITTEN is not terminal, and this is the transition that proves it. Asked of
+    # the DATABASE, which is the runtime authority -- see schema.legal_transitions.
+    with engine.connect() as conn:
+        check((sc.STATE_WRITTEN, sc.STATE_APPROVED) in sc.legal_transitions(conn),
+              "WRITTEN -> APPROVED is legal, for a date supplied later")
     with engine.connect() as conn:
         terminal = conn.execute(select(change_states.c.is_terminal).where(
             change_states.c.state == sc.STATE_WRITTEN)).scalar()
@@ -788,7 +790,22 @@ def test_state_machine_is_data() -> None:
                     (sc.STATE_INSERT, sc.STATE_WRITTEN),
                     (sc.STATE_NEEDS_RESOLUTION, sc.STATE_WRITTEN)):
         check(illegal not in edges, f"{illegal[0]} -> {illegal[1]} is NOT legal")
-        check(not sc.is_legal_transition(*illegal), "and the in-process guard agrees")
+        with engine.connect() as conn:
+            try:
+                sc.assert_transition(conn, *illegal)
+                check(False, "and the guard refuses it", "no exception raised")
+            except sc.IllegalTransition:
+                check(True, "and the guard refuses it")
+
+    # The table is the runtime authority; CHANGE_STATE_TRANSITIONS is the authoring
+    # source that seeds it. They must agree, or the seeding is decoration -- this is
+    # the drift check that earns the table its keep.
+    with engine.connect() as conn:
+        from_db = sc.legal_transitions(conn)
+    from_const = {(f, t) for f, t, _g, _a in sc.CHANGE_STATE_TRANSITIONS}
+    check(from_db == from_const,
+          "the seeded table and the authoring constant agree exactly",
+          str(sorted(from_db ^ from_const)) if from_db != from_const else "no drift")
 
     with engine.connect() as conn:
         terminal = set(conn.execute(select(change_states.c.state).where(

@@ -37,7 +37,7 @@ In short: the hard, uncertain part (can this reliably read messy vendor document
    - If the file is a known, previously-validated format (currently just Inprotex), a fast deterministic parser handles it for free.
    - Otherwise, the Anthropic API reads the document's actual structure (not just an image) and returns the same structured fields. This is the primary path for essentially all vendors, since every vendor's layout is different.
    - Anything the extractor isn't confident about gets flagged for manual review rather than guessed.
-4. **Matching** (`matcher.py`) takes those parsed lines and looks up the real NetSuite PO. It matches to the exact PO line using NetSuite's own custom fields (`custcol_sd_tmpl_style`, `custcol_product_color.refName`, `custcol_product_size.refName`), not by parsing the item's display name. Size labels get normalized first (e.g., vendor's "XXL" -> NetSuite's "2X") via `SIZE_ALIASES`.
+4. **Matching** (`matcher.py`) takes those parsed lines and looks up the real NetSuite PO. It matches to the exact PO line using NetSuite's own custom fields (`custcol_sd_tmpl_style`, `custcol_product_color.refName`, `custcol_product_size.refName`), not by parsing the item's display name. Size labels get normalized first (e.g., vendor's "XXL" -> NetSuite's "2X") via `SIZE_ALIASES`. **Colour** is matched by code first; if the vendor printed a name instead (`NEW INDIGO` against NetSuite's `NIN`), it is resolved through the long-form name on the child item — **scoped to the colours on that PO only**, never a global table, and flagged rather than guessed if two colours on one PO could both be meant (§6 item 12).
 5. A PO line that doesn't appear in a given shipment's packing list is left alone entirely — no record, no flag. Paula confirmed POs routinely ship in batches, so this is the normal case, not an error.
 
 6. **Persistence** (`ingest.py`, built 2026-08-26) writes the whole shipment into the database in one transaction: the intake event, its source documents and their roles, one row per PO, one `proposed_changes` row per extracted line in whatever state the matcher assigned, candidate rows where a key matched several open lines, and an `audit_log` entry. Re-ingesting the same document is a no-op — content dedup is checked before the extractor runs, so a re-forward costs nothing. Schema and reasoning: `PO-Update-Automation-Schema-Rationale.md`.
@@ -199,7 +199,7 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
     **What to build instead:** a new shared mailbox (`shipments@`), with app-only `Mail.Read` scoped to just that mailbox via **RBAC for Applications** — the mechanism that makes "this app, this one mailbox" expressible at all. Vendors are redirected there, or Paula forwards into it.
 
     **Two different admin roles are involved, which is what makes this a scheduling problem rather than a task:** the app registration and tenant-wide admin consent need **Entra ID** admin rights (Application Administrator or Global Administrator); creating the shared mailbox and the RBAC-for-Applications scope needs **Exchange** admin rights. Confirm both exist, with names attached, before Phase 2 starts — missing admin access has already blocked this project three times (Integration record, then role permissions, twice).
-12. **NEW 2026-08-26 — vendors print colour NAMES; NetSuite stores 3-letter colour CODES. This blocks matching for some vendors entirely.** Found by ingesting the real corpus end to end, which is the only way it could have been found: every synthetic fixture in the suite had assumed NetSuite stores the name.
+12. ~~**NEW 2026-08-26 — vendors print colour NAMES; NetSuite stores 3-letter colour CODES. This blocks matching for some vendors entirely.**~~ **RESOLVED 2026-08-26 (change 7).** Kept in full because the correction matters: the original entry said no long-form colour existed *anywhere in the account*. That was too broad. It exists nowhere in the **sandbox colour list** — but it does exist on the **child item record**, and production's colour list `Name` column has it too.
 
     **The measurement.** 33 real extracted lines from the Legendz xlsx and the Symmetry pair. **4 matched a NetSuite line; 29 did not.** The split is entirely along this axis:
 
@@ -208,19 +208,42 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
     | a colour **code** | Legendz: `MLT`, `DKF` | `MLT`, `DKF` | **yes** — 4 of 4 |
     | a colour **name** | Symmetry: `NEW INDIGO`, `BLACK`, `COCONUT` | `NIN`, `BLK`/`BLC`, `COC` | **no** — 0 of 25 |
 
-    **There is no name to map to, anywhere in NetSuite.** `customlist_psgss_product_color` holds **589 values in which `name` is identical to `abbreviation`** — both are the 3-letter code. The item's display name carries the code too (`M650022 : M650022-<product>-NIN-S`). So unlike the size list, where `ALL`/`A` differ and REST returns the name, there is simply no long-form colour anywhere in the account. A `SIZE_ALIASES`-style mapping cannot be derived from NetSuite data because the data does not contain it.
+    **Where the long name is NOT.** `customlist_psgss_product_color` holds **589 values in which `name` is identical to `abbreviation`** — both the 3-letter code. Verified two ways on the same object: REST `customlist_psgss_product_color/334` returns `name='NIN'`, `abbreviation='NIN'`, and SuiteQL filtered on `id = 334` (no name predicate) agrees. The control is the size list, where the identical REST call returns `name='ALL'`, `abbreviation='A'` — so both fields *are* exposed and the colour data really is code-in-Name. The record type has 13 fields and none of the others holds a name either; `custrecordproduct_color_standard` ("Color Standard") is populated on 21 of 589 values and holds Pantone/Coloro references (`MLT → 'Coloro 122-40-14'`).
 
-    **Three candidate resolutions, none chosen — this needs Paula or Brandon:**
-    1. **A curated colour-alias table** (`NEW INDIGO` → `NIN`), maintained like `SIZE_ALIASES`. Straightforward, but 589 codes is a lot to seed by hand and a wrong guess silently mismatches rather than failing.
-    2. **A source of truth elsewhere** — RepSpark, the PLM system, or a product master may already hold code↔name pairs. If one does, this is an import rather than a data-entry project.
-    3. **Ask vendors to print the code.** Cheapest technically, slowest organisationally, and it does not fix historical documents.
+    **Where it IS: `custitem_psgss_product_color_desc` on the child item.** `NIN → 'New Indigo'`, `BLK → 'Black'`, `BLC → 'Blackcurrant'`, `COC → 'Coconut'`, `MLT → 'Moonlight'`, `DKF → 'Dark Forest'`. `custitemcolorfamily` is a coarser grouping (Blue, Purple, Neutral) and is not the name.
 
-    **What NOT to do:** fuzzy-match `NEW INDIGO` to `NIN` by initials or substring. `BLK` and `BLC` both exist on one PO, and `COO` and `COC` are both live values — initial-matching would produce confident wrong matches on exactly the pairs that matter, and a wrong colour writes a quantity to the wrong SKU.
+    **Coverage on the population that matters** — items on **open** POs, since those are the only ones a packing slip can touch (138 open POs of 1,659; 3,677 lines; 2,393 distinct items):
 
-    **Current behaviour is correct and safe:** a name-printing line becomes `NEEDS_ATTENTION` with the reason *"no NetSuite line on PO 1720 matches M650022/NEW INDIGO/2XL"*. Nothing is guessed. But it means the tool cannot yet do useful work for a name-printing vendor, which makes this a **v1 scope question**, not only a technical one.
+    | Measure | Value |
+    |---|---|
+    | distinct items with a colour name | **2,390 of 2,393** |
+    | the three without | poly mailers and zipper bags — packaging, no colour by nature |
+    | distinct colour codes on open POs | 114, **every one of which has a name** |
 
-    **Also found in the same run:** the Legendz slip printed **both `DKF` and `DFK`** for what is presumably one colour. `DKF` exists in NetSuite; `DFK` does not. Either the vendor typo'd or the extractor transposed — worth checking against the document before assuming which, and a reminder that a 3-letter code has no redundancy to catch a transposition.
-13. **NetSuite's M2M certificate expires 2028-08-03** — calendar reminder only, no automated alert. Low urgency given the lead time, but worth a real alert once this is hosted on Azure rather than relying on memory.
+    **Production and sandbox provably disagree, in both directions.** A UI export of the colour list from another account state has 620 rows with curated long names (`Name='New Indigo'`, `Abbreviation='NIN'`); sandbox has 589 with codes, and for `abbreviation='B'` sandbox's `Name` is `'BLB'` where the export says `'Blue Sky'`. It is the same list — `custrecordproduct_color_standard` matches row for row. But sandbox also holds values the export lacks (id 576 `TAYLOR WHITNEY CABERNET`/`TWC`). **The item field was chosen because it is verified in the account we test against**; building on production's list would mean colour tests that pass in production and fail in sandbox.
+
+    **The resolution rule (change 7):** canonical CODE match first — a code-printing vendor costs no item read at all — then canonical NAME match **scoped to the colours on that PO**, then flag. Never a global map, never fuzzy.
+
+    **Scoping is what makes it safe**, and the measurement says so. Globally the item data has collisions, but only just: one name maps to two codes (`'Navy / Silver'` → `NAV` and `NVSL`) and five codes have items that disagree on spelling (`FUS`: Fuchsia/Fucshia, `MLK`: MilkShake/Milkshake, `CHC`: Charcoal/Charcoal Heather, `NAV`: Navy/Navy / Silver, `NIN`: NIN/New Indigo). **Per PO there is not one collision across all 133 open POs** — median 3 colours per PO, max 20. `BLACK` versus `Blackcurrant` is the shape that would defeat a fuzzy matcher and is trivially unambiguous when the only colours in the room are BLK, COC and NIN. If two colours on one PO ever do collide, the change flags with both candidates and picks neither.
+
+    **Correction to an earlier figure, which should not be quoted:** a previous probe reported "51 codes carry multiple descriptions" and a value holding `'Black'`, `'INDe'` and `'Indigo'`. That came from joining the colour list to `item.custitem_psgss_product_color`, which is **empty on child matrix items** — an invalid join. The correct pairing takes the code from the PO line (`custcol_product_color`) and the name from the item, and gives the much cleaner figures above.
+
+    **What NOT to do, still:** fuzzy-match by initials or substring. `BLK`/`BLC`, `COO`/`COC` and `HER`/`H` are all live values, and a wrong colour writes a quantity against the wrong product. Three tests assert those pairs never cross-match.
+
+    **Result on the real corpus:** 29 of 33 lines now match, up from 4. The remaining 4 are the `DFK` lines — see item 13.
+13. **NEW 2026-08-26 — the Legendz slip prints both `DKF` and `DFK`, and the extractor read both correctly.** Not an extraction error. The two forms are two different cells on two different rows, transcribed faithfully:
+
+    | Cell | Verbatim | Style on the same row |
+    |---|---|---|
+    | `D6` | `'DFK'` | `C6 = 'PO#1657，M630018'` |
+    | `D15` | `'DKF'` | `C15 = 'PO#1657，M680009'` |
+
+    NetSuite settles which is right: `PO0001657` carries `M630018` in **DKF and MLT**, and `M680009` in **DKF and MLT**. So row 6's `DFK` is a transposition of `DKF`, and `DFK` is not among the 589 colour values at all. A vendor typo, worth raising with Legendz — four lines (148, 205, 188 and 32 units) cannot be matched because of it.
+
+    **The extractor still has zero observed errors** across every real document run so far. Worth stating plainly, because "we extracted both forms" looked at first like the first extraction failure and would have contaminated the calibration corpus if recorded as one.
+
+    **The permanent lesson:** a 3-letter code carries **no redundancy** — `DFK` is exactly as plausible-looking as `DKF`, and nothing in the string reveals the transposition. So a printed code must be **validated against the colour list**, never trusted because it looks like a code. The current behaviour does this correctly by construction: an unknown code matches no line and flags.
+14. **NetSuite's M2M certificate expires 2028-08-03** — calendar reminder only, no automated alert. Low urgency given the lead time, but worth a real alert once this is hosted on Azure rather than relying on memory.
 
 ## 7. Design constraints discovered by testing
 

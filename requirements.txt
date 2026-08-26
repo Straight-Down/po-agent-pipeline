@@ -8,6 +8,10 @@ python-dotenv>=1.0        # load .env config
 anthropic>=0.120           # structured outputs (client.beta.messages.parse) + pydantic
                            # pydantic comes in as an anthropic dependency
 
+# Phase 2 -- database schema and migrations
+SQLAlchemy>=2.0             # one table definition, rendered for SQLite AND Azure SQL
+alembic>=1.13               # migrations, with render_as_batch for SQLite's ALTER limits
+
 # Document reading -- also used by the Phase 0 prototypes (parse_packing_slip.py)
 openpyxl>=3.1              # xlsx cell grids
 pdfplumber>=0.11           # PDF text layer

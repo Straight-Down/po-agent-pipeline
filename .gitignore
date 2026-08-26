@@ -41,6 +41,14 @@ __pycache__/
 # ---------------------------------------------------------------------------
 # Generated / transient output
 # ---------------------------------------------------------------------------
+# The local development database. Built from migration 0001 -- never committed,
+# because the schema lives in the migration and the DATA in it would be real
+# vendor and PO information.
+po_agent.db
+*.db
+*.db-journal
+*.sqlite3
+
 # parse_packing_slip.py's default CSV output, and ad-hoc extraction dumps.
 proposed_updates.csv
 *.tmp.xlsx

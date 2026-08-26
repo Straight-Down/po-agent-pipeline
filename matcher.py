@@ -131,6 +131,22 @@ def _size_key(size: str) -> str:
 
 
 @dataclass
+class ColourLookup:
+    """
+    One PO's colour vocabulary: long-form name -> the code(s) it means, ON THIS PO.
+
+    Built per PO by `build_colour_lookup`. `by_name` keys and values are canonical
+    (change 4); `display` maps a canonical code back to the name as NetSuite spells
+    it, for review messages. `missing_names` lists codes whose item carried no
+    colour name -- a printed name can never resolve to those, so they flag.
+    """
+
+    by_name: dict = field(default_factory=dict)
+    display: dict = field(default_factory=dict)
+    missing_names: list = field(default_factory=list)
+
+
+@dataclass
 class ProposedChange:
     """
     One staged change to one NetSuite PO line.
@@ -176,6 +192,13 @@ class ProposedChange:
     #: The five quantity figures for this line, on EVERY change -- see
     #: `_line_balance`. Display context, never a gate.
     line_balance: dict = field(default_factory=dict)
+
+    #: Set when the colour matched through the item's long-form NAME rather than by
+    #: code, e.g. "printed 'NEW INDIGO' resolved to code NIN ('New Indigo')".
+    #: Display and audit only: matching a printed name to a code is a non-obvious
+    #: inference, so it should be visible to whoever reviews the row. Not persisted
+    #: -- the schema has no column for it yet.
+    colour_resolution: str = ""
 
     #: Every NetSuite line whose canonical key matched, when the match was not a
     #: clean 1:1. Populated for NEEDS_RESOLUTION (several open lines) and for the
@@ -304,7 +327,11 @@ def _candidate_payload(line: POLine) -> dict:
     }
 
 
-def _find_matching_lines(vendor_line: dict, ns_lines: list[POLine]) -> list[POLine]:
+def _find_matching_lines(
+    vendor_line: dict,
+    ns_lines: list[POLine],
+    colour_lookup: Optional[ColourLookup] = None,
+) -> tuple[list[POLine], str, str]:
     """
     ALL NetSuite lines whose canonical key matches -- not the first one.
 
@@ -321,20 +348,140 @@ def _find_matching_lines(vendor_line: dict, ns_lines: list[POLine]) -> list[POLi
     The previous `_find_matching_line` returned the first match and silently
     ignored the rest, which meant one line was updated and its twin left stale
     with no flag.
+
+    Returns `(lines, colour_resolution, colour_problem)` -- the colour may have been
+    recovered from the item's long-form name (`_resolve_colour_codes`), which is
+    worth recording, and may have been ambiguous, which must flag.
     """
     style = canonical(vendor_line.get("style_number"))
-    color = canonical(vendor_line.get("color"))
+    printed_colour = canonical(vendor_line.get("color"))
     size = _size_key(vendor_line.get("size"))
-    return [
+    colours, resolution, problem = _resolve_colour_codes(
+        printed_colour, ns_lines, colour_lookup
+    )
+    matches = [
         line
         for line in ns_lines
         # BOTH operands are canonicalised. Normalising only the extracted side
         # would relocate the mismatch rather than fix it -- there is no guarantee
         # NetSuite's stored colour is clean either.
         if canonical(line.style_number) == style
-        and canonical(line.color) == color
+        and canonical(line.color) in colours
         and _size_key(line.size) == size
     ]
+    return matches, resolution, problem
+
+
+def build_colour_lookup(
+    client: NetSuiteClient, ns_lines: list[POLine], cache: Optional[dict] = None
+) -> ColourLookup:
+    """
+    Build one PO's name -> code lookup, reading each distinct colour's item once.
+
+    **Scoped to this PO, never a global table, and that is the whole design.**
+
+    Vendors do not agree on how to write a colour. Legendz prints the code
+    (`MLT`, `DKF`); Symmetry prints the name (`NEW INDIGO`, `BLACK`, `COCONUT`).
+    NetSuite stores only the code on the PO line, and the long name on the child
+    item. So a name-printing vendor needs the code recovered from the name -- and
+    the safe way to do that is against the handful of colours on the PO in hand.
+
+    Measured on the population that matters (items on open POs, 133 POs, 114
+    distinct colour codes):
+
+    - **Every one of the 114 codes has a name.** Coverage is 2,390 of 2,393
+      distinct items; the three exceptions are poly mailers, which have no colour.
+    - **Globally the data has collisions, but only just:** one name maps to two
+      codes (`'Navy / Silver'` -> `NAV` and `NVSL`), and five codes have items that
+      disagree on spelling (`FUS`: Fuchsia / Fucshia; `MLK`: MilkShake / Milkshake;
+      `CHC`: Charcoal / Charcoal Heather; `NAV`: Navy / Navy / Silver; `NIN`: NIN /
+      New Indigo -- some items carry the code in the name field).
+    - **Per PO, zero collisions.** Across all 133 open POs there is not one where a
+      printed name would resolve to two codes. `BLACK` versus `Blackcurrant` is the
+      shape that would defeat a fuzzy matcher and is trivially unambiguous when the
+      only colours in the room are BLK, COC and NIN.
+
+    (An earlier probe reported "51 codes carry multiple descriptions" and a value
+    holding 'Black', 'INDe' and 'Indigo'. That came from joining the colour list to
+    `item.custitem_psgss_product_color`, which is EMPTY on child matrix items -- an
+    invalid join. The figures above use the correct pairing: the code from the PO
+    line, the name from the item. Do not quote the old numbers.)
+
+    Same principle as Paula's ruling on sizes: resolve against the vocabulary
+    actually in play, never against a vendor profile or a global table.
+    """
+    lookup = ColourLookup()
+    cache = cache if cache is not None else {}
+    first_item_for_code: dict[str, POLine] = {}
+    for line in ns_lines:
+        code = canonical(line.color)
+        if code and code not in first_item_for_code:
+            first_item_for_code[code] = line
+
+    for code, line in first_item_for_code.items():
+        if line.item_internal_id is None:
+            lookup.missing_names.append(line.color)
+            continue
+        name = client.get_item_colour_name(line.item_internal_id, cache=cache)
+        if not name:
+            # No name to match against. The line is still matchable by CODE; a
+            # printed name simply cannot reach it, and will flag.
+            lookup.missing_names.append(line.color)
+            continue
+        lookup.by_name.setdefault(canonical(name), set()).add(code)
+        lookup.display[code] = name
+    return lookup
+
+
+def _resolve_colour_codes(
+    printed: str, ns_lines: list[POLine], lookup: Optional[ColourLookup]
+) -> tuple[set, str, str]:
+    """
+    Which NetSuite colour code(s) does the printed colour mean, on THIS PO?
+
+    Returns `(codes, resolution_note, problem)`. `problem` is non-empty only when a
+    printed name is ambiguous on this PO -- two colours it could equally be. That
+    case is flagged with both candidates and never resolved, following change 5:
+    a wrong colour writes a quantity against the wrong product, which is exactly
+    the kind of error nobody notices downstream.
+
+    **Order matters.** Code match first, so a code-printing vendor needs no item
+    read at all. Only then the name path.
+
+    **No fuzzy matching, at any point.** `BLK`/`BLC`, `COO`/`COC` and `HER`/`H` are
+    all live colour values in this account. Initial-matching or substring-matching
+    would produce confident wrong answers on exactly the pairs that matter.
+    """
+    po_codes = {canonical(line.color) for line in ns_lines}
+
+    if printed in po_codes:
+        return {printed}, "", ""
+
+    if lookup is None or not lookup.by_name:
+        # No name data (offline, mock client, or nothing populated). Behaviour is
+        # then exactly what it was before this change: code comparison only.
+        return {printed}, "", ""
+
+    candidates = lookup.by_name.get(printed, set()) & po_codes
+    if len(candidates) == 1:
+        code = next(iter(candidates))
+        display = lookup.display.get(code, code)
+        return candidates, (
+            f"printed colour {printed!r} resolved to code {code.upper()} "
+            f"({display!r}) via the item's colour name"
+        ), ""
+
+    if len(candidates) > 1:
+        named = ", ".join(
+            f"{c.upper()} ({lookup.display.get(c, c)!r})" for c in sorted(candidates)
+        )
+        return candidates, "", (
+            f"printed colour {printed!r} matches {len(candidates)} colours on this PO "
+            f"({named}). Not choosing between them -- a wrong colour would write this "
+            "quantity against the wrong product"
+        )
+
+    return {printed}, "", ""
 
 
 def _line_balance(line: Optional[POLine], slip_quantity: Optional[float]) -> dict:
@@ -490,6 +637,7 @@ def build_proposed_changes(
     eta: Optional[str] = None,
     etd: Optional[str] = None,
     shipment_needs_manual_entry: bool = False,
+    colour_lookups: Optional[dict] = None,
 ) -> list[ProposedChange]:
     """
     Stage the changes a shipment implies, for human review.
@@ -500,6 +648,12 @@ def build_proposed_changes(
     `shipment_needs_manual_entry=True` marks every record NEEDS_ATTENTION — used
     when the parsing layer could not resolve the shipment to style/colour/size
     lines from an acceptable source document.
+
+    `colour_lookups` maps a PO number to its `ColourLookup`, letting a vendor's
+    printed colour NAME resolve to NetSuite's code (see `build_colour_lookup`).
+    Omit it and matching is by code only, which is what a code-printing vendor
+    needs and all this did before change 7. The lookups are passed in rather than
+    built here so this function stays free of per-item I/O.
     """
     eta_date = _parse_eta_to_date(eta)
     etd_date = _parse_eta_to_date(etd)
@@ -516,7 +670,9 @@ def build_proposed_changes(
         note = str(vl.get("note") or "")
         ns_lines = ns_lines_by_po.get(po_number, [])
         # ALL matching lines, not just the first — the key is not unique per line.
-        candidates = _find_matching_lines(vl, ns_lines)
+        candidates, colour_resolution, colour_problem = _find_matching_lines(
+            vl, ns_lines, (colour_lookups or {}).get(po_number)
+        )
         match, resolution_problem, ambiguous_lines = _resolve_target_line(candidates)
 
         change = ProposedChange(
@@ -534,6 +690,7 @@ def build_proposed_changes(
             vendor_eta=reference_eta,
             extraction_confidence=confidence,
             extraction_note=note,
+            colour_resolution=colour_resolution,
             # Display context on every change, flagged or not. Nothing branches on
             # it -- see `_line_balance` for why a gate here was cancelled.
             line_balance=_line_balance(match, _as_quantity(vl.get("quantity"))),
@@ -547,6 +704,10 @@ def build_proposed_changes(
         )
 
         reasons: list[str] = []
+        if colour_problem:
+            # Two colours on this PO that the printed name could equally mean. Flag
+            # with both, never pick -- change 5's rule, applied to colour.
+            reasons.append(colour_problem)
         if resolution_problem:
             reasons.append(resolution_problem)
         if match is None and candidates and all(line.closed for line in candidates):

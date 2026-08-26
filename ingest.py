@@ -101,6 +101,9 @@ class IngestReport:
     rows: dict = field(default_factory=dict)
     states: dict = field(default_factory=dict)
     po_resolution: dict = field(default_factory=dict)
+    #: How many item records were read for colour names, and what they said.
+    colour_reads: int = 0
+    colour_names: dict = field(default_factory=dict)
     unpopulated: list = field(default_factory=list)
     parse_warnings: list = field(default_factory=list)
 
@@ -458,6 +461,40 @@ def ingest_shipment(
     lines_by_key, resolution = _fetch_po_lines(client, po_keys, tranid_resolver)
     report.po_resolution = resolution
 
+    # Per-PO colour vocabularies, built with the LIVE client because the matcher is
+    # handed a mock one. Cached by item id for the whole ingest, then discarded.
+    #
+    # Built LAZILY, per PO: only if some colour on the slip does not already match a
+    # code on that PO. A code-printing vendor therefore costs ZERO item reads, which
+    # is the point -- eager construction would charge every shipment for a lookup
+    # most of them never consult.
+    colour_cache: dict = {}
+    colour_lookups = {}
+    if client is not None and not client.is_mock:
+        for key, lines in lines_by_key.items():
+            printed = {
+                mt.canonical(ln.get("color"))
+                for ln in parsed.lines
+                if str(ln.get("po_number") or "").strip() == key
+            }
+            codes = {mt.canonical(line.color) for line in lines}
+            if not printed - codes:
+                continue
+            colour_lookups[key] = mt.build_colour_lookup(client, lines, cache=colour_cache)
+        report.colour_reads = len(colour_cache)
+        report.colour_names = {
+            key: dict(sorted(lookup.display.items()))
+            for key, lookup in colour_lookups.items()
+        }
+        missing = sorted({
+            code for lookup in colour_lookups.values() for code in lookup.missing_names
+        })
+        if missing:
+            report.unpopulated.append(
+                "colour codes on these POs whose item carries no colour name, so a "
+                f"printed NAME cannot resolve to them (code matching still works): {missing}"
+            )
+
     # The matcher is handed a MOCK client holding exactly the lines already read.
     # Two reasons: it cannot make a surprise network call mid-diff, and an
     # unresolvable PO arrives as an empty line list (-> NEEDS_ATTENTION) instead of
@@ -468,6 +505,7 @@ def ingest_shipment(
         eta=parsed.ship_info.get("eta"),
         etd=parsed.ship_info.get("etd"),
         shipment_needs_manual_entry=parsed.needs_manual_entry,
+        colour_lookups=colour_lookups,
     )
 
     counts = {k: 0 for k in ("shipments", "shipment_sources", "shipment_pos",

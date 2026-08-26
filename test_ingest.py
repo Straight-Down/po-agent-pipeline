@@ -474,6 +474,121 @@ def test_audit_and_state_guard() -> None:
         check(True, "removing the row from the TABLE makes the guard refuse")
 
 
+def test_colour_resolution_end_to_end() -> None:
+    section("colour resolution through the ingest, and what it costs")
+
+    class LiveishClient:
+        """
+        Duck-types the four things `ingest` asks of a live client, with counters.
+
+        Not a NetSuiteClient subclass on purpose: `is_mock` is the switch ingest
+        uses to decide whether to read at all, and faking it on a real client would
+        put a mock into paths that refuse mock input.
+        """
+
+        is_mock = False
+
+        def __init__(self, lines_by_tranid, colour_names):
+            self.lines_by_tranid = lines_by_tranid
+            self.colour_names = colour_names
+            self.last_lookup_strategy = "stub"
+            self.colour_reads = 0
+
+        def resolve_po_internal_id(self, tranid):
+            if tranid not in self.lines_by_tranid:
+                from netsuite_client import NetSuiteError
+
+                raise NetSuiteError(f"no such PO {tranid}")
+            return f"internal-{tranid}"
+
+        def get_purchase_order(self, tranid, **kwargs):
+            return self.lines_by_tranid.get(tranid, [])
+
+        def get_item_colour_name(self, item_internal_id, cache=None):
+            key = str(item_internal_id)
+            if cache is not None and key in cache:
+                return cache[key]
+            self.colour_reads += 1
+            value = self.colour_names.get(key)
+            if cache is not None:
+                cache[key] = value
+            return value
+
+    def po_line(line_id, colour, size, qty, style="M650022"):
+        line = ns_line(line_id=line_id, style=style, color=colour, size=size, qty=qty)
+        line.item_internal_id = f"item-{colour}"
+        return line
+
+    def ingest_one(printed_colour, po_lines, colour_names, style="M650022", db=None):
+        engine = db or fresh_db()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            docs = make_docs(tmp, (f"packing-{printed_colour}.xlsx",),
+                             payload=printed_colour.encode())
+            classification = FakeClassification(
+                selected=[FakeClassification.Item(docs[0], "packing_list")])
+            parsed = ParseResult(
+                lines=[{"po_number": "1720", "style_number": style,
+                        "color": printed_colour, "size": "M", "quantity": 110,
+                        "confidence": "high", "note": "", "source_hint": "P1!R3"}],
+                parser="claude", vendor_name="Symmetry")
+            client = LiveishClient({"1720": po_lines}, colour_names)
+            monkey = {}
+            install_stub_parse(monkey, parsed, classification)
+            try:
+                report = ing.ingest_shipment(
+                    engine, docs, message=msg(f"AAMk-{printed_colour}"),
+                    client=client, now=NOW)
+            finally:
+                restore(monkey)
+        return engine, report, client
+
+    # A code-printing vendor: every printed colour is already a code on the PO, so
+    # NOT ONE item is read. This is the cost model the change was scoped around.
+    engine, report, client = ingest_one(
+        "MLT", [po_line("14", "MLT", "M", 100), po_line("15", "DKF", "M", 50)],
+        {"item-MLT": "Moonlight", "item-DKF": "Dark Forest"})
+    with engine.connect() as conn:
+        row = conn.execute(select(proposed_changes)).one()
+    check(row.state == sc.STATE_PENDING_REVIEW and row.ns_line_id == "14",
+          "a printed CODE matches through the ingest", f"{row.state}/{row.ns_line_id}")
+    check(client.colour_reads == 0,
+          "and costs ZERO colour reads -- no lookup was built at all",
+          str(client.colour_reads))
+    check(report.colour_reads == 0, "the report agrees", str(report.colour_reads))
+
+    # A name-printing vendor: the lookup is built, the name resolves, and the
+    # printed text is preserved verbatim beside the canonical key.
+    engine, report, client = ingest_one(
+        "NEW INDIGO", [po_line("2", "NIN", "M", 155), po_line("3", "MLT", "M", 20)],
+        {"item-NIN": "New Indigo", "item-MLT": "Moonlight"})
+    with engine.connect() as conn:
+        row = conn.execute(select(proposed_changes)).one()
+    check(row.state == sc.STATE_PENDING_REVIEW and row.ns_line_id == "2",
+          "a printed NAME resolves to the code's line", f"{row.state}/{row.ns_line_id}")
+    check(row.src_color_text == "NEW INDIGO" and row.key_color == "new indigo",
+          "printed text preserved verbatim, canonical key alongside",
+          f"{row.src_color_text!r}/{row.key_color!r}")
+    check(client.colour_reads == 2, "one read per distinct colour on the PO",
+          str(client.colour_reads))
+    check(report.colour_names.get("1720", {}).get("nin") == "New Indigo",
+          "and the report records what NetSuite called it",
+          str(report.colour_names))
+
+    # An unresolvable colour still flags, and the read attempt is recorded.
+    engine, report, client = ingest_one(
+        "DFK", [po_line("14", "DKF", "M", 100)], {"item-DKF": "Dark Forest"})
+    with engine.connect() as conn:
+        row = conn.execute(select(proposed_changes)).one()
+    check(row.state == sc.STATE_NEEDS_ATTENTION and row.ns_line_id is None,
+          "a colour matching neither a code nor a name flags", row.state)
+    check("no NetSuite line" in (row.attention_reason or ""),
+          "with the no-match reason", (row.attention_reason or "")[:60])
+    check(client.colour_reads == 1,
+          "having tried the name path once (the code path missed)",
+          str(client.colour_reads))
+
+
 def test_scope_boundaries() -> None:
     section("scope boundaries the ingest path must not cross")
     engine = fresh_db()
@@ -577,6 +692,7 @@ def main() -> int:
         test_multi_po_document,
         test_multi_candidate_line,
         test_audit_and_state_guard,
+        test_colour_resolution_end_to_end,
         test_scope_boundaries,
         test_gaps_are_reported_not_defaulted,
     ):

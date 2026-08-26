@@ -1898,6 +1898,171 @@ def test_line_balance_context(tmp: Path) -> None:
         check(not hasattr(mt, name), f"no {name} -- the gating version stays cancelled")
 
 
+def test_colour_resolution(tmp: Path) -> None:
+    section("PO-scoped colour resolution: vendor NAMES against NetSuite CODES")
+    import datetime as dt
+
+    import matcher as mt
+    from netsuite_client import NetSuiteClient, POLine
+
+    class ColourClient:
+        """
+        Stands in for the live client's `get_item_colour_name`, counting reads.
+
+        Only that one method is needed: `build_colour_lookup` does no other I/O.
+        """
+
+        def __init__(self, names):
+            self.names = names          # item internal id -> long-form colour name
+            self.reads = 0
+
+        def get_item_colour_name(self, item_internal_id, cache=None):
+            key = str(item_internal_id)
+            if cache is not None and key in cache:
+                return cache[key]
+            self.reads += 1
+            value = self.names.get(key)
+            if cache is not None:
+                cache[key] = value
+            return value
+
+    def ns(line_id, colour, size="M", qty=100, style="M650022", item_id=None):
+        return POLine(
+            line_id=line_id, item=f"{style} : {style}-Burnside-{colour}-{size}",
+            style_number=style, vendor_name="Symmetry", color=colour, size=size,
+            quantity=qty, units="Ea", expected_receipt_date=dt.date(2026, 9, 1),
+            override_expected_receipt=False, updated_receipt_date=None, is_open=True,
+            quantity_received=0.0, item_internal_id=item_id or f"item-{colour}",
+        )
+
+    def vendor(colour, size="M", qty=110, style="M650022", po="1720"):
+        return {"po_number": po, "style_number": style, "color": colour, "size": size,
+                "quantity": qty, "confidence": "high", "note": ""}
+
+    def run(ns_lines, vendor_line, names=None, po="1720"):
+        client = ColourClient(names or {})
+        lookups = {po: mt.build_colour_lookup(client, ns_lines)} if names else {}
+        changes = mt.build_proposed_changes(
+            [vendor_line], NetSuiteClient(mock_data={po: ns_lines}),
+            colour_lookups=lookups)
+        return changes[0], client
+
+    # 1. CODE path first, and it costs no item read. Legendz prints codes.
+    lines = [ns("14", "MLT"), ns("15", "DKF")]
+    client = ColourClient({"item-MLT": "Moonlight", "item-DKF": "Dark Forest"})
+    change = mt.build_proposed_changes(
+        [vendor("MLT")], NetSuiteClient(mock_data={"1720": lines}),
+        colour_lookups={"1720": mt.ColourLookup()})[0]
+    check(change.status == mt.STATUS_PENDING_REVIEW and change.line_id == "14",
+          "a printed CODE matches directly", f"{change.status}/{change.line_id}")
+    check(change.colour_resolution == "",
+          "and records no name resolution, because none was needed",
+          repr(change.colour_resolution))
+    check(client.reads == 0, "no item was read for a code-printing vendor", str(client.reads))
+
+    # 2. NAME path. Symmetry prints 'NEW INDIGO'; NetSuite stores 'NIN'.
+    lines = [ns("3", "NIN"), ns("4", "MLT")]
+    change, client = run(lines, vendor("NEW INDIGO"),
+                         {"item-NIN": "New Indigo", "item-MLT": "Moonlight"})
+    check(change.status == mt.STATUS_PENDING_REVIEW and change.line_id == "3",
+          "a printed NAME resolves to the right code", f"{change.status}/{change.line_id}")
+    check("NEW INDIGO" in change.colour_resolution.upper()
+          and "NIN" in change.colour_resolution,
+          "and the inference is recorded for the reviewer", change.colour_resolution)
+    check(client.reads == 2, "one item read per distinct colour on the PO", str(client.reads))
+
+    # 3. Canonical form on BOTH sides -- change 4 applies here too.
+    for label, printed in (("double space", "NEW  INDIGO"), ("lowercase", "new indigo"),
+                           ("padded", "  New Indigo  "), ("nbsp", "NEW\u00a0INDIGO")):
+        change, _ = run(lines, vendor(printed),
+                        {"item-NIN": "New Indigo", "item-MLT": "Moonlight"})
+        check(change.line_id == "3", f"printed name matches despite {label}",
+              f"{printed!r} -> line {change.line_id}")
+    change, _ = run(lines, vendor("NEW INDIGO"),
+                    {"item-NIN": "new  indigo", "item-MLT": "Moonlight"})
+    check(change.line_id == "3", "and a dirty NETSUITE-side name matches a clean printed one")
+
+    # 4. SCOPING is what makes it safe. 'Navy / Silver' maps to both NAV and NVSL
+    #    globally (measured, on open POs) -- but each PO carries only one of them.
+    for code, other in (("NAV", "NVSL"), ("NVSL", "NAV")):
+        lines = [ns("1", code), ns("2", "BLK")]
+        change, _ = run(lines, vendor("NAVY / SILVER"),
+                        {f"item-{code}": "Navy / Silver", "item-BLK": "Black"})
+        check(change.line_id == "1",
+              f"a globally-ambiguous name is unambiguous on a PO carrying only {code}",
+              f"line {change.line_id} (the other code {other} is not on this PO)")
+
+    # 5. Two colours on the SAME PO that the name could mean -> FLAG, never pick.
+    lines = [ns("1", "NAV"), ns("2", "NVSL")]
+    change, _ = run(lines, vendor("NAVY / SILVER"),
+                    {"item-NAV": "Navy / Silver", "item-NVSL": "Navy / Silver"})
+    check(change.status in (mt.STATUS_NEEDS_ATTENTION, mt.STATUS_NEEDS_RESOLUTION),
+          "an ambiguous printed name FLAGS", change.status)
+    check(change.line_id is None, "and picks nothing", str(change.line_id))
+    check("matches 2 colours on this PO" in change.attention_reason,
+          "the reason says how many colours it could be",
+          change.attention_reason[:90])
+    check("NAV" in change.attention_reason and "NVSL" in change.attention_reason,
+          "and names both candidate codes", change.attention_reason[:120])
+    check("wrong product" in change.attention_reason,
+          "and says why it will not guess", change.attention_reason[-70:])
+
+    # 6. NO FUZZY MATCHING. All three pairs are live values in this account.
+    for a, b in (("BLK", "BLC"), ("COO", "COC"), ("HER", "H")):
+        lines = [ns("1", b)]  # only the OTHER code is on the PO
+        change, _ = run(lines, vendor(a), {f"item-{b}": f"Name of {b}"})
+        check(change.status == mt.STATUS_NEEDS_ATTENTION and change.line_id is None,
+              f"printed {a!r} does NOT match a line whose code is {b!r}",
+              f"{change.status}/{change.line_id}")
+        check("no NetSuite line" in (change.attention_reason or ""),
+              f"{a} vs {b}: reported as no match, not silently resolved")
+    # Nor by prefix or substring of the NAME.
+    lines = [ns("1", "BLC")]
+    change, _ = run(lines, vendor("BLACK"), {"item-BLC": "Blackcurrant"})
+    check(change.line_id is None,
+          "printed 'BLACK' does not match 'Blackcurrant' by prefix", str(change.line_id))
+    lines = [ns("1", "BLK"), ns("2", "BLC")]
+    change, _ = run(lines, vendor("BLACK"),
+                    {"item-BLK": "Black", "item-BLC": "Blackcurrant"})
+    check(change.line_id == "1",
+          "and with both on one PO, 'BLACK' resolves to BLK exactly -- the case that "
+          "would defeat a fuzzy matcher", f"line {change.line_id}")
+
+    # 7. An empty colour name flags rather than guessing.
+    lines = [ns("1", "NIN")]
+    change, _ = run(lines, vendor("NEW INDIGO"), {"item-NIN": None})
+    check(change.status == mt.STATUS_NEEDS_ATTENTION and change.line_id is None,
+          "no colour name on the item -> flag, never guess", change.status)
+    client = ColourClient({"item-NIN": None})
+    lookup = mt.build_colour_lookup(client, lines)
+    check(lookup.missing_names == ["NIN"],
+          "and the lookup reports which code had no name", str(lookup.missing_names))
+    check(not lookup.by_name, "with nothing to match a name against")
+
+    # 8. The cache: one read per distinct ITEM, reused across POs in a shipment.
+    client = ColourClient({"item-NIN": "New Indigo", "item-MLT": "Moonlight"})
+    cache: dict = {}
+    po_a = [ns("1", "NIN"), ns("2", "MLT")]
+    po_b = [ns("9", "NIN")]  # same colour, same item id -> already cached
+    mt.build_colour_lookup(client, po_a, cache=cache)
+    mt.build_colour_lookup(client, po_b, cache=cache)
+    check(client.reads == 2,
+          "two distinct colours across two POs cost two reads, not three", str(client.reads))
+    check(sorted(cache) == ["item-MLT", "item-NIN"], "cached by item internal id",
+          str(sorted(cache)))
+
+    # 9. Omitting the lookups entirely leaves pre-change-7 behaviour intact.
+    lines = [ns("3", "NIN")]
+    plain = mt.build_proposed_changes(
+        [vendor("NEW INDIGO")], NetSuiteClient(mock_data={"1720": lines}))[0]
+    check(plain.status == mt.STATUS_NEEDS_ATTENTION,
+          "with no colour lookup, a printed name still just misses", plain.status)
+    coded = mt.build_proposed_changes(
+        [vendor("NIN")], NetSuiteClient(mock_data={"1720": lines}))[0]
+    check(coded.status == mt.STATUS_PENDING_REVIEW,
+          "while a printed code matches as it always did", coded.status)
+
+
 def test_scope_boundaries(tmp: Path) -> None:
     section("scope boundaries (things this tool must never do)")
     import datetime as dt
@@ -2550,7 +2715,7 @@ def main() -> int:
             test_line_aggregation, test_aggregation_wired_into_parsers,
             test_matcher_paula_rulings, test_sheet_selection, test_closed_po_line,
             test_duplicate_key_resolution, test_scope_boundaries,
-            test_line_balance_context,
+            test_line_balance_context, test_colour_resolution,
             test_unopenable_files, test_size_value_space_failsafe,
             test_no_packing_sheet_becomes_manual_entry,
             test_manual_entry_path, test_matcher_handoff,

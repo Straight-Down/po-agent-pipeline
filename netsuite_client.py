@@ -62,6 +62,18 @@ NS_PARENT_ITEM = "custcol_cmo_parentitem"
 NS_COLOR = "custcol_product_color"
 NS_SIZE = "custcol_product_size"
 
+#: The child item field holding the long-form colour name ("New Indigo" for code
+#: "NIN"). The colour LIST does not carry it: in this account
+#: `customlist_psgss_product_color/334` returns name='NIN', abbreviation='NIN',
+#: and the identical REST call against the size list returns name='ALL',
+#: abbreviation='A' -- so both fields are exposed and the colour data really is
+#: code-in-Name. A UI export from another account state does have curated long
+#: names in that column, but building against it would mean colour tests that pass
+#: in production and fail in sandbox. This field is verified in the account we test
+#: against: populated on 2,390 of the 2,393 distinct items on open POs (the other
+#: three are poly mailers -- packaging, with no colour by nature).
+ITEM_COLOUR_NAME_FIELD = "custitem_psgss_product_color_desc"
+
 #: The four writable target fields, in the order the docs list them.
 WRITABLE_LINE_FIELDS = (
     NS_QUANTITY,
@@ -850,6 +862,48 @@ class NetSuiteClient:
             "line": line_number,
             "sent": body_fields,
         }
+
+    def get_item_colour_name(
+        self, item_internal_id: Union[int, str], cache: Optional[dict] = None
+    ) -> Optional[str]:
+        """
+        The long-form colour name on one child item, or None.
+
+        `cache` is a caller-owned dict keyed by item internal id, so one shipment's
+        processing reads each item once. It is deliberately NOT persisted: a table
+        would need a refresh story, and this is static reference data that costs one
+        cheap GET when it is actually needed. Vendors who print colour codes never
+        trigger a read at all.
+
+        Returns None when the field is empty, when the item cannot be read, or in
+        mock mode. None means "no name available" and the caller must flag rather
+        than guess -- see `matcher.build_colour_lookup`.
+        """
+        key = str(item_internal_id)
+        if cache is not None and key in cache:
+            return cache[key]
+
+        value: Optional[str] = None
+        if not self.is_mock:
+            config = self._require_live("get_item_colour_name()")
+            # Child SKUs are inventory items here, but the record type is not
+            # guaranteed, so fall through rather than failing the whole shipment.
+            for record_type in ("inventoryItem", "assemblyItem", "nonInventorySaleItem"):
+                try:
+                    record = self._request(
+                        "GET", f"{config.record_base}/{record_type}/{key}"
+                    ).json()
+                except NetSuiteError:
+                    continue
+                raw = record.get(ITEM_COLOUR_NAME_FIELD)
+                value = str(raw).strip() or None if raw is not None else None
+                break
+            else:
+                logger.warning("item %s: could not be read for a colour name", key)
+
+        if cache is not None:
+            cache[key] = value
+        return value
 
     # -- diagnostics --------------------------------------------------------
 

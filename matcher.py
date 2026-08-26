@@ -173,6 +173,10 @@ class ProposedChange:
     #: written to automatically — `to_netsuite_fields()` refuses.
     line_closed: bool = False
 
+    #: The five quantity figures for this line, on EVERY change -- see
+    #: `_line_balance`. Display context, never a gate.
+    line_balance: dict = field(default_factory=dict)
+
     #: Every NetSuite line whose canonical key matched, when the match was not a
     #: clean 1:1. Populated for NEEDS_RESOLUTION (several open lines) and for the
     #: no-open-line case, so a human has what they need to decide without going
@@ -333,6 +337,51 @@ def _find_matching_lines(vendor_line: dict, ns_lines: list[POLine]) -> list[POLi
     ]
 
 
+def _line_balance(line: Optional[POLine], slip_quantity: Optional[float]) -> dict:
+    """
+    The quantity figures for one line, so a human can read the situation directly.
+
+    Attached to every change, not only flagged ones. The review screen can then
+    say "ordered 300, received 0, this slip 128" and a partial delivery is
+    self-evident to the person who can actually judge it. **The numbers are the
+    signal; this tool does not interpret them.** `outstanding` is
+    `quantity - quantity_received`, with a missing received count treated as zero.
+
+    All five values are None-safe: an unmatched vendor line still gets a payload,
+    carrying its slip quantity with the line-side figures None. "Nothing matched,
+    and the slip said 128" is itself worth showing.
+
+    **This is deliberately not a gate, and the reasoning is worth keeping** --
+    a version that refused to propose anything when the slip fell short of
+    outstanding was built and cancelled:
+
+    - **A final short-ship and a partial delivery are the same document.**
+      Production came in light, or the balance is following by sea: slip quantity
+      below line quantity either way. No arithmetic on these numbers separates
+      them, so a rule built on them mislabels one of the two by construction.
+    - **It would have removed the tool's main job.** With `quantity_received = 0`,
+      outstanding equals ordered, so "slip equals outstanding" means "nothing to
+      update but the date" -- the tool could only ever have proposed a quantity
+      change on a line that already had receipts. On the real PO 1662 example it
+      went from 2 proposals to 0.
+    - **The premise was wrong.** The worry was that the tool would set a date
+      before Paula saw the slip. Nothing is ever written without her approval, so
+      there is no such race. And she knows a line split is coming because she
+      arranges the air shipment herself -- the recognition happens before the
+      packing slip arrives, not during review.
+
+    So: show her the numbers, and leave the judgement where it already was.
+    """
+    received = None if line is None else float(line.quantity_received or 0.0)
+    return {
+        "ns_line_id": line.line_id if line is not None else None,
+        "line_quantity": line.quantity if line is not None else None,
+        "quantity_received": received,
+        "slip_quantity": slip_quantity,
+        "outstanding": None if line is None else float(line.quantity) - received,
+    }
+
+
 def _resolve_target_line(
     candidates: list[POLine],
 ) -> tuple[Optional[POLine], Optional[str], list[POLine]]:
@@ -399,6 +448,16 @@ def _resolve_target_line(
         f"(line {ids}). The tool does not choose between them and does not sum them "
         "— pick the line this shipment belongs against"
     ), open_lines
+
+
+def _as_quantity(value) -> Optional[float]:
+    """A slip quantity as a number for display arithmetic; None stays None."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _iso_or_none(value: Optional[dt.date]) -> Optional[str]:
@@ -475,6 +534,9 @@ def build_proposed_changes(
             vendor_eta=reference_eta,
             extraction_confidence=confidence,
             extraction_note=note,
+            # Display context on every change, flagged or not. Nothing branches on
+            # it -- see `_line_balance` for why a gate here was cancelled.
+            line_balance=_line_balance(match, _as_quantity(vl.get("quantity"))),
             # Populated only when the match was not a clean 1:1, so a reviewer can
             # decide without opening NetSuite. Never the RepSpark field.
             candidate_lines=(

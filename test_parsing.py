@@ -1784,6 +1784,120 @@ def test_duplicate_key_resolution(tmp: Path) -> None:
           str([(l["quantity"]) for l in agg]))
 
 
+def test_line_balance_context(tmp: Path) -> None:
+    section("line_balance: the numbers a human reads, on every change, gating nothing")
+    import datetime as dt
+
+    import matcher as mt
+    from netsuite_client import NetSuiteClient, POLine
+
+    def ns(size="M", qty=300, recv=0.0, line_id="10", set_recv=True):
+        line = POLine(
+            line_id=line_id, item=f"W600001 : W600001-Harper-BLACK-{size}",
+            style_number="W600001", vendor_name=None, color="BLACK", size=size,
+            quantity=qty, units="Ea", expected_receipt_date=dt.date(2026, 9, 1),
+            override_expected_receipt=False, updated_receipt_date=None, is_open=True,
+        )
+        if set_recv:
+            line.quantity_received = recv
+        return line
+
+    def vendor(qty, size="M"):
+        return {"po_number": "1721", "style_number": "W600001", "color": "BLACK",
+                "size": size, "quantity": qty, "confidence": "high", "note": ""}
+
+    def one(lines, vl):
+        return mt.build_proposed_changes([vl], NetSuiteClient(mock_data={"1721": lines}))[0]
+
+    # 1. A normal proposal carries it. 300 ordered, 0 received, this slip 128 --
+    #    a partial delivery is legible from the numbers without the tool saying so.
+    c = one([ns(qty=300, recv=0.0)], vendor(128))
+    check(c.status == mt.STATUS_PENDING_REVIEW,
+          "a short slip still PROPOSES -- line_balance gates nothing", c.status)
+    check(c.line_balance == {"ns_line_id": "10", "line_quantity": 300,
+                             "quantity_received": 0.0, "slip_quantity": 128.0,
+                             "outstanding": 300.0},
+          "and carries all five figures", str(c.line_balance))
+    check(c.to_netsuite_fields(include_dates=False) == {"quantity": 128},
+          "the write is unaffected", str(c.to_netsuite_fields(include_dates=False)))
+
+    # 2. NO_CHANGE carries it too -- Paula still wants to see the arithmetic on a
+    #    line whose quantity happens to already be right.
+    c = one([ns(qty=300, recv=0.0)], vendor(300))
+    check(c.status == mt.STATUS_NO_CHANGE, "quantity already correct -> NO_CHANGE", c.status)
+    check(c.line_balance["outstanding"] == 300.0 and c.line_balance["slip_quantity"] == 300.0,
+          "NO_CHANGE still carries the figures", str(c.line_balance))
+
+    # 3. An existing NEEDS_ATTENTION carries it. Low confidence, so the line matched
+    #    and the line-side figures are real.
+    c = one([ns(qty=300, recv=0.0)],
+            {**vendor(128), "confidence": "low", "note": "quantity cell smudged"})
+    check(c.status == mt.STATUS_NEEDS_ATTENTION, "low confidence still NEEDS_ATTENTION", c.status)
+    check(c.line_balance["ns_line_id"] == "10" and c.line_balance["slip_quantity"] == 128.0,
+          "and the flagged row carries the figures too", str(c.line_balance))
+
+    # 4. outstanding = quantity - quantity_received, when received is present.
+    c = one([ns(qty=300, recv=128.0)], vendor(172))
+    check(c.line_balance["outstanding"] == 172.0,
+          "300 ordered, 128 received -> 172 outstanding", str(c.line_balance["outstanding"]))
+    check(c.line_balance["quantity_received"] == 128.0, "received reported as given")
+
+    # 5. A missing quantity_received counts as zero rather than unknown, so
+    #    outstanding stays computable and errs large.
+    bare = ns(qty=300, set_recv=False)
+    bare.quantity_received = None
+    c = one([bare], vendor(128))
+    check(c.line_balance["quantity_received"] == 0.0,
+          "absent received -> 0.0, not None", str(c.line_balance["quantity_received"]))
+    check(c.line_balance["outstanding"] == 300.0,
+          "so outstanding is the full ordered quantity", str(c.line_balance["outstanding"]))
+
+    # 6. An unmatched vendor line still gets a payload. "Nothing matched, and the
+    #    slip said 40" is worth showing; the line-side figures are simply absent.
+    c = one([ns(qty=300)], vendor(40, size="4XL"))
+    check(c.status == mt.STATUS_NEEDS_ATTENTION, "unmatched line still NEEDS_ATTENTION", c.status)
+    check(c.line_balance == {"ns_line_id": None, "line_quantity": None,
+                             "quantity_received": None, "slip_quantity": 40.0,
+                             "outstanding": None},
+          "payload present, line-side figures None", str(c.line_balance))
+
+    # 7. A vendor line with no quantity at all does not break the arithmetic.
+    c = one([ns(qty=300)], {**vendor(None)})
+    check(c.line_balance["slip_quantity"] is None, "no slip quantity -> None, not 0")
+    check(c.line_balance["outstanding"] == 300.0, "line-side figures still computed")
+
+    # 8. Over-shipment is UNTOUCHED. Ruling 6 stands: shipped above ordered is a
+    #    plain PENDING_REVIEW with no flag. The figures are shown, not judged.
+    c = one([ns(qty=100)], vendor(500))
+    check(c.status == mt.STATUS_PENDING_REVIEW,
+          "500 shipped against 100 ordered is STILL a plain proposal (ruling 6)", c.status)
+    check(c.attention_reason == "", "and carries no attention flag", repr(c.attention_reason))
+    check(c.line_balance["slip_quantity"] == 500.0 and c.line_balance["outstanding"] == 100.0,
+          "the review screen sees 500 against 100 and lets a human read it",
+          str(c.line_balance))
+
+    # 9. Per-line, and nothing about one line's balance affects another.
+    changes = {ch.size: ch for ch in mt.build_proposed_changes(
+        [vendor(128, size="M"), vendor(50, size="L")],
+        NetSuiteClient(mock_data={"1721": [ns(size="M", qty=300), ns(size="L", qty=50, line_id="11")]}),
+    )}
+    check(changes["M"].status == mt.STATUS_PENDING_REVIEW
+          and changes["L"].status == mt.STATUS_NO_CHANGE,
+          "a short line and an exact line coexist, both unflagged",
+          f"{changes['M'].status}/{changes['L'].status}")
+    check(changes["M"].line_balance["outstanding"] == 300.0
+          and changes["L"].line_balance["outstanding"] == 50.0,
+          "each carries its OWN figures", str([changes["M"].line_balance["outstanding"],
+                                              changes["L"].line_balance["outstanding"]]))
+
+    # 10. Nothing in the codebase gates on it. The cancelled version added a
+    #     QuantityMismatch guard and two attention codes; assert they are absent so
+    #     the gate cannot creep back in unnoticed.
+    for name in ("QuantityMismatch", "ATTENTION_PARTIAL_LINE", "ATTENTION_OVER_SHIPMENT",
+                 "_classify_line_balance"):
+        check(not hasattr(mt, name), f"no {name} -- the gating version stays cancelled")
+
+
 def test_scope_boundaries(tmp: Path) -> None:
     section("scope boundaries (things this tool must never do)")
     import datetime as dt
@@ -2436,6 +2550,7 @@ def main() -> int:
             test_line_aggregation, test_aggregation_wired_into_parsers,
             test_matcher_paula_rulings, test_sheet_selection, test_closed_po_line,
             test_duplicate_key_resolution, test_scope_boundaries,
+            test_line_balance_context,
             test_unopenable_files, test_size_value_space_failsafe,
             test_no_packing_sheet_becomes_manual_entry,
             test_manual_entry_path, test_matcher_handoff,

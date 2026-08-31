@@ -564,6 +564,139 @@ def test_transient_retry() -> None:
     check(not nc._is_transient_exception(ValueError("x")), "ValueError not classified transient")
 
 
+def test_tranid_transformation() -> None:
+    section("printed PO number -> tranId, and the query it actually sends")
+    import json as _json
+
+    from netsuite_client import (
+        TRANID_MIN_DIGITS,
+        TRANID_PATTERN,
+        TRANID_PREFIX,
+        PONumberUnresolvable,
+        po_tranid,
+    )
+
+    check(TRANID_PREFIX == "PO" and TRANID_MIN_DIGITS == 7,
+          "the rule matches Setup > Company > Auto-Generated Numbers",
+          f"{TRANID_PREFIX} + {TRANID_MIN_DIGITS} digits")
+    check(bool(TRANID_PATTERN.match("PO0001662")) and not TRANID_PATTERN.match("PO1662"),
+          "the pattern is exact -- 7 digits, not 'starts with PO'")
+    check(not TRANID_PATTERN.match("PO00016620"), "and not 8 digits either")
+
+    for printed, expected in (("1662", "PO0001662"), ("PO#1720", "PO0001720"),
+                              ("PO NO : 1721", "PO0001721"), ("7", "PO0000007")):
+        check(po_tranid(printed) == expected, f"{printed!r} -> {expected}",
+              po_tranid(printed))
+
+    class Resp:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._payload = payload
+            self.text = _json.dumps(payload)
+
+        def json(self):
+            return self._payload
+
+    class RecordingSession:
+        """Captures the URLs the client requests, and replays scripted responses."""
+
+        def __init__(self, outcomes):
+            self.outcomes = list(outcomes)
+            self.urls = []
+            self.queries = []
+
+        def request(self, method, url, **kwargs):
+            self.urls.append(url)
+            self.queries.append((kwargs.get("params") or {}).get("q", ""))
+            return self.outcomes.pop(0)
+
+    def live_client(outcomes):
+        client = NetSuiteClient(config=FAKE_CONFIG)
+        client._session = RecordingSession(outcomes)
+        client._access_token = "fake-token"
+        client._token_expires_at = 9_999_999_999
+        client.TRANSIENT_BACKOFF_SECONDS = 0
+        return client
+
+    hit = Resp(200, {"count": 1, "items": [{"id": "8489541"}]})
+
+    # The printed number is transformed BEFORE the query goes out. This is the
+    # assertion that would have caught the old behaviour, where the bare number was
+    # sent and NetSuite answered 200 with zero matches.
+    client = live_client([hit])
+    internal_id = client.resolve_po_internal_id("1662")
+    check(internal_id == "8489541", "a printed PO number resolves", internal_id)
+    check("PO0001662" in client._session.queries[0],
+          "and the query asked for the TRANID, not the printed number",
+          client._session.queries[0])
+    check('tranId IS "1662"' not in client._session.queries[0],
+          "the bare number was never sent", client._session.queries[0])
+    check(client.last_resolved_tranid == "PO0001662",
+          "the derived tranId is recorded for display", str(client.last_resolved_tranid))
+    check(client.last_lookup_strategy == "record q= (quoted)",
+          "and which q= form worked", str(client.last_lookup_strategy))
+
+    # Already a tranId: unchanged, still one query.
+    client = live_client([hit])
+    check(client.resolve_po_internal_id("PO0001662") == "8489541",
+          "a tranId passes through unchanged")
+    check("PO0001662" in client._session.queries[0] and len(client._session.queries) == 1,
+          "with exactly one query", str(client._session.queries))
+
+    # The unquoted form is the documented fallback, and it is recorded when used.
+    miss = Resp(200, {"count": 0, "items": []})
+    client = live_client([miss, hit])
+    check(client.resolve_po_internal_id("1662") == "8489541",
+          "the unquoted q= form is tried when the quoted one misses")
+    check(client.last_lookup_strategy == "record q= (unquoted)",
+          "and the strategy records which one worked", str(client.last_lookup_strategy))
+
+    # A derived tranId that does not exist: a defined outcome carrying both strings,
+    # and NO third attempt in another format.
+    client = live_client([miss, miss])
+    try:
+        client.resolve_po_internal_id("9999")
+        check(False, "an absent PO raises PONumberUnresolvable", "no exception")
+    except PONumberUnresolvable as exc:
+        check(True, "an absent PO raises PONumberUnresolvable")
+        check(exc.printed == "9999" and exc.attempted == "PO0009999",
+              "carrying the printed value and the attempted tranId separately",
+              f"{exc.printed!r}/{exc.attempted!r}")
+        check("9999" in str(exc) and "PO0009999" in str(exc),
+              "and both appear in the message a reviewer reads")
+        check("no other shape is tried" in str(exc),
+              "the message states that no second format was guessed")
+    check(len(client._session.urls) == 2,
+          "exactly two queries: the two q= quoting forms, no format retries",
+          str(len(client._session.urls)))
+
+    # Malformed references never reach the network.
+    for bad in ("", "   ", "PO NO :"):
+        client = live_client([])
+        try:
+            client.resolve_po_internal_id(bad)
+            check(False, f"{bad!r} is refused before any request", "no exception")
+        except PONumberUnresolvable:
+            check(not client._session.urls, f"{bad!r} is refused before any request",
+                  "0 requests")
+
+    client = live_client([])
+    try:
+        client.resolve_po_internal_id("#1720, 1721")
+        check(False, "a two-PO reference is refused before any request", "no exception")
+    except PONumberUnresolvable as exc:
+        check(not client._session.urls and "different numbers" in str(exc),
+              "a two-PO reference is refused before any request", str(exc)[:60])
+
+    # The cache is keyed by tranId, so the printed and padded forms share an entry.
+    client = live_client([hit])
+    client.resolve_po_internal_id("1662")
+    check(client.resolve_po_internal_id("PO0001662") == "8489541"
+          and len(client._session.urls) == 1,
+          "the cache is keyed by tranId, so 1662 and PO0001662 are one entry",
+          f"{len(client._session.urls)} request(s)")
+
+
 def test_mock_mode_unchanged() -> None:
     section("mock mode (demo_matcher.py must keep working)")
     mock_line = POLine(
@@ -638,6 +771,7 @@ def main() -> int:
         test_update_payload_shape,
         test_error_translation,
         test_transient_retry,
+        test_tranid_transformation,
         test_mock_mode_unchanged,
     ):
         try:

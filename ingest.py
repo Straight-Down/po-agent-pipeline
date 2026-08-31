@@ -44,11 +44,17 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 import matcher as mt
 import schema as sc
-from netsuite_client import NetSuiteClient, NetSuiteError, POLine
+from netsuite_client import (
+    NetSuiteClient,
+    NetSuiteError,
+    POLine,
+    PONumberUnresolvable,
+    po_tranid,
+)
 from schema import (
     attachments,
     audit_log,
@@ -129,25 +135,6 @@ def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None, microsecond=0)
 
 
-def _identity_tranids(po_key: str) -> list[str]:
-    """
-    Default PO lookup: try the printed number exactly as it appeared.
-
-    **This will fail against real NetSuite data, and that is deliberate.** Vendors
-    print `1662`; NetSuite stores `PO0001662`, and querying the bare number returns
-    a *successful* empty result. The transformation (extract digits -> zero-pad ->
-    prefix) is a known Phase 2 blocker: it needs Setup > Company >
-    Auto-Generated Numbers read, validation against several hundred real tranIds,
-    and Paula or Brandon's confirmation. Guessing `"PO"` + 7 digits from one sample
-    is exactly what the build plan says not to do.
-
-    So the rule is not baked in here. `tranid_resolver` is the seam it will occupy
-    once confirmed; until then an unresolvable PO is a defined outcome
-    (`resolution_status = 'NOT_FOUND'`), not a crash.
-    """
-    return [po_key]
-
-
 # ---------------------------------------------------------------------------
 # NetSuite reads
 # ---------------------------------------------------------------------------
@@ -156,14 +143,18 @@ def _identity_tranids(po_key: str) -> list[str]:
 def _fetch_po_lines(
     client: Optional[NetSuiteClient],
     po_keys: Sequence[str],
-    tranid_resolver: Callable[[str], list[str]],
 ) -> tuple[dict, dict]:
     """
-    Resolve each printed PO number and read its lines.
+    Resolve each printed PO number to its tranId, then read its lines.
 
     Returns `(lines_by_printed_key, resolution)`. Resolution failure is per PO and
     never fatal: one unresolvable PO on a six-PO slip must not cost the other five
     (`shipment_pos.resolution_status` exists for exactly this).
+
+    The transformation lives in `netsuite_client.po_tranid` and is applied by
+    `resolve_po_internal_id`, so there is no injectable resolver here any more. The
+    padding rule used to be a report-script concern precisely because it was
+    unvalidated; it is now checked against all 1,659 PO tranIds in the account.
 
     The lines come back keyed by the number **as printed**, because that is what
     the extracted lines carry and what the matcher will look up.
@@ -192,27 +183,32 @@ def _fetch_po_lines(
             resolution[key] = record
             continue
 
-        for candidate in tranid_resolver(key):
-            try:
-                internal_id = client.resolve_po_internal_id(candidate)
-            except NetSuiteError as exc:
-                record["detail"] = str(exc).splitlines()[0][:200]
-                continue
-            try:
-                lines_by_key[key] = client.get_purchase_order(candidate)
-            except NetSuiteError as exc:
-                record.update(status="NOT_FOUND", detail=str(exc).splitlines()[0][:200])
-                break
+        # One derived tranId, one lookup. A miss is reported, never retried in
+        # another shape -- see po_tranid on why a second format guess is wrong.
+        try:
+            tranid = po_tranid(key)
+        except PONumberUnresolvable as exc:
+            record.update(status="NOT_FOUND", detail=str(exc).splitlines()[0][:200])
+            resolution[key] = record
+            continue
+
+        record["ns_tranid"] = tranid
+        try:
+            internal_id = client.resolve_po_internal_id(tranid)
+            lines_by_key[key] = client.get_purchase_order(tranid)
+        except PONumberUnresolvable as exc:
+            # Derived correctly, but no such PO. Both strings are kept: printed
+            # value and attempted tranId.
+            record.update(status="NOT_FOUND", detail=str(exc).splitlines()[0][:200])
+        except NetSuiteError as exc:
+            record.update(status="NOT_FOUND", detail=str(exc).splitlines()[0][:200])
+        else:
             record.update(
                 status="RESOLVED",
-                ns_tranid=candidate,
                 ns_internal_id=internal_id,
                 strategy=client.last_lookup_strategy,
                 detail="",
             )
-            break
-        else:
-            record["status"] = "NOT_FOUND"
         resolution[key] = record
 
     return lines_by_key, resolution
@@ -394,7 +390,6 @@ def ingest_shipment(
     client: Optional[NetSuiteClient] = None,
     extractor=None,
     actor: str = "system",
-    tranid_resolver: Callable[[str], list[str]] = _identity_tranids,
     cross_check: bool = True,
     now: Optional[dt.datetime] = None,
 ) -> IngestReport:
@@ -458,7 +453,7 @@ def ingest_shipment(
     report.parse_warnings = list(parsed.warnings)
 
     po_keys = sorted({str(ln.get("po_number") or "").strip() for ln in parsed.lines if ln.get("po_number")})
-    lines_by_key, resolution = _fetch_po_lines(client, po_keys, tranid_resolver)
+    lines_by_key, resolution = _fetch_po_lines(client, po_keys)
     report.po_resolution = resolution
 
     # Per-PO colour vocabularies, built with the LIVE client because the matcher is

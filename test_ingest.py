@@ -532,7 +532,10 @@ def test_colour_resolution_end_to_end() -> None:
                         "color": printed_colour, "size": "M", "quantity": 110,
                         "confidence": "high", "note": "", "source_hint": "P1!R3"}],
                 parser="claude", vendor_name="Symmetry")
-            client = LiveishClient({"1720": po_lines}, colour_names)
+            # Keyed by tranId, because ingest now transforms the printed number
+            # before it asks (change 8). A stub keyed by "1720" would fail here,
+            # which is the point.
+            client = LiveishClient({"PO0001720": po_lines}, colour_names)
             monkey = {}
             install_stub_parse(monkey, parsed, classification)
             try:
@@ -587,6 +590,132 @@ def test_colour_resolution_end_to_end() -> None:
     check(client.colour_reads == 1,
           "having tried the name path once (the code path missed)",
           str(client.colour_reads))
+
+
+def test_tranid_resolution() -> None:
+    section("printed PO number -> tranId, in the pipeline")
+    from netsuite_client import PONumberUnresolvable, po_tranid
+
+    # The rule, against the values whose tranIds are known.
+    for printed, expected in (("1662", "PO0001662"), ("1720", "PO0001720"),
+                              ("1721", "PO0001721"), ("1657", "PO0001657"),
+                              ("7", "PO0000007"), ("1777", "PO0001777")):
+        check(po_tranid(printed) == expected, f"{printed!r} -> {expected}", po_tranid(printed))
+
+    # Every rendering seen across the eight real documents.
+    for printed in ("PO#1662", "PO NO : 1662", "PO NO  :1662", "PO NO. : 1662",
+                    "  1662  ", "PO1662", "1662"):
+        check(po_tranid(printed) == "PO0001662",
+              f"real-document rendering {printed!r} resolves", po_tranid(printed))
+
+    # Idempotent: applying it to a tranId returns the tranId.
+    check(po_tranid("PO0001662") == "PO0001662", "already a tranId -> unchanged")
+    check(po_tranid(po_tranid("1662")) == "PO0001662", "and applying it twice is safe")
+
+    # Defined outcomes, not crashes.
+    for bad, why in ((("PO NO :"), "no digits"), ("", "empty"), ("   ", "whitespace only")):
+        try:
+            po_tranid(bad)
+            check(False, f"{why} raises PONumberUnresolvable", "no exception")
+        except PONumberUnresolvable as exc:
+            check(True, f"{why} raises PONumberUnresolvable", str(exc)[:60])
+
+    # Two numbers in one string names two POs. Never pick one.
+    try:
+        po_tranid("#1720, 1721")
+        check(False, "a reference naming TWO POs refuses", "no exception")
+    except PONumberUnresolvable as exc:
+        check("2 different numbers" in str(exc), "a reference naming TWO POs refuses",
+              str(exc)[:80])
+        check("wrong order" in str(exc), "and says why picking one would be wrong")
+    # ...but a repeated number is one PO, not two.
+    check(po_tranid("PO#1662 (1662)") == "PO0001662",
+          "the same number twice is still one PO")
+
+    class ResolvingClient:
+        """Records what tranId the resolver actually asked for."""
+
+        is_mock = False
+
+        def __init__(self, known):
+            self.known = known
+            self.asked = []
+            self.last_lookup_strategy = None
+
+        def resolve_po_internal_id(self, value):
+            from netsuite_client import po_tranid as transform
+
+            tranid = transform(value)
+            self.asked.append(tranid)
+            if tranid not in self.known:
+                raise PONumberUnresolvable(
+                    f"PO {value!r} was looked up as tranId {tranid!r} and does not exist",
+                    printed=str(value), attempted=tranid)
+            self.last_lookup_strategy = "record q= (quoted)"
+            return self.known[tranid]
+
+        def get_purchase_order(self, value, **kwargs):
+            from netsuite_client import po_tranid as transform
+
+            return [] if transform(value) not in self.known else [ns_line("1")]
+
+        def get_item_colour_name(self, item_internal_id, cache=None):
+            return None
+
+    # Resolution through _fetch_po_lines: the printed number is transformed once.
+    client = ResolvingClient({"PO0001662": "8489541"})
+    lines, resolution = ing._fetch_po_lines(client, ["1662"])
+    check(client.asked == ["PO0001662"],
+          "the resolver was asked for the tranId, not the printed number", str(client.asked))
+    check(resolution["1662"]["status"] == "RESOLVED", "and it resolved",
+          resolution["1662"]["status"])
+    check(resolution["1662"]["ns_tranid"] == "PO0001662",
+          "the derived tranId is recorded", resolution["1662"]["ns_tranid"])
+    check(resolution["1662"]["ns_internal_id"] == "8489541", "with the internal id")
+    check(resolution["1662"]["strategy"] == "record q= (quoted)",
+          "and which q= form worked", str(resolution["1662"]["strategy"]))
+
+    # A PO that does not exist: NOT_FOUND, both strings recorded, no second attempt.
+    client = ResolvingClient({"PO0001662": "8489541"})
+    lines, resolution = ing._fetch_po_lines(client, ["9999"])
+    record = resolution["9999"]
+    check(record["status"] == "NOT_FOUND", "an absent PO is NOT_FOUND, not a crash",
+          record["status"])
+    check(record["ns_tranid"] == "PO0009999",
+          "the attempted tranId is still recorded", record["ns_tranid"])
+    check("9999" in record["detail"] and "PO0009999" in record["detail"],
+          "and the detail carries BOTH the printed value and what was looked up",
+          record["detail"][:80])
+    check(client.asked == ["PO0009999"],
+          "exactly ONE lookup -- no second format was tried", str(client.asked))
+
+    # A malformed reference never reaches NetSuite at all.
+    client = ResolvingClient({"PO0001662": "8489541"})
+    lines, resolution = ing._fetch_po_lines(client, ["#1720, 1721"])
+    check(resolution["#1720, 1721"]["status"] == "NOT_FOUND",
+          "a reference naming two POs is NOT_FOUND")
+    check(client.asked == [], "and no lookup was attempted", str(client.asked))
+
+    # Per PO, not per shipment: one bad PO does not cost the good ones.
+    client = ResolvingClient({"PO0001662": "8489541", "PO0001721": "8669872"})
+    lines, resolution = ing._fetch_po_lines(client, ["1662", "9999", "1721"])
+    check([resolution[k]["status"] for k in ("1662", "9999", "1721")]
+          == ["RESOLVED", "NOT_FOUND", "RESOLVED"],
+          "one unresolvable PO leaves the others resolved",
+          str([resolution[k]["status"] for k in ("1662", "9999", "1721")]))
+    check(sorted(lines) == ["1662", "1721"],
+          "and lines come back keyed by the PRINTED number", str(sorted(lines)))
+
+    # The extraction boundary, asserted rather than assumed.
+    from netsuite_client import assert_po_reference
+
+    check(assert_po_reference("1662") == "1662", "a PO reference passes the contract")
+    try:
+        assert_po_reference("")
+        check(False, "an empty reference is refused at the boundary", "no exception")
+    except PONumberUnresolvable as exc:
+        check("extractor" in str(exc),
+              "an empty reference is refused, naming the upstream owner", str(exc)[:70])
 
 
 def test_scope_boundaries() -> None:
@@ -693,6 +822,7 @@ def main() -> int:
         test_multi_candidate_line,
         test_audit_and_state_guard,
         test_colour_resolution_end_to_end,
+        test_tranid_resolution,
         test_scope_boundaries,
         test_gaps_are_reported_not_defaulted,
     ):

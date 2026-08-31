@@ -40,6 +40,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -73,6 +74,22 @@ NS_SIZE = "custcol_product_size"
 #: against: populated on 2,390 of the 2,393 distinct items on open POs (the other
 #: three are poly mailers -- packaging, with no colour by nature).
 ITEM_COLOUR_NAME_FIELD = "custitem_psgss_product_color_desc"
+
+#: PO transaction numbering, from Setup > Company > Auto-Generated Numbers
+#: (Purchase Order row): Prefix "PO", Minimum Digits 7, Current Number 1777.
+#: So a printed 1662 is stored as PO0001662.
+#:
+#: **Validated against the data, not trusted from the setup screen**, because Allow
+#: Override and Use Subsidiary / Use Location were not captured -- and a checkbox
+#: says what is permitted, not what happened. All **1,659 of 1,659** PO tranIds in
+#: the account match `^PO\d{7}$`: one single shape, spanning 2021-06-16 to
+#: 2026-07-31, no duplicate numbers, and `"PO" + zfill(7)` reproduces every one of
+#: them exactly. So override is off or unused, and there is no subsidiary or
+#: location variation in practice. Re-run the same check against production before
+#: cutover -- the two accounts have already been shown to differ elsewhere.
+TRANID_PREFIX = "PO"
+TRANID_MIN_DIGITS = 7
+TRANID_PATTERN = re.compile(r"^PO\d{7}$")
 
 #: The four writable target fields, in the order the docs list them.
 WRITABLE_LINE_FIELDS = (
@@ -123,6 +140,27 @@ class NetSuitePermissionError(NetSuiteError):
     For Phase 1 this is the specific finding we're hunting: it would mean the
     "PO Update" role can't do what the CFO role could.
     """
+
+
+class PONumberUnresolvable(NetSuiteError):
+    """
+    A printed PO reference could not be turned into a usable tranId, or the tranId
+    it produced does not exist.
+
+    A **defined outcome**, not a bug: the caller records it against the shipment's
+    PO row (`resolution_status = 'NOT_FOUND'`) and flags. Carries `printed` and
+    `attempted` so a reviewer sees both what the vendor wrote and what was looked
+    up -- without those two strings side by side, "PO not found" is unactionable.
+
+    Never followed by a second format guess or a fuzzy search. If the derived
+    tranId is absent, the answer is that a human looks, not that the tool tries
+    another shape.
+    """
+
+    def __init__(self, message: str, printed: str = "", attempted: str = ""):
+        super().__init__(message)
+        self.printed = printed
+        self.attempted = attempted
 
 
 class NetSuiteTransientError(NetSuiteError):
@@ -380,6 +418,80 @@ def _to_bool(value: Any) -> bool:
     return bool(value)
 
 
+def po_tranid(printed: str) -> str:
+    """
+    Turn what a vendor printed into NetSuite's tranId: `1662` -> `PO0001662`.
+
+    Handles every rendering seen across the real corpus -- `PO#1662`,
+    `PO NO : 1720`, `PO NO. : 1721`, a bare `1720` in a table cell -- by taking the
+    digits and applying the account's numbering rule (`TRANID_PREFIX`,
+    `TRANID_MIN_DIGITS`). A value that is already a tranId passes through unchanged,
+    so this is idempotent and safe to apply twice.
+
+    **Why this cannot be a fuzzy or multi-format search.** Querying the bare number
+    returns HTTP 200 with `totalResults=0` -- it executes correctly and matches
+    nothing, which a naive caller reads as "PO not found" rather than "you asked the
+    wrong question". So the transformation has to be right the first time, and a
+    miss has to be reported rather than retried in another shape.
+
+    Raises `PONumberUnresolvable` when the input carries no digits, or carries more
+    than one distinct number. The second case matters: a filename like
+    `#1720, 1721` names two POs, and silently taking the first would attach a whole
+    shipment to the wrong order. Splitting that is the extractor's job -- each
+    extracted line carries its own `po_number` -- so this refuses rather than
+    guessing.
+
+    **This only ever receives a value the extractor identified as a PO reference.**
+    That boundary is load-bearing: a bare four-digit number cannot be found by a
+    page-wide regex, because carton counts, quantities and style-number fragments
+    look identical, and recognising `1720` as a PO needs the column-header context
+    (`PO NO`). Nothing here can recover from being handed a carton count, so it does
+    not try to; `assert_po_reference` states the contract.
+    """
+    text = str(printed or "").strip()
+    if TRANID_PATTERN.match(text):
+        return text
+
+    groups = re.findall(r"\d+", text)
+    if not groups:
+        raise PONumberUnresolvable(
+            f"PO reference {printed!r} contains no digits, so no tranId can be derived. "
+            "Expected something like '1662', 'PO#1662' or 'PO0001662'.",
+            printed=text,
+        )
+    distinct = {str(int(g)) for g in groups}
+    if len(distinct) > 1:
+        raise PONumberUnresolvable(
+            f"PO reference {printed!r} contains {len(distinct)} different numbers "
+            f"({', '.join(sorted(distinct))}). That names more than one PO, and picking "
+            "one would attach the shipment to the wrong order. Split it upstream: each "
+            "extracted line carries its own po_number.",
+            printed=text,
+        )
+
+    return f"{TRANID_PREFIX}{int(groups[0]):0{TRANID_MIN_DIGITS}d}"
+
+
+def assert_po_reference(printed: str) -> str:
+    """
+    The contract on `po_tranid`'s input: a value the EXTRACTOR called a PO reference.
+
+    Returns it unchanged. Exists to make the boundary explicit and greppable rather
+    than implied by a comment. Resolving a PO number is a lookup problem; *recognising*
+    a bare `1720` as one -- against carton counts and quantities that look identical --
+    is an extraction problem, solved with column-header context this layer does not
+    have. If this ever fires, the fix is upstream.
+    """
+    text = str(printed or "").strip()
+    if not text:
+        raise PONumberUnresolvable(
+            "an empty PO reference reached the resolver. The extractor should never emit "
+            "a line with no po_number, and the matcher already flags one that does.",
+            printed="",
+        )
+    return text
+
+
 def normalize_line_fields(fields: dict) -> dict:
     """
     Translate a caller's field dict into a NetSuite sublist patch body.
@@ -457,6 +569,9 @@ class NetSuiteClient:
         #: quoting rules without live credentials, so record the answer from the
         #: first real run instead of guessing in a comment.
         self.last_lookup_strategy: Optional[str] = None
+        #: The tranId the last resolve actually queried, for showing beside the
+        #: vendor's printed value.
+        self.last_resolved_tranid: Optional[str] = None
 
     # -- mode ---------------------------------------------------------------
 
@@ -639,16 +754,16 @@ class NetSuiteClient:
 
     def resolve_po_internal_id(self, po_number: str) -> str:
         """
-        Map a PO's `tranId` to its internal record id (e.g. "PO0001662" -> "8489541").
+        Map a printed PO reference OR a tranId to its internal record id.
 
-        **This takes a tranId, not a bare vendor PO number.** Vendor packing slips
-        print `1662`; NetSuite stores `PO0001662`, and `?q=tranId IS "1662"`
-        returns 200 with zero matches -- it executes correctly and matches
-        nothing. Turning a printed PO number into a tranId is a separate
-        format-transformation problem, deliberately not solved here: the prefix
-        and digit padding come from Setup > Company > Auto-Generated Numbers and
-        must be read from that setup rather than inferred from one sample. See
-        RUNBOOK section 6 for the open item.
+        `1662`, `PO#1662` and `PO0001662` all resolve to `"8489541"`: the input goes
+        through `po_tranid` first, which is idempotent for an already-correct tranId.
+        That transformation used to sit outside the pipeline -- the default was an
+        untransformed lookup that always failed against live data, with the padding
+        applied only inside a report script. It is now the real behaviour.
+
+        `last_resolved_tranid` records what was actually queried, so a caller can show
+        the vendor's printed value beside the derived tranId.
 
         Both `q=` quoting forms are confirmed working and equivalent (each returns
         totalResults=1 for PO0001662), so quoting is optional. The quoted form is
@@ -659,13 +774,17 @@ class NetSuiteClient:
         it this returns 400 USER_ERROR while single-record GET/PATCH by internal
         id keeps working -- that asymmetry is the diagnostic signature.
         """
-        if po_number in self._po_id_cache:
-            return self._po_id_cache[po_number]
+        printed = assert_po_reference(po_number)
+        tranid = po_tranid(printed)
+        self.last_resolved_tranid = tranid
+
+        if tranid in self._po_id_cache:
+            return self._po_id_cache[tranid]
 
         config = self._require_live("resolve_po_internal_id()")
         attempts = [
-            ("record q= (quoted)", lambda: self._lookup_via_record_query(f'tranId IS "{po_number}"')),
-            ("record q= (unquoted)", lambda: self._lookup_via_record_query(f"tranId IS {po_number}")),
+            ("record q= (quoted)", lambda: self._lookup_via_record_query(f'tranId IS "{tranid}"')),
+            ("record q= (unquoted)", lambda: self._lookup_via_record_query(f"tranId IS {tranid}")),
         ]
 
         errors = []
@@ -680,18 +799,27 @@ class NetSuiteClient:
                 continue
             if internal_id:
                 self.last_lookup_strategy = label
-                self._po_id_cache[po_number] = internal_id
-                logger.info("Resolved PO %s -> internal id %s (via %s)", po_number, internal_id, label)
+                self._po_id_cache[tranid] = internal_id
+                logger.info(
+                    "Resolved PO %s (as tranId %s) -> internal id %s (via %s)",
+                    printed, tranid, internal_id, label,
+                )
                 return internal_id
             errors.append(f"{label}: no match")
 
-        raise NetSuiteError(
-            f"Could not resolve tranId {po_number!r} to an internal id in account "
-            f"{config.account_id}.\n"
+        # A defined outcome. Both strings are in the message because either alone is
+        # unactionable: the printed value says what the vendor wrote, the tranId says
+        # what was actually asked for. No second format is attempted.
+        raise PONumberUnresolvable(
+            f"PO {printed!r} was looked up as tranId {tranid!r} and does not exist in "
+            f"account {config.account_id}.\n"
             + "\n".join(f"  - {e}" for e in errors)
-            + "\n\nIf this was a bare vendor PO number (e.g. '1662'), it is not a tranId -- "
-            "NetSuite stores these prefixed and zero-padded (e.g. 'PO0001662'), so the query "
-            "will execute and match nothing. See RUNBOOK section 6."
+            + f"\n\nThe tranId came from the account's numbering rule ({TRANID_PREFIX} + "
+            f"{TRANID_MIN_DIGITS} digits), which reproduces all 1,659 existing PO tranIds "
+            "exactly. A miss therefore means the PO does not exist, not that the format is "
+            "wrong -- so no other shape is tried. A human resolves it.",
+            printed=printed,
+            attempted=tranid,
         )
 
     def _lookup_via_record_query(self, q: str) -> Optional[str]:

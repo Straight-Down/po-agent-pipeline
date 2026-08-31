@@ -83,6 +83,10 @@ Test totals at this point: **456 offline + 103 NetSuite client**, with the eight
 2. Wire the approval action to the NetSuite write-back built in Phase 1.
 
    **ACCEPTANCE CRITERION — the review UI must record a human verdict on EVERY line it shows, including lines accepted unchanged.** Not a nice-to-have, and easy to miss because the natural implementation only writes a row when Paula changes something. If verdicts are recorded only on disagreement, the calibration corpus has **no negatives**: the base rate is unknowable, and `needs_review` — which currently fires on 100% of documents and is therefore useless for triage — can never be calibrated. The columns exist (`human_verdict`, `verdict_by`, `verdict_at` on `proposed_changes`, surfaced by `v_calibration`); the UI has to fill them in for the accept case too. Getting this wrong is not visible until someone tries to calibrate months later and finds one half of the data missing.
+
+   **Now measured, and the case is stronger than when this was written:** on the real corpus `needs_review` fires on **19 of the 29 correctly matched lines**. The flags are honest — the extractor genuinely inferred those values from block recap rows and carried-forward headers, and said so — but at two thirds of correct work they are unselective, and a reviewer will learn to ignore them within about a week. Those 19 are the first calibration rows with a **target line attached**, so they are exactly the corpus this criterion exists to build.
+
+   **Also for whoever builds the screen:** `ns_line_is_open` and `ns_item_internal_id` describe the *matched* line, so when change 5 chooses no target they are NULL and the per-line open state lives on `candidate_lines` instead. Open state therefore comes from two places depending on outcome. That is deliberate — a copy on the row would be a second source of truth for something change 5 explicitly refused to decide — not an oversight.
 3. Error handling: what happens if NetSuite rejects a write (e.g., closed PO, permission error) — should surface clearly, not fail silently.
 4. Confirmation notification back to Paula (and Kiko) on success/failure.
 

@@ -4,7 +4,7 @@
 
 **Audience:** assumes general technical competence, no prior context on this specific project. Where more depth exists elsewhere, this doc points to it rather than repeating it — `PO-Update-Automation-Architecture.md` is the full design rationale; this doc is the "how do I actually run/fix/hand this off" companion.
 
-**Last updated:** 2026-08-31
+**Last updated:** 2026-09-01
 
 ---
 
@@ -281,35 +281,148 @@ These are not open questions — they are settled constraints that later phases 
 
 **Row identity must be the canonical key, never a digest of the whole row.** Verbatim display text varies between runs *by design*: the extractor may render a colour `NEW INDIGO` on one run and `NEW  INDIGO` on the next, and the pipeline deliberately preserves what was printed rather than rewriting it. In one five-run comparison, 6 of 25 rows differed in displayed text while keys, quantities, counts and row order were identical. A row-digest idempotency check on `proposed_changes` would therefore see spurious changes on every re-parse. Key on the canonical form (`canonical.py`).
 
-**The confidence signal is currently INERT for triage.** `needs_review` came back `True` on all four real documents — including the ones that were subsequently hand-verified as flawless. A flag that always fires carries zero information. Two things follow: Phase 3 must **not** build its review queue on `needs_review` as-is, and the signal is **uncalibrated rather than proven safe** — zero extraction errors were observed across 20/20 hand-verified line items, so the false-negative rate is unmeasured, not zero. Calibrating it needs a corpus with known-bad documents.
+**The confidence signal is INERT for triage, and now measurably so.** After change 7 resolved colour matching, the real corpus produces 29 matched lines of 33 — and **`needs_review` fires on 19 of those 29 correctly matched lines.** The flags are *honest*: the extractor really did infer the PO, style or colour from a block recap row or carry it forward from the row above, and it said so. They are simply **unselective**, and a reviewer learns within about a week that a flag firing on two thirds of correct work means nothing.
+
+Those 19 are also the first calibration rows with a **target line attached**, which is what makes them usable: the tool's claim, the line it matched, and space for the human verdict. See the Phase 3 acceptance criterion in the build plan — without a verdict recorded on *every* line shown, including the accepted-unchanged ones, this corpus has no negatives and the flag can never be calibrated.
+
+The original observation, kept because the shape of the problem has not changed: `needs_review` came back `True` on all four real documents — including the ones that were subsequently hand-verified as flawless. A flag that always fires carries zero information. Two things follow: Phase 3 must **not** build its review queue on `needs_review` as-is, and the signal is **uncalibrated rather than proven safe** — zero extraction errors were observed across 20/20 hand-verified line items, so the false-negative rate is unmeasured, not zero. Calibrating it needs a corpus with known-bad documents.
 
 **A shipment is not 1:1 with a PO, and the fan-out is larger than assumed.** One Inprotex sheet interleaves **six** POs (1640, 1645, 1650, 1662, 1667, 1704); the Symmetry set spans two (1720, 1721). Consequences for Phase 2/3:
 - the `shipments` / `proposed_changes` schema must model one email spanning many POs,
 - the Phase 3 **approval unit** must be defined deliberately — per PO, per shipment, or per line — rather than falling out of the implementation,
 - **write-back needs partial-failure semantics**: one approval can mean six PO writes, and the fifth can fail. What the audit log records, and what Paula sees, when three succeeded and one didn't, has to be decided before the write path is wired.
 
-**`transactionLine.isclosed` is NOT the complement of `isOpen`, and reading it as such produces confidently wrong numbers.** The per-line Closed checkbox is effectively unused in this account — nobody ticks it — so SuiteQL `isclosed = 'F'` reports the lines of a **Fully Billed** PO as fully open. That produced a stated count of **~1,024 "open POs"** which was simply wrong, and it was wrong in the most dangerous direction: a plausible number, quoted with confidence, that no one would think to question. **Use PO status for the business meaning of "open", and REST's per-line `isOpen` as the usable flag** — `isOpen` was present on all 367 lines of the 25 most recent sandbox POs. `POLine` now models both fields separately, with the trap named on the field itself, because a line can be **neither** open nor closed.
+### SuiteQL is unreliable in specific ways — prefer REST paging and per-row queries
 
-**Silent-truncation audit of every paged read (2026-08-31).** Prompted by two traps that both fail without erroring: `?limit=1` reports `totalResults=1000` with `hasMore=true` (a capped, wrong total — at `limit=5` the same query correctly reports 1,659), and SuiteQL ignores `OFFSET` entirely. Every NetSuite read in the pipeline was checked:
+Four separate instances, one habit. Each was found the hard way, and **every one of
+them fails without raising an error** — which is why they belong together rather
+than scattered as curiosities: the shared lesson is that a SuiteQL result looking
+plausible is not evidence that it is complete or correct.
+
+**1. `OFFSET` is SILENTLY IGNORED.** `FETCH FIRST` is honoured; `OFFSET` is not, so
+`... ORDER BY id OFFSET 1000 ROWS FETCH FIRST 1000 ROWS ONLY` returns the **first**
+page every time. A paging loop written that way never advances and never
+terminates. Ours was still cheerfully fetching page one at **offset 505,000** when
+a ten-minute timeout killed it. Nothing errored at any point.
+
+**Page with the endpoint's own query parameters instead** —
+`POST /query/v1/suiteql?limit=1000&offset=1000` — which pages correctly and returns
+`totalResults` and `hasMore` to loop on. Keyset pagination
+(`WHERE id > :last ORDER BY id FETCH FIRST 1000`) also works and is the safer habit
+for a long-running job, since it cannot drift if rows are inserted mid-scan. Both
+verified: 1,659 POs in two pages either way.
+
+**2. `totalResults` is capped and wrong at small limits.** Verbatim, because it is
+the clearest instance we have:
+
+```
+GET /purchaseOrder?limit=1  ->  totalResults=1000, hasMore=true
+GET /purchaseOrder?limit=5  ->  totalResults=1659, hasMore=true
+```
+
+A caller trusting `totalResults` at `limit=1` concludes there are exactly 1,000 POs.
+There are 1,659. **Follow `hasMore` to completion; never treat `totalResults` as a
+count.**
+
+**3. `GROUP BY` returns 500s.** `GROUP BY status` and
+`GROUP BY (tranid, id, item) HAVING COUNT(*) > 1` returned **HTTP 500 with three
+distinct error ids** across repeated attempts, while per-status `COUNT(*)` and a
+narrower `GROUP BY t.tranid` succeeded instantly. The failure is about query shape,
+not load or permissions. **Compute aggregates client-side from narrow reads.** One
+thing that worked exactly as designed: the change-3 transient-retry handler retried
+the 500s with backoff and then **reported** the failure rather than silently
+returning an empty result set — demonstrated on a real fault rather than a
+simulated one.
+
+**4. `transactionLine.isclosed` is NOT the complement of `isOpen`.** The per-line
+Closed checkbox is effectively unused in this account — nobody ticks it — so
+`isclosed = 'F'` reports the lines of a **Fully Billed** PO as fully open. That
+produced a stated count of **~1,024 "open POs"** which was simply wrong, and wrong
+in the most dangerous direction: a plausible number, quoted with confidence, that
+nobody would think to question. **Use PO status for the business meaning of "open",
+and REST's per-line `isOpen` as the usable flag** — present on all 367 lines of the
+25 most recent sandbox POs. `POLine` models both fields separately, with the trap
+named on the field itself, because a line can be **neither** open nor closed.
+
+**Also worth knowing:** a `LIKE 'PO%'` scan over the whole `transaction` table with
+no `type` filter does not return in ten minutes. Filter by `type` first.
+
+### Paging: the pipeline is clean today, and Phase 2 is where that changes
+
+A silent-truncation audit (2026-08-31) checked every NetSuite read in the pipeline
+against the two traps above.
 
 | Call site | Shape | Verdict |
 |---|---|---|
-| `_lookup_via_record_query` | `?q=... &limit=5`, reads `items` | **Safe by design** — wants exactly one match and raises on more than one. Ignoring `hasMore` is correct here. |
-| `get_purchase_order_record` | `?expandSubResources=true`, reads `record["item"]["items"]` | **No truncation today, unguarded.** The sublist reports `totalResults` but no `hasMore`/`offset`. Largest PO in the account is **380 lines** (`PO0001497`) and all 380 come back; **0 POs have ≥1000 lines**. Nothing would detect it if one ever did. |
-| `_fetch_sublist_the_long_way` | `/purchaseOrder/{id}/item` collection | Same exposure; fallback path, has never fired live. |
-| `verify_connection` | `?limit=1` | Diagnostic only, does not consume `items`. |
+| `_lookup_via_record_query` | `?q=... &limit=5`, reads `items` | **Safe by design** — it wants exactly one match and raises on more than one, so ignoring `hasMore` is correct here |
+| `get_purchase_order_record` | `expandSubResources=true` → `record["item"]["items"]` | **Now guarded** — see below |
+| `_fetch_sublist_the_long_way` | `/purchaseOrder/{id}/item` collection | Same guard; fallback path, has never fired live |
+| `verify_connection` | `?limit=1` | Diagnostic only, does not consume `items` |
 
-**No SQL `OFFSET` appears anywhere in the pipeline**, and **no pipeline code paginates a collection to completion — because none needs to**: the only collection read is the single-PO lookup. Every bulk enumeration so far has lived in throwaway probe scripts. **Phase 2's polling job is where this first becomes real**, and it is where both traps would bite.
+**No SQL `OFFSET` appears anywhere in the pipeline** — the only uses were in
+throwaway probe scripts.
 
-**The one cheap guard worth considering** (not implemented, awaiting a decision): compare `len(items)` against the sublist's `totalResults` on every PO read and raise rather than silently process a subset. It is the only place a real PO could truncate.
+**The structural finding, which is forward-looking rather than historical: no
+pipeline code paginates a collection to completion, because none needs to yet.**
+The single collection read is the one-PO lookup. Every bulk enumeration so far has
+lived in a probe script that was deleted afterwards. **Phase 2's polling job is
+where this first becomes real, and any enumeration it does MUST follow `hasMore` to
+completion** — a mailbox listing, a "which POs are open" sweep, a backlog replay.
+Getting that wrong processes a subset and reports success.
 
-**SuiteQL SILENTLY IGNORES a SQL `OFFSET` clause.** `... ORDER BY id OFFSET 1000 ROWS FETCH FIRST 1000 ROWS ONLY` returns the **first** page every time — `FETCH FIRST` is honoured, `OFFSET` is not. A paging loop written that way never advances and never terminates: the first attempt at this ran for ten minutes, cheerfully fetching page one at offsets up to 505,000. Nothing errors, so there is no failure to notice.
+**The PO sublist is the one place a real PO could truncate, and it is now guarded.**
+The sublist reports `totalResults` but **no `hasMore` and no `offset`**, so counting
+is the only available signal. `_assert_sublist_complete` compares `len(items)`
+against `totalResults` on every PO read and raises `SublistTruncated` on a
+mismatch. Fatal rather than a warning, deliberately: a truncated read stages
+proposals for the lines it saw and stays silent about the rest, Paula approves what
+she is shown, and the missing lines never appear anywhere — no error, no flag, no
+row. A partial PO looks complete, which is what makes it worse than a failed read.
+Zero false positives on current data: the largest PO in the account is **380 lines**
+(`PO0001497`) and **no PO has 1,000 or more**, so the guard raises on nothing today
+and exists for the PO that eventually does.
 
-**Page with the endpoint's own query parameters instead** — `POST /query/v1/suiteql?limit=1000&offset=1000` — which works correctly and returns `totalResults` and `hasMore` to loop on. Keyset pagination (`WHERE id > :last ORDER BY id FETCH FIRST 1000`) also works and is the safer habit for a long-running job, since it cannot drift if rows are inserted mid-scan. Both were verified: 1,659 POs in two pages either way.
+### Migrations: autogenerate cannot see views, and SQLite will not alter under one
 
-**Also worth knowing:** a `LIKE 'PO%'` scan over the whole `transaction` table (no type filter) does not return in ten minutes. Filter by `type` first.
+This will recur on every future migration, so it is worth knowing before writing
+one rather than after.
 
-**SuiteQL is not dependable for aggregates. Keep queries narrow.** `GROUP BY status` and `GROUP BY (tranid, id, item) HAVING COUNT(*) > 1` returned **HTTP 500 with three distinct error ids** across repeated attempts, while per-status `COUNT(*)` and a narrower `GROUP BY t.tranid` succeeded instantly. So the failure is about query shape, not load or permissions. **Phase 2 must not lean on aggregate SuiteQL**; compute aggregates client-side from narrow reads. One thing that did work exactly as designed: the change-3 transient-retry handler retried the 500s with backoff and then **reported the failure**, rather than silently returning an empty result set — demonstrated on a real fault rather than a simulated one, which is the harder test to arrange.
+**Alembic's autogenerate does not track views** — they are not in the metadata — so
+any view change has to be hand-written into the migration.
+
+**And on SQLite, EVERY view over a table must be dropped BEFORE a batch `ALTER`,
+not just the view being changed.** Batch mode rebuilds the table (create tmp, copy,
+drop original, rename), and dropping a table that any view references fails
+outright: `error in view v_calibration: no such table: main.proposed_changes`. In
+migration 0002, `v_calibration` had to come down and go back unchanged purely
+because `proposed_changes` was being altered underneath it. Cost two failed
+round-trips to find, because the first failure names the *view*, which is not the
+thing being changed.
+
+Two habits that follow: drop every dependent view first and recreate them after,
+and spell the previous definition out **in the migration** for the downgrade rather
+than importing the live one from `schema.py` — importing it would silently
+reinstate the new shape and make the downgrade a no-op.
+
+**Two values for one thing, deliberately: `PROMPT_VERSION` and `prompt_fingerprint()`.**
+The version is a human-readable string (`2026-08-31.1`) stored on
+`shipments.extractor_prompt_version`, because a calibration query sliced by prompt
+revision has to be legible to whoever reads it. The fingerprint is a 16-character
+hash of all four prompt texts, pinned by a test — so editing a prompt without
+bumping the version fails loudly, with both values shown.
+
+The hash is **not** used as the stored value: an opaque string in a database column
+tells a reader nothing. That is the same separation already in force between
+verbatim vendor text and canonical keys — display and identity are different jobs,
+and collapsing them loses whichever one you did not choose.
+
+**`ns_line_is_open` and `ns_item_internal_id` describe the MATCHED line**, so when
+change 5 selects no target they stay NULL and the per-line open state is on
+`candidate_lines` instead. The review screen therefore reads open state from two
+places depending on outcome: the row when a line was chosen, the candidate payload
+when none was. Deliberate rather than denormalised — a copy on the row would be a
+second source of truth for something change 5 explicitly refused to decide — but
+whoever builds that screen needs to know it up front.
 
 **Not yet exercised against a real document:** the merge-note path (`color printed as 'X' and 'Y' in the source`) is covered by unit tests, but in every live run so far each individual run rendered a value consistently — the variation was *between* runs. So that code path has never fired on real input.
 
@@ -404,6 +517,31 @@ would have destroyed it — the tests would have gone green around a rule that h
 quietly disabled the feature. What shipped instead was the same numbers with no
 gate: `line_balance` on every change, so the review screen shows "ordered 300,
 received 0, this slip 128" and the human who can judge it does.
+
+### 8. Validate a configured rule against the whole population, not the setting
+
+The tranId transformation was blocked for weeks on reading three checkboxes in
+Setup > Company > Auto-Generated Numbers: Prefix, Minimum Digits, **Allow
+Override**, and **Use Subsidiary / Use Location**. Two of those were never captured.
+
+Querying the data settled it in one pass and settled it better: **1,659 of 1,659 PO
+tranIds match `^PO\d{7}$`** — one distinct shape, spanning 2021-06-16 to 2026-07-31
+and every status, zero non-conforming, zero duplicate numbers, and `"PO" + zfill(7)`
+reproduces every one exactly. The 112 gaps in the sequence are ordinary deletions,
+not a second format.
+
+**A checkbox says what is permitted; the data says what happened.** The second is
+what the code has to handle. And the data answered a question the checkboxes could
+not: even if Allow Override *is* enabled, nobody has used it in five years — which
+is a stronger statement than "the setting is off", and it came free.
+
+The habit: when a rule comes from configuration, spend the one query to check it
+against the whole real population before building on it. It converts a config
+reading into a measured fact, it is usually cheap, and it occasionally tells you the
+configuration is lying. Keep the pattern check in the code regardless — `TRANID_PATTERN`
+stays, because 100% conformance today is not a guarantee about tomorrow, and
+re-running the survey against production is a Phase 4 item precisely because
+sandbox conformance is not production conformance.
 
 ## 9. How to recover when something breaks
 

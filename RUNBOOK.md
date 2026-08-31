@@ -243,9 +243,20 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
     **The resolution rule (change 7):** canonical CODE match first — a code-printing vendor costs no item read at all — then canonical NAME match **scoped to the colours on that PO**, then flag. Never a global map, never fuzzy.
 
-    **Scoping is what makes it safe**, and the measurement says so. Globally the item data has collisions, but only just: one name maps to two codes (`'Navy / Silver'` → `NAV` and `NVSL`) and five codes have items that disagree on spelling (`FUS`: Fuchsia/Fucshia, `MLK`: MilkShake/Milkshake, `CHC`: Charcoal/Charcoal Heather, `NAV`: Navy/Navy / Silver, `NIN`: NIN/New Indigo). **Per PO there is not one collision across all 133 open POs** — median 3 colours per PO, max 20. `BLACK` versus `Blackcurrant` is the shape that would defeat a fuzzy matcher and is trivially unambiguous when the only colours in the room are BLK, COC and NIN. If two colours on one PO ever do collide, the change flags with both candidates and picks neither.
+    **Why scoped — and NOT because of collision risk.** That was the original argument and the data does not support it. Measured on items appearing on open POs: exactly **one** name maps to two codes (`'Navy / Silver'` → `NAV` and `NVSL`), five codes have items that disagree on spelling (`FUS`: Fuchsia/Fucshia, `MLK`: MilkShake/Milkshake, `CHC`: Charcoal/Charcoal Heather, `NAV`, `NIN`), and **per PO there is not a single collision across all 133 open POs** (median 3 colours per PO, max 20). A global map would have collided **once**. That is not a reason to build anything.
 
-    **Correction to an earlier figure, which should not be quoted:** a previous probe reported "51 codes carry multiple descriptions" and a value holding `'Black'`, `'INDe'` and `'Indigo'`. That came from joining the colour list to `item.custitem_psgss_product_color`, which is **empty on child matrix items** — an invalid join. The correct pairing takes the code from the PO line (`custcol_product_color`) and the name from the item, and gives the much cleaner figures above.
+    The reasons that survive are about maintenance, and they are sufficient on their own:
+
+    - **No seeded table** — nothing to populate by hand across 589 colour values, and no chance of seeding one wrong.
+    - **No refresh story.** A cached global map goes stale the moment a colour is added, and colour values *are* still being added (the newest in sandbox was created 2026-06-03). A per-PO lookup is built from live data every time.
+    - **No drift** between what a map claims and what the PO actually holds, because the lookup is derived from the PO's own lines.
+    - **Coverage is not a differentiator either way:** all 114 codes on open POs have a name, across 2,390 of 2,393 items.
+
+    If two colours on one PO ever *do* collide, the change flags with both candidates and picks neither — that path exists and is tested, it just has never fired on real data.
+
+    **Retracted figure, which should not be requoted:** an earlier probe reported "51 codes carry multiple descriptions" and a value holding `'Black'`, `'INDe'` and `'Indigo'`. That came from joining the colour list to `item.custitem_psgss_product_color`, which is **empty on child matrix items** — an invalid join. The correct pairing takes the code from the PO line (`custcol_product_color`) and the name from the item.
+
+    **Provenance is now persisted** (migration 0002): the method, the printed value looked up, the resolved code, the long name that supplied it, and the item whose record said so. Not reconstructable later — the item read is not stored, and a PO's colour set changes as lines are added or received — so "why did NEW INDIGO become NIN" is a query rather than an archaeology exercise.
 
     **What NOT to do, still:** fuzzy-match by initials or substring. `BLK`/`BLC`, `COO`/`COC` and `HER`/`H` are all live values, and a wrong colour writes a quantity against the wrong product. Three tests assert those pairs never cross-match.
 
@@ -278,6 +289,19 @@ These are not open questions — they are settled constraints that later phases 
 - **write-back needs partial-failure semantics**: one approval can mean six PO writes, and the fifth can fail. What the audit log records, and what Paula sees, when three succeeded and one didn't, has to be decided before the write path is wired.
 
 **`transactionLine.isclosed` is NOT the complement of `isOpen`, and reading it as such produces confidently wrong numbers.** The per-line Closed checkbox is effectively unused in this account — nobody ticks it — so SuiteQL `isclosed = 'F'` reports the lines of a **Fully Billed** PO as fully open. That produced a stated count of **~1,024 "open POs"** which was simply wrong, and it was wrong in the most dangerous direction: a plausible number, quoted with confidence, that no one would think to question. **Use PO status for the business meaning of "open", and REST's per-line `isOpen` as the usable flag** — `isOpen` was present on all 367 lines of the 25 most recent sandbox POs. `POLine` now models both fields separately, with the trap named on the field itself, because a line can be **neither** open nor closed.
+
+**Silent-truncation audit of every paged read (2026-08-31).** Prompted by two traps that both fail without erroring: `?limit=1` reports `totalResults=1000` with `hasMore=true` (a capped, wrong total — at `limit=5` the same query correctly reports 1,659), and SuiteQL ignores `OFFSET` entirely. Every NetSuite read in the pipeline was checked:
+
+| Call site | Shape | Verdict |
+|---|---|---|
+| `_lookup_via_record_query` | `?q=... &limit=5`, reads `items` | **Safe by design** — wants exactly one match and raises on more than one. Ignoring `hasMore` is correct here. |
+| `get_purchase_order_record` | `?expandSubResources=true`, reads `record["item"]["items"]` | **No truncation today, unguarded.** The sublist reports `totalResults` but no `hasMore`/`offset`. Largest PO in the account is **380 lines** (`PO0001497`) and all 380 come back; **0 POs have ≥1000 lines**. Nothing would detect it if one ever did. |
+| `_fetch_sublist_the_long_way` | `/purchaseOrder/{id}/item` collection | Same exposure; fallback path, has never fired live. |
+| `verify_connection` | `?limit=1` | Diagnostic only, does not consume `items`. |
+
+**No SQL `OFFSET` appears anywhere in the pipeline**, and **no pipeline code paginates a collection to completion — because none needs to**: the only collection read is the single-PO lookup. Every bulk enumeration so far has lived in throwaway probe scripts. **Phase 2's polling job is where this first becomes real**, and it is where both traps would bite.
+
+**The one cheap guard worth considering** (not implemented, awaiting a decision): compare `len(items)` against the sublist's `totalResults` on every PO read and raise rather than silently process a subset. It is the only place a real PO could truncate.
 
 **SuiteQL SILENTLY IGNORES a SQL `OFFSET` clause.** `... ORDER BY id OFFSET 1000 ROWS FETCH FIRST 1000 ROWS ONLY` returns the **first** page every time — `FETCH FIRST` is honoured, `OFFSET` is not. A paging loop written that way never advances and never terminates: the first attempt at this ran for ten minutes, cheerfully fetching page one at offsets up to 505,000. Nothing errors, so there is no failure to notice.
 

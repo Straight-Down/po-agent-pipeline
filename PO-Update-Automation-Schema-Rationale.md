@@ -255,6 +255,16 @@ Until then: the store is private, it is not in OneDrive, and nothing has been de
 
 ---
 
+## 13a. Colour resolution provenance (migration 0002)
+
+Five columns on `proposed_changes`: `colour_resolution_method` (`CODE` / `NAME` / `AMBIGUOUS` / `UNRESOLVED`), `colour_printed_key`, `colour_resolved_code`, `colour_resolved_name`, `colour_name_source_item_id`.
+
+**Why persist rather than re-derive.** Matching a printed `NEW INDIGO` to NetSuite's `NIN` is a non-obvious inference, and the evidence for it is not kept anywhere else: the item read is not stored, and a PO's colour set changes as lines are added or received. So the answer is available at the moment of matching and gone afterwards. A wrong colour writes a quantity against the wrong product, which makes "why did this resolve that way" a question someone will eventually need answered — and `v_review_lines` now answers it in one query.
+
+**A `NAME` resolution must carry its evidence**, enforced by `ck_proposed_changes_name_resolution_needs_provenance`: the code, the name and the source item are all required together. Without them the row asserts a conclusion with nothing behind it. `CODE` needs no attribution — the printed value *was* the code — and the code path deliberately records no name even when the lookup happens to hold one, because reporting a source that was not consulted misdescribes how the match was made.
+
+**One migration lesson worth carrying forward.** Alembic's autogenerate cannot see views, and on SQLite **every** view over a table has to be dropped *before* a batch `ALTER` — batch mode rebuilds the table by dropping the original, which fails while any view references it (`error in view v_calibration: no such table`). So 0002 drops both views, alters, and recreates both; the downgrade restores 0001's definition verbatim rather than importing the live one, which would silently reinstate the new shape.
+
 ## 14. Migrations
 
 **Alembic over SQLAlchemy Core metadata.** Not the ORM — `schema.py` is table definitions, and the application talks to them through Core or plain SQL.
@@ -337,7 +347,9 @@ The schema's first contact with real data (2026-08-26, `ingest.py` against the L
 
 **Every line came back `NEEDS_ATTENTION`**, for two distinct and legitimate reasons: 29 because the vendor printed a colour *name* against NetSuite's colour *codes* (RUNBOOK §6 item 12, a new blocker this run found), and 4 because the extractor reported `medium` confidence with a specific note — *"Quantity read from the block subtotal row 14; PO, style and colour inferred from the block header in row 12."* Those 4 are the first real rows in the calibration corpus: the tool's claim recorded, awaiting a human verdict.
 
-**Columns with no producer, reported rather than defaulted:** `ns_item_internal_id` and `ns_line_is_open` (33/33 NULL — both exist on `POLine` but `matcher.ProposedChange` does not surface them), `extractor_prompt_version` (no such constant), `agreement_json` (the cross-check result is a warning string, not structured data). The human and approval columns are 33/33 NULL by design — that is the review step's job.
+~~**Columns with no producer:** `ns_item_internal_id`, `ns_line_is_open`, `extractor_prompt_version`, `agreement_json`.~~ **Three of the four closed 2026-08-31.** `ns_item_internal_id` and `ns_line_is_open` are now carried through from `POLine` (29 of 33 populated — the four blanks are the unmatched `DFK` lines, which have no matched line to describe), and `extractor_prompt_version` records `claude_extractor.PROMPT_VERSION`. Still open: `agreement_json`, because the cross-check result is a warning string rather than structured data. The human and approval columns remain NULL by design — that is the review step's job.
+
+**Colour provenance added by migration 0002** and populated on the same corpus: 25 lines resolved by NAME (`NEW INDIGO` → `nin` via `'New Indigo'` from item 51669; `BLACK` → `blk`; `COCONUT` → `coc`), 4 by CODE (`DKF`, `MLT` — no attribution, because no name was consulted), 4 UNRESOLVED (the `DFK` typo).
 
 ## 16. What this deliberately does not include
 

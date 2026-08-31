@@ -144,6 +144,9 @@ class ColourLookup:
     by_name: dict = field(default_factory=dict)
     display: dict = field(default_factory=dict)
     missing_names: list = field(default_factory=list)
+    #: canonical code -> the item internal id whose record supplied its name. Kept
+    #: so the persisted provenance can name the source, not just the answer.
+    name_source: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -167,6 +170,15 @@ class ProposedChange:
     # Quantity — replace semantics; this is the part that can be plainly approved.
     current_quantity: Optional[int]
     proposed_quantity: Optional[int]
+
+    #: The matched line's item record id, and whether NetSuite still considers the
+    #: line open. Both come from `POLine` (change 5) and were previously dropped
+    #: here, so they landed NULL in the database. `ns_line_is_open` is what the
+    #: review screen needs: `line_closed` is NOT its complement -- a Fully Billed
+    #: line is neither open nor closed -- so "can this still be updated?" cannot be
+    #: answered from `line_closed` alone.
+    ns_item_internal_id: Optional[str] = None
+    ns_line_is_open: Optional[bool] = None
 
     # Current NetSuite date state, for display next to the reference dates.
     current_expected_receipt_date: Optional[str] = None
@@ -195,10 +207,18 @@ class ProposedChange:
 
     #: Set when the colour matched through the item's long-form NAME rather than by
     #: code, e.g. "printed 'NEW INDIGO' resolved to code NIN ('New Indigo')".
-    #: Display and audit only: matching a printed name to a code is a non-obvious
-    #: inference, so it should be visible to whoever reviews the row. Not persisted
-    #: -- the schema has no column for it yet.
+    #: The human sentence, for display.
     colour_resolution: str = ""
+
+    #: The same thing structured, for persistence: method, the canonical printed
+    #: value that was looked up, the code it resolved to, the long name that
+    #: supplied the mapping, and the item whose record that name came from.
+    #:
+    #: **Persisted because it is not reconstructable later.** The item read is not
+    #: stored, and a PO's colour set changes as lines are added or received -- so
+    #: re-deriving "why did NEW INDIGO become NIN" from a row six months old is
+    #: guesswork. The answer has to be written down when it is known.
+    colour_provenance: dict = field(default_factory=dict)
 
     #: Every NetSuite line whose canonical key matched, when the match was not a
     #: clean 1:1. Populated for NEEDS_RESOLUTION (several open lines) and for the
@@ -331,7 +351,7 @@ def _find_matching_lines(
     vendor_line: dict,
     ns_lines: list[POLine],
     colour_lookup: Optional[ColourLookup] = None,
-) -> tuple[list[POLine], str, str]:
+) -> tuple[list[POLine], str, str, dict]:
     """
     ALL NetSuite lines whose canonical key matches -- not the first one.
 
@@ -349,14 +369,15 @@ def _find_matching_lines(
     ignored the rest, which meant one line was updated and its twin left stale
     with no flag.
 
-    Returns `(lines, colour_resolution, colour_problem)` -- the colour may have been
-    recovered from the item's long-form name (`_resolve_colour_codes`), which is
-    worth recording, and may have been ambiguous, which must flag.
+    Returns `(lines, colour_resolution, colour_problem, colour_provenance)` -- the
+    colour may have been recovered from the item's long-form name
+    (`_resolve_colour_codes`), which is worth recording and persisting, and may have
+    been ambiguous, which must flag.
     """
     style = canonical(vendor_line.get("style_number"))
     printed_colour = canonical(vendor_line.get("color"))
     size = _size_key(vendor_line.get("size"))
-    colours, resolution, problem = _resolve_colour_codes(
+    colours, resolution, problem, provenance = _resolve_colour_codes(
         printed_colour, ns_lines, colour_lookup
     )
     matches = [
@@ -369,7 +390,7 @@ def _find_matching_lines(
         and canonical(line.color) in colours
         and _size_key(line.size) == size
     ]
-    return matches, resolution, problem
+    return matches, resolution, problem, provenance
 
 
 def build_colour_lookup(
@@ -386,26 +407,27 @@ def build_colour_lookup(
     item. So a name-printing vendor needs the code recovered from the name -- and
     the safe way to do that is against the handful of colours on the PO in hand.
 
-    Measured on the population that matters (items on open POs, 133 POs, 114
-    distinct colour codes):
+    **Why scoped, now that the numbers are in.** The original argument was that a
+    global map would collide. On the real data it barely would: across items on open
+    POs, exactly **one** name maps to two codes (`'Navy / Silver'` -> `NAV` and
+    `NVSL`), five codes have items that disagree on spelling (`FUS`, `MLK`, `CHC`,
+    `NAV`, `NIN`), and **per PO there is not a single collision across 133 open
+    POs**. So collision risk is not the reason, and citing it would overstate the
+    case. (An earlier probe's "51 codes carry multiple descriptions" figure came
+    from an invalid join and is retracted -- do not requote it.)
 
-    - **Every one of the 114 codes has a name.** Coverage is 2,390 of 2,393
-      distinct items; the three exceptions are poly mailers, which have no colour.
-    - **Globally the data has collisions, but only just:** one name maps to two
-      codes (`'Navy / Silver'` -> `NAV` and `NVSL`), and five codes have items that
-      disagree on spelling (`FUS`: Fuchsia / Fucshia; `MLK`: MilkShake / Milkshake;
-      `CHC`: Charcoal / Charcoal Heather; `NAV`: Navy / Navy / Silver; `NIN`: NIN /
-      New Indigo -- some items carry the code in the name field).
-    - **Per PO, zero collisions.** Across all 133 open POs there is not one where a
-      printed name would resolve to two codes. `BLACK` versus `Blackcurrant` is the
-      shape that would defeat a fuzzy matcher and is trivially unambiguous when the
-      only colours in the room are BLK, COC and NIN.
+    The reasons that survive are about maintenance, and they are enough:
 
-    (An earlier probe reported "51 codes carry multiple descriptions" and a value
-    holding 'Black', 'INDe' and 'Indigo'. That came from joining the colour list to
-    `item.custitem_psgss_product_color`, which is EMPTY on child matrix items -- an
-    invalid join. The figures above use the correct pairing: the code from the PO
-    line, the name from the item. Do not quote the old numbers.)
+    - **No seeded table**, so nothing to populate by hand for 589 colour values,
+      and no chance of seeding one wrong.
+    - **No refresh story.** A cached global map goes stale the moment a colour is
+      added -- and colour values *are* still being added (the newest in sandbox was
+      created 2026-06-03). A per-PO lookup is built from live data every time.
+    - **No drift** between what the map says and what the PO actually holds. The
+      lookup is derived from the PO's own lines, so it cannot disagree with them.
+    - **Coverage is not a concern either way**: all 114 codes on open POs have a
+      name, on 2,390 of 2,393 items (the three exceptions are poly mailers, which
+      have no colour).
 
     Same principle as Paula's ruling on sizes: resolve against the vocabulary
     actually in play, never against a vendor profile or a global table.
@@ -430,20 +452,24 @@ def build_colour_lookup(
             continue
         lookup.by_name.setdefault(canonical(name), set()).add(code)
         lookup.display[code] = name
+        lookup.name_source[code] = str(line.item_internal_id)
     return lookup
 
 
 def _resolve_colour_codes(
     printed: str, ns_lines: list[POLine], lookup: Optional[ColourLookup]
-) -> tuple[set, str, str]:
+) -> tuple[set, str, str, dict]:
     """
     Which NetSuite colour code(s) does the printed colour mean, on THIS PO?
 
-    Returns `(codes, resolution_note, problem)`. `problem` is non-empty only when a
-    printed name is ambiguous on this PO -- two colours it could equally be. That
-    case is flagged with both candidates and never resolved, following change 5:
-    a wrong colour writes a quantity against the wrong product, which is exactly
-    the kind of error nobody notices downstream.
+    Returns `(codes, resolution_note, problem, provenance)`. `problem` is non-empty
+    only when a printed name is ambiguous on this PO -- two colours it could equally
+    be. That case is flagged with both candidates and never resolved, following
+    change 5: a wrong colour writes a quantity against the wrong product, which is
+    exactly the kind of error nobody notices downstream.
+
+    `provenance` is the structured record persisted on the row: method, printed key,
+    resolved code, the name that supplied the mapping and the item it came from.
 
     **Order matters.** Code match first, so a code-printing vendor needs no item
     read at all. Only then the name path.
@@ -454,13 +480,27 @@ def _resolve_colour_codes(
     """
     po_codes = {canonical(line.color) for line in ns_lines}
 
+    def record(method: str, code: Optional[str] = None) -> dict:
+        # The provenance row. `name` and `name_source_item_id` are filled ONLY for a
+        # NAME resolution: on the code path no name was consulted, so attributing
+        # one -- even a correct one the lookup happens to hold -- would misreport
+        # how the match was actually made.
+        attributed = method == "NAME" and lookup is not None and code is not None
+        return {
+            "method": method,
+            "printed": printed,
+            "code": code,
+            "name": lookup.display.get(code) if attributed else None,
+            "name_source_item_id": lookup.name_source.get(code) if attributed else None,
+        }
+
     if printed in po_codes:
-        return {printed}, "", ""
+        return {printed}, "", "", record("CODE", printed)
 
     if lookup is None or not lookup.by_name:
         # No name data (offline, mock client, or nothing populated). Behaviour is
         # then exactly what it was before this change: code comparison only.
-        return {printed}, "", ""
+        return {printed}, "", "", record("UNRESOLVED")
 
     candidates = lookup.by_name.get(printed, set()) & po_codes
     if len(candidates) == 1:
@@ -469,7 +509,7 @@ def _resolve_colour_codes(
         return candidates, (
             f"printed colour {printed!r} resolved to code {code.upper()} "
             f"({display!r}) via the item's colour name"
-        ), ""
+        ), "", record("NAME", code)
 
     if len(candidates) > 1:
         named = ", ".join(
@@ -479,9 +519,9 @@ def _resolve_colour_codes(
             f"printed colour {printed!r} matches {len(candidates)} colours on this PO "
             f"({named}). Not choosing between them -- a wrong colour would write this "
             "quantity against the wrong product"
-        )
+        ), record("AMBIGUOUS")
 
-    return {printed}, "", ""
+    return {printed}, "", "", record("UNRESOLVED")
 
 
 def _line_balance(line: Optional[POLine], slip_quantity: Optional[float]) -> dict:
@@ -670,8 +710,8 @@ def build_proposed_changes(
         note = str(vl.get("note") or "")
         ns_lines = ns_lines_by_po.get(po_number, [])
         # ALL matching lines, not just the first — the key is not unique per line.
-        candidates, colour_resolution, colour_problem = _find_matching_lines(
-            vl, ns_lines, (colour_lookups or {}).get(po_number)
+        candidates, colour_resolution, colour_problem, colour_provenance = (
+            _find_matching_lines(vl, ns_lines, (colour_lookups or {}).get(po_number))
         )
         match, resolution_problem, ambiguous_lines = _resolve_target_line(candidates)
 
@@ -681,6 +721,8 @@ def build_proposed_changes(
             color=str(vl.get("color") or "").strip(),
             size=str(vl.get("size") or "").strip(),
             line_id=match.line_id if match else None,
+            ns_item_internal_id=match.item_internal_id if match else None,
+            ns_line_is_open=match.is_open if match else None,
             current_quantity=match.quantity if match else None,
             proposed_quantity=vl.get("quantity"),
             current_expected_receipt_date=_iso_or_none(match.expected_receipt_date) if match else None,
@@ -691,6 +733,7 @@ def build_proposed_changes(
             extraction_confidence=confidence,
             extraction_note=note,
             colour_resolution=colour_resolution,
+            colour_provenance=colour_provenance,
             # Display context on every change, flagged or not. Nothing branches on
             # it -- see `_line_balance` for why a gate here was cancelled.
             line_balance=_line_balance(match, _as_quantity(vl.get("quantity"))),

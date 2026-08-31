@@ -823,6 +823,154 @@ def test_state_machine_is_data() -> None:
         )
 
 
+def test_colour_provenance_columns() -> None:
+    section("migration 0002: colour resolution provenance")
+    engine = fresh_db()
+    with engine.begin() as conn:
+        ship = mk_shipment(conn, message_id=mk_message(conn, "msg-colour"), primary_sha=None)
+        po = mk_po(conn, ship, "PO#1720", "1720")
+
+    # A NAME resolution has to carry its evidence. This is the check that makes the
+    # column set provenance rather than an assertion.
+    with engine.begin() as conn:
+        expect_integrity(
+            lambda: mk_change(conn, ship, po, size="m",
+                              colour_resolution_method="NAME",
+                              colour_printed_key="new indigo",
+                              colour_resolved_code="nin",
+                              colour_resolved_name=None,
+                              colour_name_source_item_id=None),
+            "a NAME resolution without the name and its source item is rejected",
+        )
+    with engine.begin() as conn:
+        change = mk_change(conn, ship, po, size="m",
+                           colour_resolution_method="NAME",
+                           colour_printed_key="new indigo",
+                           colour_resolved_code="nin",
+                           colour_resolved_name="New Indigo",
+                           colour_name_source_item_id="51669")
+    with engine.connect() as conn:
+        row = conn.execute(select(proposed_changes).where(
+            proposed_changes.c.id == change)).one()
+    check(row.colour_resolution_method == "NAME"
+          and row.colour_resolved_code == "nin"
+          and row.colour_resolved_name == "New Indigo"
+          and row.colour_name_source_item_id == "51669",
+          "a complete NAME resolution persists",
+          f"{row.colour_printed_key} -> {row.colour_resolved_code}")
+
+    # CODE needs no attribution: the printed value WAS the code.
+    with engine.begin() as conn:
+        mk_change(conn, ship, po, size="l", colour_resolution_method="CODE",
+                  colour_printed_key="mlt", colour_resolved_code="mlt")
+    with engine.connect() as conn:
+        row = conn.execute(select(proposed_changes).where(
+            proposed_changes.c.key_size == "l")).one()
+    check(row.colour_resolution_method == "CODE" and row.colour_resolved_name is None,
+          "a CODE resolution persists without a name source")
+
+    for method in ("AMBIGUOUS", "UNRESOLVED"):
+        with engine.begin() as conn:
+            mk_change(conn, ship, po, size=method.lower()[:2],
+                      colour_resolution_method=method, colour_printed_key="puce")
+        check(True, f"{method} is an accepted method")
+    with engine.begin() as conn:
+        expect_integrity(
+            lambda: mk_change(conn, ship, po, size="xl",
+                              colour_resolution_method="GUESSED"),
+            "an unknown resolution method is rejected",
+        )
+
+    # The review screen reads it from the view, which is where the question is asked.
+    with engine.connect() as conn:
+        cols = conn.execute(text("SELECT * FROM v_review_lines")).keys()
+    for column in ("colour_resolution_method", "colour_resolved_code",
+                   "colour_resolved_name"):
+        check(column in cols, f"v_review_lines exposes {column}")
+    with engine.connect() as conn:
+        answer = conn.execute(text(
+            "SELECT color_printed, colour_resolved_code, colour_resolved_name "
+            "FROM v_review_lines WHERE colour_resolution_method = 'NAME'")).one()
+    check(answer.colour_resolved_name == "New Indigo",
+          "so 'why did NEW INDIGO become NIN' is one query",
+          f"{answer.color_printed} -> {answer.colour_resolved_code} "
+          f"({answer.colour_resolved_name})")
+
+
+def test_colour_provenance_columns() -> None:
+    section("migration 0002: colour resolution provenance")
+    engine = fresh_db()
+    with engine.begin() as conn:
+        ship = mk_shipment(conn, message_id=mk_message(conn, "msg-colour"), primary_sha=None)
+        po = mk_po(conn, ship, "PO#1720", "1720")
+
+    # A NAME resolution has to carry its evidence. This is the check that makes the
+    # column set provenance rather than an assertion.
+    with engine.begin() as conn:
+        expect_integrity(
+            lambda: mk_change(conn, ship, po, size="m",
+                              colour_resolution_method="NAME",
+                              colour_printed_key="new indigo",
+                              colour_resolved_code="nin",
+                              colour_resolved_name=None,
+                              colour_name_source_item_id=None),
+            "a NAME resolution without the name and its source item is rejected",
+        )
+    with engine.begin() as conn:
+        change = mk_change(conn, ship, po, size="m",
+                           colour_resolution_method="NAME",
+                           colour_printed_key="new indigo",
+                           colour_resolved_code="nin",
+                           colour_resolved_name="New Indigo",
+                           colour_name_source_item_id="51669")
+    with engine.connect() as conn:
+        row = conn.execute(select(proposed_changes).where(
+            proposed_changes.c.id == change)).one()
+    check(row.colour_resolution_method == "NAME"
+          and row.colour_resolved_code == "nin"
+          and row.colour_resolved_name == "New Indigo"
+          and row.colour_name_source_item_id == "51669",
+          "a complete NAME resolution persists",
+          f"{row.colour_printed_key} -> {row.colour_resolved_code}")
+
+    # CODE needs no attribution: the printed value WAS the code.
+    with engine.begin() as conn:
+        mk_change(conn, ship, po, size="l", colour_resolution_method="CODE",
+                  colour_printed_key="mlt", colour_resolved_code="mlt")
+    with engine.connect() as conn:
+        row = conn.execute(select(proposed_changes).where(
+            proposed_changes.c.key_size == "l")).one()
+    check(row.colour_resolution_method == "CODE" and row.colour_resolved_name is None,
+          "a CODE resolution persists without a name source")
+
+    for method in ("AMBIGUOUS", "UNRESOLVED"):
+        with engine.begin() as conn:
+            mk_change(conn, ship, po, size=method.lower()[:2],
+                      colour_resolution_method=method, colour_printed_key="puce")
+        check(True, f"{method} is an accepted method")
+    with engine.begin() as conn:
+        expect_integrity(
+            lambda: mk_change(conn, ship, po, size="xl",
+                              colour_resolution_method="GUESSED"),
+            "an unknown resolution method is rejected",
+        )
+
+    # The review screen reads it from the view, which is where the question is asked.
+    with engine.connect() as conn:
+        cols = conn.execute(text("SELECT * FROM v_review_lines")).keys()
+    for column in ("colour_resolution_method", "colour_resolved_code",
+                   "colour_resolved_name"):
+        check(column in cols, f"v_review_lines exposes {column}")
+    with engine.connect() as conn:
+        answer = conn.execute(text(
+            "SELECT color_printed, colour_resolved_code, colour_resolved_name "
+            "FROM v_review_lines WHERE colour_resolution_method = 'NAME'")).one()
+    check(answer.colour_resolved_name == "New Indigo",
+          "so 'why did NEW INDIGO become NIN' is one query",
+          f"{answer.color_printed} -> {answer.colour_resolved_code} "
+          f"({answer.colour_resolved_name})")
+
+
 def test_scope_boundaries_in_the_schema() -> None:
     section("scope boundaries the schema itself enforces")
     engine = fresh_db()
@@ -897,6 +1045,8 @@ def main() -> int:
         test_canonical_key_identity,
         test_five_review_figures,
         test_calibration_pairing,
+        test_colour_provenance_columns,
+        test_colour_provenance_columns,
         test_two_workflows_are_distinguishable,
         test_state_machine_is_data,
         test_scope_boundaries_in_the_schema,

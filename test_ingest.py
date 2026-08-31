@@ -95,6 +95,7 @@ def ns_line(line_id="18", style="M120246", color="TID", size="S", qty=12,
         expected_receipt_date=dt.date(2026, 7, 6), override_expected_receipt=False,
         updated_receipt_date=None, closed=closed, is_open=is_open,
         quantity_received=recv, quantity_billed=0.0, rate=18.75,
+        item_internal_id=f"item-{color}",
     )
 
 
@@ -794,17 +795,26 @@ def test_gaps_are_reported_not_defaulted() -> None:
             restore(monkey)
 
     joined = " | ".join(report.unpopulated)
-    for expected in ("ns_item_internal_id", "ns_line_is_open", "extractor_prompt_version",
-                     "agreement_json", "human_verdict"):
+    for expected in ("agreement_json", "human_verdict"):
         check(expected in joined, f"{expected} reported as unpopulated")
+
+    # These three used to be on the gap list and are now filled, so the assertion
+    # flips: reporting a gap that no longer exists is its own kind of stale.
+    for closed in ("ns_item_internal_id", "ns_line_is_open", "extractor_prompt_version"):
+        check(closed not in joined,
+              f"{closed} is no longer reported as a gap -- it has a producer now")
 
     with engine.connect() as conn:
         row = conn.execute(select(proposed_changes)).one()
-    check(row.ns_item_internal_id is None and row.ns_line_is_open is None,
-          "and they are NULL rather than holding a plausible-looking default")
+        ship = conn.execute(select(shipments)).one()
+    check(row.ns_item_internal_id == "item-TID",
+          "the matched line's item id persists", str(row.ns_item_internal_id))
+    check(row.ns_line_is_open == 1, "and its open state", str(row.ns_line_is_open))
     check(row.ns_line_closed == 0,
-          "while a column that DOES have a producer is populated",
-          str(row.ns_line_closed))
+          "alongside line_closed, which is NOT its complement", str(row.ns_line_closed))
+    check(bool(ship.extractor_prompt_version),
+          "and the shipment records which prompt version produced it",
+          str(ship.extractor_prompt_version))
 
 
 def main() -> int:

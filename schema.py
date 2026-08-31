@@ -468,6 +468,19 @@ proposed_changes = Table(
     Column("src_quantity_text", String(100)),
     Column("source_hint", String(120)),  # 'PACKING!R42' / 'P2!R17'
     Column("source_sha256", String(64), ForeignKey("attachments.content_sha256")),
+    # -- how the colour was resolved (migration 0002). Persisted because it is NOT
+    # -- reconstructable later: the item read is not stored, and a PO's colour set
+    # -- changes as lines are added or received. "Why did NEW INDIGO become NIN"
+    # -- has to be answerable from this row alone.
+    # --   CODE       the printed value was already a NetSuite colour code
+    # --   NAME       recovered from the item's long-form colour name
+    # --   AMBIGUOUS  the name matched two colours on this PO; nothing was chosen
+    # --   UNRESOLVED neither path matched
+    Column("colour_resolution_method", String(12)),
+    Column("colour_printed_key", String(64)),   # canonical value actually looked up
+    Column("colour_resolved_code", String(64)),  # the NetSuite code it resolved to
+    Column("colour_resolved_name", String(200)),  # the long name that supplied it
+    Column("colour_name_source_item_id", String(40)),  # whose item record said so
     # -- the five figures the review screen needs, so a human can read the
     # -- situation directly: "ordered 300, received 0, this slip 128" makes a
     # -- partial delivery self-evident. `outstanding` is derived
@@ -523,6 +536,20 @@ proposed_changes = Table(
         "human_verdict IS NULL OR human_verdict IN "
         "('ACCEPTED','CORRECTED','REJECTED','CANDIDATE_PICKED')",
         name="human_verdict",
+    ),
+    CheckConstraint(
+        "colour_resolution_method IS NULL OR colour_resolution_method IN "
+        "('CODE','NAME','AMBIGUOUS','UNRESOLVED')",
+        name="colour_resolution_method",
+    ),
+    # A NAME resolution has to say which name and which item said so, or it is not
+    # provenance -- just an assertion. CODE needs neither: the printed value WAS
+    # the code, and there is nothing to attribute.
+    CheckConstraint(
+        "colour_resolution_method <> 'NAME' OR "
+        "(colour_resolved_code IS NOT NULL AND colour_resolved_name IS NOT NULL "
+        " AND colour_name_source_item_id IS NOT NULL)",
+        name="name_resolution_needs_provenance",
     ),
     # No target line => cannot be approved or written. This is what makes
     # NEEDS_RESOLUTION a real state rather than a null FK with a comment beside it.
@@ -674,7 +701,10 @@ SELECT pc.id                        AS change_id,
        pc.current_quantity          AS current_quantity,
        pc.current_quantity_received AS current_quantity_received,
        pc.proposed_quantity         AS proposed_quantity,
-       pc.current_quantity - COALESCE(pc.current_quantity_received, 0) AS outstanding
+       pc.current_quantity - COALESCE(pc.current_quantity_received, 0) AS outstanding,
+       pc.colour_resolution_method  AS colour_resolution_method,
+       pc.colour_resolved_code      AS colour_resolved_code,
+       pc.colour_resolved_name      AS colour_resolved_name
 FROM proposed_changes pc
 JOIN shipment_pos sp ON sp.id = pc.shipment_po_id
 """

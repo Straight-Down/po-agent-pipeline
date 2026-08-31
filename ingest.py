@@ -130,6 +130,22 @@ def sha256_file(path: Union[str, Path]) -> str:
     return digest.hexdigest()
 
 
+def _prompt_version() -> Optional[str]:
+    """
+    The extractor's prompt version, imported lazily.
+
+    Lazy because `claude_extractor` pulls in the Anthropic SDK, and the persistence
+    layer should stay importable without it -- the schema tests, for one, have no
+    business needing an API client on the path.
+    """
+    try:
+        from claude_extractor import PROMPT_VERSION
+
+        return PROMPT_VERSION
+    except Exception:  # noqa: BLE001 -- a missing extractor must not fail an ingest
+        return None
+
+
 def _utcnow() -> dt.datetime:
     """Timestamps are generated here, never by the database -- see schema.py."""
     return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None, microsecond=0)
@@ -352,7 +368,7 @@ def _change_row(change: mt.ProposedChange, line: dict, shipment_id, po_id, sha, 
         "source_sha256": sha,
         # the five review figures (change 6); outstanding is derived by v_review_lines
         "ns_line_id": change.line_id,
-        "ns_item_internal_id": None,  # see IngestReport.unpopulated
+        "ns_item_internal_id": change.ns_item_internal_id,
         "current_quantity": balance.get("line_quantity"),
         "current_quantity_received": balance.get("quantity_received"),
         "proposed_quantity": change.proposed_quantity,
@@ -360,7 +376,7 @@ def _change_row(change: mt.ProposedChange, line: dict, shipment_id, po_id, sha, 
         "current_expected_receipt_date": _as_date(change.current_expected_receipt_date),
         "current_updated_receipt_date": _as_date(change.current_updated_receipt_date),
         "current_override_flag": change.current_override_flag,
-        "ns_line_is_open": None,  # see IngestReport.unpopulated
+        "ns_line_is_open": change.ns_line_is_open,
         "ns_line_closed": change.line_closed,
         # calibration: the tool's claim. The human half stays NULL until the
         # review UI fills it in -- that is the Phase 3 acceptance criterion.
@@ -368,6 +384,15 @@ def _change_row(change: mt.ProposedChange, line: dict, shipment_id, po_id, sha, 
         "extraction_note": (change.extraction_note or None),
         "needs_review": change.extraction_confidence in REVIEW_CONFIDENCES,
         "attention_reason": (change.attention_reason or None),
+        # How the colour was resolved. Written now because it cannot be
+        # reconstructed later -- see schema.py on why.
+        "colour_resolution_method": (change.colour_provenance or {}).get("method"),
+        "colour_printed_key": (change.colour_provenance or {}).get("printed"),
+        "colour_resolved_code": (change.colour_provenance or {}).get("code"),
+        "colour_resolved_name": (change.colour_provenance or {}).get("name"),
+        "colour_name_source_item_id": (
+            (change.colour_provenance or {}).get("name_source_item_id")
+        ),
         "created_at": now,
         "updated_at": now,
     }
@@ -533,7 +558,9 @@ def ingest_shipment(
             "vendor_eta": parsed.ship_info.get("eta"),
             "parser": parsed.parser or None,
             "extractor_model": getattr(extractor, "model", None),
-            "extractor_prompt_version": None,  # see IngestReport.unpopulated
+            # Calibration slices by this: a false-negative rate is meaningless if
+            # the corpus mixes prompt revisions under one label.
+            "extractor_prompt_version": _prompt_version(),
             "doc_needs_review": bool(parsed.needs_review),
             "needs_manual_entry": bool(parsed.needs_manual_entry),
             "parse_warnings_json": json.dumps(parsed.warnings) if parsed.warnings else None,
@@ -644,12 +671,6 @@ def _unpopulated_columns(client: Optional[NetSuiteClient]) -> list[str]:
     worth avoiding -- an empty column is a question, a wrong one is not.
     """
     gaps = [
-        "proposed_changes.ns_item_internal_id -- POLine carries item_internal_id "
-        "but matcher.ProposedChange does not surface it; needs a matcher field",
-        "proposed_changes.ns_line_is_open -- POLine.is_open exists (change 5) but "
-        "ProposedChange exposes only line_closed; needs a matcher field",
-        "shipments.extractor_prompt_version -- claude_extractor has no prompt "
-        "version constant to read",
         "shipment_sources.agreement_json -- the cross-check result is currently a "
         "warning string on ParseResult, not structured data",
         "messages.* -- no Graph client yet (Phase 2 item 2); the caller supplies a "

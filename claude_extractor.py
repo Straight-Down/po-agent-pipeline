@@ -36,6 +36,7 @@ Inprotex fast path or for the offline tests.
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 from contextlib import contextmanager
@@ -479,6 +480,19 @@ def _render_window(grid: SheetGrid, start: int, end: int, split: bool) -> str:
 # Prompts
 # ---------------------------------------------------------------------------
 
+#: Bump this whenever ANY prompt text below changes.
+#:
+#: Calibration needs to slice results by which prompt produced them: a
+#: `needs_review` false-negative rate is meaningless if the corpus mixes three
+#: prompt revisions, and the extractor's confidence notes are prompt-dependent.
+#: `shipments.extractor_prompt_version` records it per shipment.
+#:
+#: Forgetting to bump it is the obvious failure, so it is not left to memory --
+#: `prompt_fingerprint()` hashes the actual prompt text, and a test pins the pair.
+#: Edit a prompt without bumping this and that test fails with both values, which
+#: is the cheapest available reminder.
+PROMPT_VERSION = "2026-08-31.1"
+
 # Stable across every call, so it sits in front of the cache breakpoint.
 PACKING_SYSTEM_PROMPT = """\
 You extract shipment line items from vendor packing slips for a purchase-order \
@@ -603,6 +617,32 @@ becomes a wrong receipt date in the ERP.
 invent or infer a waybill or invoice number.
 
 4. Put anything else a reviewer should know in warnings."""
+
+
+def prompt_fingerprint() -> str:
+    """
+    A short hash of every prompt this module sends, plus the classifier's.
+
+    Exists so `PROMPT_VERSION` cannot drift from the text it names: a test compares
+    this against a pinned value, so editing a prompt without bumping the version
+    fails loudly instead of quietly poisoning the calibration corpus with two
+    different prompts under one label.
+
+    Deliberately NOT used as the version itself -- an opaque hash in a database
+    column tells a human nothing, and the point of the column is to be readable
+    six months later.
+    """
+    from attachment_classifier import CLASSIFIER_SYSTEM_PROMPT
+
+    joined = "\x00".join(
+        (
+            PACKING_SYSTEM_PROMPT,
+            MULTI_DOC_SYSTEM_PROMPT,
+            SHIPPING_SYSTEM_PROMPT,
+            CLASSIFIER_SYSTEM_PROMPT,
+        )
+    )
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------

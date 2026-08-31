@@ -2063,6 +2063,153 @@ def test_colour_resolution(tmp: Path) -> None:
           "while a printed code matches as it always did", coded.status)
 
 
+def test_line_fields_surfaced(tmp: Path) -> None:
+    section("POLine's item id and is_open reach ProposedChange")
+    import datetime as dt
+
+    import matcher as mt
+    from netsuite_client import NetSuiteClient, POLine
+
+    def ns(line_id="18", is_open=True, closed=False, item_id="51669", qty=12):
+        return POLine(
+            line_id=line_id, item="M120246 : M120246-Waterman Polo-TID-S",
+            style_number="M120246", vendor_name=None, color="TID", size="S",
+            quantity=qty, units="Ea", expected_receipt_date=dt.date(2026, 7, 6),
+            override_expected_receipt=False, updated_receipt_date=None,
+            closed=closed, is_open=is_open, quantity_received=0.0,
+            item_internal_id=item_id,
+        )
+
+    def vendor(qty=9):
+        return {"po_number": "1662", "style_number": "M120246", "color": "TID",
+                "size": "S", "quantity": qty, "confidence": "high", "note": ""}
+
+    def one(lines, vl=None):
+        return mt.build_proposed_changes(
+            [vl or vendor()], NetSuiteClient(mock_data={"1662": lines}))[0]
+
+    c = one([ns()])
+    check(c.ns_item_internal_id == "51669",
+          "the matched line's item internal id is carried through", str(c.ns_item_internal_id))
+    check(c.ns_line_is_open is True, "and so is is_open", str(c.ns_line_is_open))
+
+    # is_open is NOT the complement of line_closed, which is the whole reason the
+    # review screen needs it: a Fully Billed line is neither open nor closed.
+    # A line that is neither open NOR closed is not a writable target, so change 5
+    # chooses nothing and these two fields stay None -- they describe the MATCHED
+    # line, and there is not one. The figures for such a line are on
+    # `candidate_lines` instead, which is where the review screen reads them.
+    c = one([ns(is_open=False, closed=False)])
+    check(c.status == mt.STATUS_NEEDS_ATTENTION,
+          "a line that is neither open nor closed flags rather than proposing", c.status)
+    check(c.ns_line_is_open is None and c.line_id is None,
+          "and carries no matched-line fields, because no line was chosen",
+          f"is_open={c.ns_line_is_open} line_id={c.line_id}")
+    check([p["is_open"] for p in c.candidate_lines] == [False],
+          "the candidate payload is what reports its open state",
+          str([p["is_open"] for p in c.candidate_lines]))
+
+    # An unmatched line has nothing to report, and says so with None rather than a
+    # plausible-looking default.
+    c = one([ns()], {**vendor(), "size": "4XL"})
+    check(c.ns_item_internal_id is None and c.ns_line_is_open is None,
+          "an unmatched line leaves both None", f"{c.ns_item_internal_id}/{c.ns_line_is_open}")
+
+
+def test_colour_provenance(tmp: Path) -> None:
+    section("colour resolution provenance, structured for persistence")
+    import datetime as dt
+
+    import matcher as mt
+    from netsuite_client import NetSuiteClient, POLine
+
+    class ColourClient:
+        def __init__(self, names):
+            self.names = names
+
+        def get_item_colour_name(self, item_internal_id, cache=None):
+            return self.names.get(str(item_internal_id))
+
+    def ns(line_id, colour, item_id):
+        return POLine(
+            line_id=line_id, item=f"M650022 : M650022-Burnside-{colour}-M",
+            style_number="M650022", vendor_name=None, color=colour, size="M",
+            quantity=100, units="Ea", expected_receipt_date=dt.date(2026, 9, 1),
+            override_expected_receipt=False, updated_receipt_date=None,
+            is_open=True, quantity_received=0.0, item_internal_id=item_id,
+        )
+
+    def run(lines, printed, names):
+        client = ColourClient(names)
+        lookups = {"1720": mt.build_colour_lookup(client, lines)} if names else {}
+        return mt.build_proposed_changes(
+            [{"po_number": "1720", "style_number": "M650022", "color": printed,
+              "size": "M", "quantity": 110, "confidence": "high", "note": ""}],
+            NetSuiteClient(mock_data={"1720": lines}), colour_lookups=lookups)[0]
+
+    # NAME path: the row records what was printed, what it became, the name that
+    # said so, and which item's record supplied it.
+    c = run([ns("2", "NIN", "51669"), ns("3", "MLT", "51670")], "NEW INDIGO",
+            {"51669": "New Indigo", "51670": "Moonlight"})
+    p = c.colour_provenance
+    check(p["method"] == "NAME", "a name resolution records method NAME", p["method"])
+    check(p["printed"] == "new indigo", "with the canonical printed value", p["printed"])
+    check(p["code"] == "nin", "the code it resolved to", str(p["code"]))
+    check(p["name"] == "New Indigo", "the long name as NetSuite spells it", str(p["name"]))
+    check(p["name_source_item_id"] == "51669",
+          "and WHICH item record said so -- the part that is not reconstructable later",
+          str(p["name_source_item_id"]))
+
+    # CODE path: nothing to attribute, and it says so rather than inventing a source.
+    c = run([ns("14", "MLT", "51670")], "MLT", {"51670": "Moonlight"})
+    p = c.colour_provenance
+    check(p["method"] == "CODE", "a code match records method CODE", p["method"])
+    check(p["code"] == "mlt" and p["name_source_item_id"] is None,
+          "with the code but no name source, because none was consulted",
+          f"{p['code']}/{p['name_source_item_id']}")
+
+    # No match at all.
+    c = run([ns("14", "MLT", "51670")], "PUCE", {"51670": "Moonlight"})
+    check(c.colour_provenance["method"] == "UNRESOLVED",
+          "an unresolvable colour records UNRESOLVED", c.colour_provenance["method"])
+    check(c.status == mt.STATUS_NEEDS_ATTENTION, "and flags")
+
+    # Ambiguous on one PO: recorded as AMBIGUOUS, and no code is claimed.
+    c = run([ns("1", "NAV", "1"), ns("2", "NVSL", "2")], "NAVY / SILVER",
+            {"1": "Navy / Silver", "2": "Navy / Silver"})
+    p = c.colour_provenance
+    check(p["method"] == "AMBIGUOUS", "two colours on one PO records AMBIGUOUS", p["method"])
+    check(p["code"] is None, "and claims no code", str(p["code"]))
+
+    # The human sentence still exists alongside the structured record.
+    c = run([ns("2", "NIN", "51669")], "NEW INDIGO", {"51669": "New Indigo"})
+    check("NIN" in c.colour_resolution and "New Indigo" in c.colour_resolution,
+          "the display sentence is unchanged", c.colour_resolution[:70])
+
+
+def test_prompt_version(tmp: Path) -> None:
+    section("prompt version, and the fingerprint that stops it drifting")
+    import claude_extractor as ce
+
+    check(isinstance(ce.PROMPT_VERSION, str) and ce.PROMPT_VERSION,
+          "PROMPT_VERSION exists and is a readable string", ce.PROMPT_VERSION)
+
+    # Pinned. If a prompt changes, this fails -- and the fix is to bump
+    # PROMPT_VERSION and update this hash in the same commit. That pairing is the
+    # only thing stopping a calibration corpus from mixing two prompts under one
+    # label, which would make its false-negative rate meaningless.
+    EXPECTED = "d8e08cdb8a82fc11"
+    actual = ce.prompt_fingerprint()
+    check(actual == EXPECTED,
+          "prompt text matches the fingerprint pinned for this PROMPT_VERSION",
+          f"expected {EXPECTED}, got {actual} -- if you edited a prompt, bump "
+          f"PROMPT_VERSION (now {ce.PROMPT_VERSION}) and update this hash")
+    check(len(actual) == 16, "the fingerprint is short enough to read", actual)
+    check(actual != ce.PROMPT_VERSION,
+          "and is NOT used as the version itself -- an opaque hash in a database "
+          "column tells a human nothing")
+
+
 def test_scope_boundaries(tmp: Path) -> None:
     section("scope boundaries (things this tool must never do)")
     import datetime as dt
@@ -2716,6 +2863,7 @@ def main() -> int:
             test_matcher_paula_rulings, test_sheet_selection, test_closed_po_line,
             test_duplicate_key_resolution, test_scope_boundaries,
             test_line_balance_context, test_colour_resolution,
+            test_line_fields_surfaced, test_colour_provenance, test_prompt_version,
             test_unopenable_files, test_size_value_space_failsafe,
             test_no_packing_sheet_becomes_manual_entry,
             test_manual_entry_path, test_matcher_handoff,

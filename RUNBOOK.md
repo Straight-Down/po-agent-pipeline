@@ -4,7 +4,7 @@
 
 **Audience:** assumes general technical competence, no prior context on this specific project. Where more depth exists elsewhere, this doc points to it rather than repeating it — `PO-Update-Automation-Architecture.md` is the full design rationale; this doc is the "how do I actually run/fix/hand this off" companion.
 
-**Last updated:** 2026-08-26
+**Last updated:** 2026-08-31
 
 ---
 
@@ -82,7 +82,7 @@ It was created with `git init --separate-git-dir "C:\dev\po-agent.git"` so the g
 
 Remote is `https://github.com/Straight-Down/po-agent-pipeline.git`, **private** — it must stay private, because the tracked vendor corpus contains real third-party commercial data (supplier unit prices, a named inspector, customer contact details). `.gitattributes` marks pdf/xlsx/png/docx as binary; without it Git's heuristic classified a generated PDF as text and would have rewritten its bytes on checkout, silently invalidating the validation corpus.
 
-## 6. Known limitations and open risks (as of 2026-08-26)
+## 6. Known limitations and open risks (as of 2026-08-31)
 
 Ranked by how much they matter. Items struck through are resolved, with the resolution recorded in place rather than deleted — the reasoning trail is the point.
 
@@ -134,7 +134,31 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
    Unlike the collection failures, this one names itself in the error: `403 INSUFFICIENT_PERMISSION`, *"You need the 'Custom Lists' permission"*.
 
    **OPEN — least-privilege check before production:** `SuiteAnalytics Workbook` is on at **Edit**. **Whether `View` suffices is untested.** The pipeline only reads, so Edit is broader than needed. Test View and downgrade if it works — before the Phase 4 production cutover, not after.
-9. **NEW 2026-08-12 — tranId format transformation (Phase 2 blocker).** Resolving a PO now works, but **not from the number vendors actually print.** Vendors print the bare number; **NetSuite stores the tranId as `PO0001662`.**
+9. ~~**NEW 2026-08-12 — tranId format transformation (Phase 2 blocker).**~~ **RESOLVED 2026-08-31 (change 8).** The rule is now in the pipeline and validated against every PO in the account. Vendors print the bare number; **NetSuite stores the tranId as `PO0001662`.**
+
+   **The rule, from Setup > Company > Auto-Generated Numbers (Purchase Order row):** Prefix `PO`, Minimum Digits `7`, Current Number `1777`. So `tranId = "PO" + str(number).zfill(7)`.
+
+   **Validated against the data, not the checkbox.** Allow Override and Use Subsidiary / Use Location were never captured — and a checkbox says what is *permitted*, not what *happened*. So every PO tranId in the account was queried:
+
+   | Measure | Result |
+   |---|---|
+   | POs examined | **1,659** (all of them) |
+   | match `^PO\d{7}$` exactly | **1,659 — 100.00%** |
+   | non-conforming | **0** |
+   | distinct shapes | **1** (`PO#######`) |
+   | date span | 2021-06-16 → 2026-07-31 |
+   | duplicate numbers | none |
+   | `"PO" + zfill(7)` round-trip failures | **0** |
+
+   **The finding:** override is off or unused, and there is no subsidiary or location variation in practice. Not one legacy or hand-keyed value exists, across five years and every status (959 Fully Billed, 562 Closed, 89 Pending Receipt, and the rest) — so this is not a case of the convention holding only for recent records. 112 numbers are missing from the sequence, which is ordinary deletion, not a second format.
+
+   **Implemented as** `netsuite_client.po_tranid` (`1662`, `PO#1662`, `PO NO : 1720` and `PO0001662` all resolve; idempotent), applied inside `resolve_po_internal_id`. It used to live only in a report script while the pipeline default was an untransformed lookup that always failed — that seam is gone.
+
+   **Non-conforming input is a defined outcome, never a second guess.** A reference with no digits, or naming two POs (`#1720, 1721`), is refused **before any request** — splitting that is the extractor's job, since each line carries its own `po_number`, and picking one would attach a whole shipment to the wrong order. A derived tranId that does not exist gives `resolution_status = 'NOT_FOUND'` with **both** the printed value and the attempted tranId recorded; there is no fuzzy fallback, because the rule reproduces all 1,659 existing tranIds and a miss therefore means the PO is absent, not that the format is wrong.
+
+   **The extraction boundary still stands** (`assert_po_reference` states it): a bare four-digit number cannot be found with a page-wide regex, because carton counts, quantities and style fragments look identical. Recognising `1720` as a PO needs the column-header context (`PO NO`) — that is an extraction problem, and nothing in the resolver can recover from being handed a carton count.
+
+   **Historical detail, kept because it is the reason the transformation had to be exact:**
 
    | Query | Result |
    |---|---|
@@ -142,7 +166,7 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
    | `?q=tranId IS PO0001662` | `200`, `totalResults=1`, id `8489541` |
    | `?q=tranId IS "1662"` | `200`, `totalResults=0` — executes fine, matches nothing |
 
-   Quoting is optional and **neither form is preferred** — both were confirmed equivalent. The dangerous case is the third: a **successful** response with zero results, which a naive caller reads as "PO not found" rather than "you asked the wrong question".
+   Quoting is optional and **neither form is preferred** — both were confirmed equivalent, and `last_lookup_strategy` still records which one answered. The dangerous case is the third: a **successful** response with zero results, which a naive caller reads as "PO not found" rather than "you asked the wrong question".
 
    **Renderings observed across the eight real documents** — every one carries the bare number, and **not one uses NetSuite's stored form:**
 
@@ -153,14 +177,9 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
    Since all renderings carry the bare number, the transformation is **extract digits → zero-pad → prefix**.
 
-   **BLOCKED on, in order:**
-   1. Read **Setup > Company > Auto-Generated Numbers**, Purchase Order row — the actual **Prefix**, **Minimum Digits**, **Allow Override**, and **Use Subsidiary / Use Location** settings.
-   2. Validate the derived rule against **several hundred real tranIds**, not one.
-   3. Confirm with Paula or Brandon.
+   ~~**BLOCKED on:** read the numbering setup; validate against several hundred real tranIds; confirm with Paula or Brandon.~~ **All three done** — the setup was read, the rule was validated against 1,659 tranIds rather than several hundred, and the data made the confirmation unnecessary.
 
-   **Do NOT hardcode `"PO"` + 7 digits from the single observed sample.**
-
-   **Robustness requirement:** if **Allow Override** is enabled, tranIds are a *convention, not a guarantee* — someone can type an arbitrary one. The resolver must treat a non-conforming tranId as a **defined outcome** (flag for human resolution), never a crash or a silent wrong match.
+   **The robustness requirement still holds even at 100% conformance.** Allow Override was never observed in the *setup*, only in the *data*: if it is enabled, tranIds remain a convention rather than a guarantee, and someone could type an arbitrary one tomorrow. So `TRANID_PATTERN` stays in the code as the check, a non-conforming value stays a flagged outcome, and this is worth re-running against production before cutover (Phase 4) — the two accounts have already been shown to differ elsewhere.
 
    **Extraction risk worth naming now:** the bare-`nnnn` case cannot be found with a page-wide regex. Four-digit numbers also appear in these same documents as carton counts, quantities and style-number fragments. Recognising `1720` as a PO requires the **column-header context** (`PO NO`) — i.e. it is an extraction problem, not a post-processing one.
 10. **NEW 2026-08-24 — `(PO, style, colour, size)` is NOT unique per NetSuite PO line.** The matcher's key can resolve to several lines. This was found by measurement, not review, and it is the assumption the whole matching design rested on.
@@ -259,6 +278,12 @@ These are not open questions — they are settled constraints that later phases 
 - **write-back needs partial-failure semantics**: one approval can mean six PO writes, and the fifth can fail. What the audit log records, and what Paula sees, when three succeeded and one didn't, has to be decided before the write path is wired.
 
 **`transactionLine.isclosed` is NOT the complement of `isOpen`, and reading it as such produces confidently wrong numbers.** The per-line Closed checkbox is effectively unused in this account — nobody ticks it — so SuiteQL `isclosed = 'F'` reports the lines of a **Fully Billed** PO as fully open. That produced a stated count of **~1,024 "open POs"** which was simply wrong, and it was wrong in the most dangerous direction: a plausible number, quoted with confidence, that no one would think to question. **Use PO status for the business meaning of "open", and REST's per-line `isOpen` as the usable flag** — `isOpen` was present on all 367 lines of the 25 most recent sandbox POs. `POLine` now models both fields separately, with the trap named on the field itself, because a line can be **neither** open nor closed.
+
+**SuiteQL SILENTLY IGNORES a SQL `OFFSET` clause.** `... ORDER BY id OFFSET 1000 ROWS FETCH FIRST 1000 ROWS ONLY` returns the **first** page every time — `FETCH FIRST` is honoured, `OFFSET` is not. A paging loop written that way never advances and never terminates: the first attempt at this ran for ten minutes, cheerfully fetching page one at offsets up to 505,000. Nothing errors, so there is no failure to notice.
+
+**Page with the endpoint's own query parameters instead** — `POST /query/v1/suiteql?limit=1000&offset=1000` — which works correctly and returns `totalResults` and `hasMore` to loop on. Keyset pagination (`WHERE id > :last ORDER BY id FETCH FIRST 1000`) also works and is the safer habit for a long-running job, since it cannot drift if rows are inserted mid-scan. Both were verified: 1,659 POs in two pages either way.
+
+**Also worth knowing:** a `LIKE 'PO%'` scan over the whole `transaction` table (no type filter) does not return in ten minutes. Filter by `type` first.
 
 **SuiteQL is not dependable for aggregates. Keep queries narrow.** `GROUP BY status` and `GROUP BY (tranid, id, item) HAVING COUNT(*) > 1` returned **HTTP 500 with three distinct error ids** across repeated attempts, while per-status `COUNT(*)` and a narrower `GROUP BY t.tranid` succeeded instantly. So the failure is about query shape, not load or permissions. **Phase 2 must not lean on aggregate SuiteQL**; compute aggregates client-side from narrow reads. One thing that did work exactly as designed: the change-3 transient-retry handler retried the 500s with backoff and then **reported the failure**, rather than silently returning an empty result set — demonstrated on a real fault rather than a simulated one, which is the harder test to arrange.
 

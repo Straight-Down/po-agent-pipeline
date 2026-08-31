@@ -564,6 +564,91 @@ def test_transient_retry() -> None:
     check(not nc._is_transient_exception(ValueError("x")), "ValueError not classified transient")
 
 
+def test_sublist_truncation_guard() -> None:
+    section("a short item sublist is refused, not silently processed")
+    import json as _json
+
+    from netsuite_client import SublistTruncated, _assert_sublist_complete
+
+    # The unit: counting is the only signal, because the sublist exposes no
+    # hasMore and no offset.
+    _assert_sublist_complete({"totalResults": 3, "items": [{}, {}, {}]}, "8489541")
+    check(True, "a complete sublist passes")
+
+    try:
+        _assert_sublist_complete({"totalResults": 1200, "items": [{}] * 1000}, "8489541")
+        check(False, "a short sublist raises SublistTruncated", "no exception")
+    except SublistTruncated as exc:
+        check("1200" in str(exc) and "1000" in str(exc),
+              "a short sublist raises SublistTruncated naming both counts", str(exc)[:80])
+        check("no error and no flag" in str(exc),
+              "and says why it refuses rather than proceeding")
+
+    # Absent or unusable metadata is NOT evidence of truncation. Guessing here
+    # would turn the guard into a source of false failures on odd payloads.
+    for sublist, why in (
+        ({"items": [{}]}, "no totalResults at all"),
+        ({"totalResults": None, "items": [{}]}, "a null totalResults"),
+        ({"totalResults": "42", "items": [{}]}, "a non-numeric totalResults"),
+        ("not-a-dict", "a sublist that is not a dict"),
+    ):
+        _assert_sublist_complete(sublist, "1")
+        check(True, f"{why} passes -- missing metadata is not evidence of truncation")
+
+    # More items than the total is not truncation either; it is odd, but nothing is
+    # missing, so it is not this guard's business.
+    _assert_sublist_complete({"totalResults": 2, "items": [{}, {}, {}]}, "1")
+    check(True, "a sublist LONGER than its total passes -- nothing is missing")
+
+    # And through the real read path, with a scripted response.
+    class Resp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+            self.text = _json.dumps(payload)
+
+        def json(self):
+            return self._payload
+
+    class OneShot:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def request(self, method, url, **kwargs):
+            return Resp(self.payload)
+
+    def client_for(payload):
+        client = NetSuiteClient(config=FAKE_CONFIG)
+        client._session = OneShot(payload)
+        client._access_token = "fake-token"
+        client._token_expires_at = 9_999_999_999
+        client.TRANSIENT_BACKOFF_SECONDS = 0
+        return client
+
+    complete = {"id": "8489541", "tranId": "PO0001662",
+                "item": {"totalResults": 2, "items": [{"line": 1}, {"line": 2}]}}
+    record = client_for(complete).get_purchase_order_record("8489541")
+    check(len(record["item"]["items"]) == 2, "a complete record reads normally")
+
+    truncated = {"id": "8489541", "tranId": "PO0001662",
+                 "item": {"totalResults": 1200, "items": [{"line": n} for n in range(1000)]}}
+    client = client_for(truncated)
+    expect_raises(
+        SublistTruncated,
+        lambda: client.get_purchase_order_record("8489541"),
+        "a 1,200-line PO returning 1,000 lines refuses the whole record",
+    )
+
+    # The point of refusing: nothing downstream gets a partial line set to work
+    # from, so no proposals can be staged for a subset.
+    client = client_for(truncated)
+    expect_raises(
+        SublistTruncated,
+        lambda: client.get_purchase_order_lines_by_internal_id("8489541"),
+        "so get_purchase_order_lines_by_internal_id cannot return a subset either",
+    )
+
+
 def test_tranid_transformation() -> None:
     section("printed PO number -> tranId, and the query it actually sends")
     import json as _json
@@ -771,6 +856,7 @@ def main() -> int:
         test_update_payload_shape,
         test_error_translation,
         test_transient_retry,
+        test_sublist_truncation_guard,
         test_tranid_transformation,
         test_mock_mode_unchanged,
     ):

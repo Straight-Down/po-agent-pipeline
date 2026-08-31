@@ -163,6 +163,21 @@ class PONumberUnresolvable(NetSuiteError):
         self.attempted = attempted
 
 
+class SublistTruncated(NetSuiteError):
+    """
+    A PO's item sublist came back shorter than NetSuite says it is.
+
+    The failure this prevents is silent and expensive: a 1,200-line PO yields the
+    first 1,000 lines, proposals are staged for those, Paula approves them, and the
+    remaining 200 never appear anywhere -- no error, no flag, no row. Nothing
+    downstream could notice, because a short list is indistinguishable from a short
+    PO.
+
+    So a mismatch is fatal to the read rather than a warning. A partial PO is worse
+    than no PO: no PO is visibly missing, while a partial one looks complete.
+    """
+
+
 class NetSuiteTransientError(NetSuiteError):
     """
     NetSuite was unreachable or failing server-side, and retries were exhausted.
@@ -416,6 +431,41 @@ def _to_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "t", "yes", "y", "1"}
     return bool(value)
+
+
+def _assert_sublist_complete(sublist: Any, internal_id: str) -> None:
+    """
+    Refuse a PO whose item sublist is shorter than NetSuite says it is.
+
+    The sublist reports `totalResults` but **no `hasMore` and no `offset`**, so
+    counting is the only truncation signal available. Verified on this account:
+    the largest PO has 380 lines (`PO0001497`) and none has 1,000 or more, so this
+    raises on nothing today -- it exists for the PO that eventually does.
+
+    Why fatal rather than a warning: a truncated read produces proposals for the
+    lines it saw and silence for the rest. Paula approves what she is shown, the
+    missing lines never surface, and no error is ever emitted. A partial PO looks
+    complete, which is precisely what makes it worse than a failed read.
+
+    A missing or non-numeric `totalResults` is NOT treated as a mismatch -- absent
+    metadata is not evidence of truncation, and guessing would turn a guard into a
+    source of false failures.
+    """
+    if not isinstance(sublist, dict):
+        return
+    total = sublist.get("totalResults")
+    if not isinstance(total, int):
+        return
+    got = len(sublist.get("items") or [])
+    if got < total:
+        raise SublistTruncated(
+            f"PO internal id {internal_id}: NetSuite reports {total} item lines but the "
+            f"read returned {got}. Refusing the record rather than staging proposals for "
+            f"{got} of {total} lines -- the missing ones would never appear anywhere, with "
+            "no error and no flag. The sublist exposes no hasMore/offset, so pagination "
+            "has to be added here (see RUNBOOK section 7) before a PO this size can be "
+            "processed."
+        )
 
 
 def po_tranid(printed: str) -> str:
@@ -840,6 +890,8 @@ class NetSuiteClient:
         if not isinstance(record.get("item"), dict) or "items" not in record.get("item", {}):
             logger.info("Item sublist not inlined; fetching /purchaseOrder/%s/item separately", internal_id)
             record["item"] = self._fetch_sublist_the_long_way(internal_id)
+
+        _assert_sublist_complete(record.get("item"), internal_id)
         return record
 
     def _fetch_sublist_the_long_way(self, internal_id: str) -> dict:
@@ -855,6 +907,9 @@ class NetSuiteClient:
                 logger.warning("Sublist entry without a line number on PO %s: %s", internal_id, stub)
                 continue
             lines.append(self._request("GET", f"{base}/purchaseOrder/{internal_id}/item/{line_no}").json())
+        # Same check on the fallback path: it reads a collection too, and the
+        # collection reports its own total.
+        _assert_sublist_complete({**collection, "items": lines}, internal_id)
         return {"items": lines}
 
     def get_purchase_order(self, po_number: str) -> list[POLine]:

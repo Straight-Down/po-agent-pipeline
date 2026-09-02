@@ -284,6 +284,34 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
     **The permanent lesson:** a 3-letter code carries **no redundancy** — `DFK` is exactly as plausible-looking as `DKF`, and nothing in the string reveals the transposition. So a printed code must be **validated against the colour list**, never trusted because it looks like a code. The current behaviour does this correctly by construction: an unknown code matches no line and flags.
 14. **NetSuite's M2M certificate expires 2028-08-03** — calendar reminder only, no automated alert. Low urgency given the lead time, but worth a real alert once this is hosted on Azure rather than relying on memory.
+15. ~~**NEW 2026-09-02 — a filename could EXCLUDE an attachment, and did: three packing-list sheets were thrown away unopened.**~~ **FIXED 2026-09-02.** `FW26 ... PO-1624 USA -  Clearance Invoice.xlsx` matched the `invoice` filename rule, which was marked unambiguous, so triage never opened it (`method: filename`). Inside were four sheets: `COMMERCIAL INVOICE`, then `PO-1624 20138` / `20139` / `20140`, each headed `Packing list` at H8 with a full per-size grid. That workbook is the only size-level source for PO 1624.
+
+    **This was a regression in judgment, not a missing feature.** The classifier had scored 8/8 earlier *precisely because it opened* a file named `SD #1720, 1721 INVOICE, PACKING LIST.pdf` and correctly called it a commercial invoice. Content inspection is the part that demonstrably works; letting the signal known to be unreliable in both directions short-circuit it inverted the design.
+
+    **The rule now, stated so it cannot drift back:** a filename hint may **prioritise or deprioritise**; it may **never exclude**. Only content, or a file that will not open, excludes. Concretely, in `classify_attachments` every readable attachment goes to the content check, and the name's remaining jobs are to seed a prior (overridden by whatever content says) and to order the survivors in `ClassificationResult.primary` — where a packing-named file wins over an invoice-named one, but the invoice-named one is still selected and still available as a cross-check. `AttachmentClassification.filename_hint` keeps the name's claim as the audit trail for the disagreement.
+
+    **The one exception stands:** the inspection-report ban still short-circuits before any content read. That is keyed on document **type** and is Paula's ruling (2026-08-11), not a filename heuristic — and it is exactly why it does not generalise to the word "invoice".
+
+    Cost of the fix: one preview per readable attachment instead of per suspicious one, in the same single API call. A few thousand tokens against discarding a vendor's only size-level source.
+16. ~~**NEW 2026-09-02 — the size-header detector recognised only LETTER sizes, so every numerically-sized sheet looked sizeless.**~~ **FIXED 2026-09-02.** `_find_size_header_row` compared cells against a hand-written set of `XS`…`4XL`. It therefore could not see the footwear sheet's `K28='8'`…`Q28='14'` (strings) or Tainan's `I7=30.0`…`O7=42.0` (floats). Both sheets classified as "packing list but no per-size quantities" and were excluded. **This was the real numeric-size blocker** — canonicalising the token set earlier fixed full-width `２Ｘ` but did nothing for numbers, and item 4 above had already established that **39 of the account's 46 sizes are not letter sizes**.
+
+    A bigger hand-written set would have been the same bug again, so the vocabulary is now **read from the live `customlist_psgss_product_size`** and cached in a generated snapshot: `size_vocabulary.py`, `netsuite_size_list.json` (46 values, `python size_vocabulary.py --refresh` to rewrite, `--check` to report drift without writing). Recognised forms: bare integer strings (`'8'`), integers arriving as floats (`30.0` → the label `30`, **not** `'30.0'`), decimals (`9.5`, `10.5`), and waist-inseam pairs (`32-34`) matched whole against the list rather than parsed.
+
+    **Bare numbers need one test more than letters**, because a row of quantities is also a row of bare numbers. Two things separate them, both measured against the real sheets: **list validity** (Tainan's net-weight row `0.39`…`0.48` yields zero valid labels; the footwear carton row yields two, under the threshold of three) and **monotonicity** (a size scale is printed ascending; Tainan's quantity row `30 | 30 | 3 | 90 | 6` has three valid labels but does not ascend). Monotonicity is required only when *every* hit is a bare number — a row containing `S` or `32-34` has already identified itself, and a descending letter row is still a size row.
+
+    Residual, accepted knowingly: an adversarial row of ascending, all-list-valid quantities would still match. A hit only adds a preview region for the classifier to read, so a false positive costs a few hundred tokens while a false negative sends a whole shipment to manual entry. **`matcher.SIZE_ALIASES` was NOT touched** — every size on both new slips already exists in the NetSuite list, so there is nothing to alias.
+17. ~~**NEW 2026-09-02 — legacy `.xls` was unreadable, blocking a vendor entirely on file format.**~~ **FIXED 2026-09-02.** Tainan's packing list begins `d0cf11e0a1b11ae1` — an OLE2/BIFF compound document, not OOXML. openpyxl cannot open one, so it raised `DocumentUnreadable` and triage excluded the file. It is the **only** size-level source for PO 1725.
+
+    `xlrd>=2.0` now reads BIFF (recorded in `requirements.txt`), and **routing is by magic bytes, not by extension** (`claude_extractor.sniff_format`) so a renamed or mis-saved attachment still lands on a reader that can read it. Both readers produce identical `SheetGrid`s, so nothing downstream knows which ran. Two conversions earn that parity: BIFF dates are floats against a workbook epoch (an unconverted cell renders `46244` where the OOXML path renders a real date), and BIFF numbers are all floats (an integral `30.0` renders `30`, which is what the size list holds).
+
+    **A trap worth knowing:** openpyxl validates the **extension** before looking at the file, so a genuine OOXML workbook saved as `.xls` is refused with `InvalidFileException` on the name alone. Signature routing does not hold end-to-end unless the bytes are handed to it directly — `open_workbook` does that for any suffix outside `.xlsx/.xlsm/.xltx/.xltm`. Found by a test, not by review.
+
+    `open_workbook` itself stays openpyxl-only on purpose: its callers use the real openpyxl object, and imitating that API over xlrd is a lot of surface for one vendor. `read_workbook_grids` is the format-agnostic entry point, and it is what the classifier and the Claude extractor use.
+18. ~~**NEW 2026-09-02 — `shipment_pos.po_number_key` was not canonical, so the same document ingested differently run to run.**~~ **FIXED 2026-09-02.** One extraction of the footwear workbook returned `'1624'` for two of its three sheets and `'PO0001624'` for the third, and which sheet got which **varied between runs**. `po_tranid` normalises both for lookup, so PO *resolution* never noticed — but the raw strings were also dict keys and were written to the database, so one PO became **two `shipment_pos` rows**, its lines split across two parents, and the PO was read from NetSuite twice. Same class as the `NEW  INDIGO` double-space nondeterminism (§7, "Row identity must be the canonical key").
+
+    `netsuite_client.po_number_key` is now the single grouping and storage key (`'1624'`), derived **through `po_tranid`** so there is one digit-extraction rule rather than two that can drift. Applied in `ingest` (grouping, colour lookups, the DB write) and in `matcher.build_proposed_changes` (so the matcher's `colour_lookups` keys line up with what ingest stores). A reference `po_tranid` refuses — no digits, or more than one distinct number — falls back to the canonical form of the text: deterministic, without inventing a PO number, and resolution still reports `NOT_FOUND`.
+
+    **A second, quieter instance of the same bug in the same row**, found by the test rather than by inspection: `po_number_printed` took the *first* matching line's rendering, which is also whichever came first that run. It now stores **every distinct rendering, sorted** (`1624 / PO0001624`) — deterministic, and more truthful, since the column exists so a reviewer sees what the vendor wrote and the vendor wrote two things.
 
 ## 7. Design constraints discovered by testing
 
@@ -301,6 +329,10 @@ The original observation, kept because the shape of the problem has not changed:
 - the `shipments` / `proposed_changes` schema must model one email spanning many POs,
 - the Phase 3 **approval unit** must be defined deliberately — per PO, per shipment, or per line — rather than falling out of the implementation,
 - **write-back needs partial-failure semantics**: one approval can mean six PO writes, and the fifth can fail. What the audit log records, and what Paula sees, when three succeeded and one didn't, has to be decided before the write path is wired.
+
+**A cheap signal may rank; only an authoritative one may reject.** Two of the four defects found on 2026-09-02 were the same shape: a cheap proxy for a fact was allowed to make a *terminal* decision about that fact. A filename was allowed to exclude an attachment from ever being opened, and a file extension was allowed to decide which reader ran. Both proxies are usually right, which is why both survived review — and both were wrong on the first genuinely new vendor, in the direction that discards data silently. The rule that follows applies well beyond these two: rank on the cheap signal if it helps, but route rejection through the authoritative one — content for what a document is, magic bytes for what a file is. A proxy that can only reorder work is safe; a proxy that can end it is not.
+
+**A hand-maintained vocabulary of someone else's data is a latent bug with a delay on it.** The size-header detector's hardcoded letter-size set was not wrong when written; it became wrong when Straight Down's footwear and bottoms lines made numeric sizes the majority of the account's 46 values. Nothing failed loudly — the sheets simply read as sizeless. The same trap exists anywhere the pipeline compares vendor text against "our" vocabulary, and the answer is the one now used for sizes: read the list from NetSuite, snapshot it for offline use, and provide a drift check (`python size_vocabulary.py --check`). Note that `matcher.SIZE_ALIASES` is a different thing and is legitimately hand-maintained: it maps *vendor spellings onto* NetSuite labels, so it is a translation table, not a copy of NetSuite's data.
 
 ### SuiteQL is unreliable in specific ways — prefer REST paging and per-row queries
 
@@ -552,6 +584,32 @@ configuration is lying. Keep the pattern check in the code regardless — `TRANI
 stays, because 100% conformance today is not a guarantee about tomorrow, and
 re-running the survey against production is a Phase 4 item precisely because
 sandbox conformance is not production conformance.
+
+### 9. A new vendor is the only real test of a generalisation
+
+Three vendors were validated, hand-checked, and passing — 8/8 on attachment triage,
+77/77 on Inprotex, 100% tranId conformance across 1,659 POs. Then two new vendors
+arrived and produced **four** defects before the matcher was reached at all: a
+filename that excluded a file unopened, a size detector blind to numbers, a file
+format that would not open, and a database key that was not canonical.
+
+None of these was subtle in hindsight, and none was findable from the first three
+vendors, because all three happened to be apparel-only, letter-sized, `.xlsx`/PDF,
+and single-rendering. The passing tests were not wrong; they were **describing a
+narrower population than the one being claimed** — which is the same point as
+lesson 6 above, arriving with a bill attached.
+
+Two working consequences:
+
+- **Run a new vendor end to end before writing any code for it.** The diagnostic
+  pass on these two files (classify → extract → check sizes against NetSuite →
+  hand-verify five lines per document) cost one session and found all four defects
+  in one go, including the two that had nothing to do with the vendor's layout.
+- **Expect the defects to be upstream of the interesting part.** The layout
+  question everyone anticipated (Tainan's two-axis waist/inseam grid) is still
+  open and correctly scoped separately. The four things that actually blocked
+  these vendors were all in triage, file reading, and key derivation — the parts
+  already considered settled.
 
 ## 9. How to recover when something breaks
 

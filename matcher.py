@@ -224,6 +224,18 @@ class ProposedChange:
     #: guesswork. The answer has to be written down when it is known.
     colour_provenance: dict = field(default_factory=dict)
 
+    #: How the SIZE was arrived at, when it was composed from two axes rather than
+    #: printed in one place: method (COMPOSED / COMPOSITION_REJECTED), the printed
+    #: label of each axis verbatim, and the composed result.
+    #:
+    #: Same reasoning as `colour_provenance`, and the same reason it is persisted:
+    #: "why did this line become 32-34" is answerable only from the two cells it
+    #: came from, and those are a waist column header and an inseam block label
+    #: several rows apart. Nothing downstream can reconstruct that pairing from
+    #: the size alone. Empty dict on the single-axis documents, which is most of
+    #: them.
+    size_composition: dict = field(default_factory=dict)
+
     #: Every NetSuite line whose canonical key matched, when the match was not a
     #: clean 1:1. Populated for NEEDS_RESOLUTION (several open lines) and for the
     #: no-open-line case, so a human has what they need to decide without going
@@ -743,6 +755,11 @@ def build_proposed_changes(
             extraction_note=note,
             colour_resolution=colour_resolution,
             colour_provenance=colour_provenance,
+            # Carried straight through from the extraction row. The matcher does
+            # not compose sizes and does not second-guess one -- the composition
+            # was already validated against the account's size list by
+            # `extraction_schema.enforce_size_composition`.
+            size_composition=dict(vl.get("size_composition") or {}),
             # Display context on every change, flagged or not. Nothing branches on
             # it -- see `_line_balance` for why a gate here was cancelled.
             line_balance=_line_balance(match, _as_quantity(vl.get("quantity"))),

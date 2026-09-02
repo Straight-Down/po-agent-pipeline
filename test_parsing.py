@@ -399,9 +399,17 @@ def test_extractor_call_shape(tmp: Path) -> None:
     check(kwargs["betas"] == [ce.FALLBACK_BETA], "fallback beta header set", str(kwargs["betas"]))
 
     system = kwargs["system"][0]
+    # The breakpoint sits after the LAST stable block, so both the instructions
+    # and the size list ride the cache. Asserting on the last block rather than
+    # the first is the point: the whole stable prefix is what gets cached.
     check(
-        system["cache_control"] == {"type": "ephemeral"},
-        "stable system prompt is cached (volatile grid goes in the user turn)",
+        kwargs["system"][-1]["cache_control"] == {"type": "ephemeral"},
+        "the whole stable system prefix is cached (volatile grid goes in the user turn)",
+        f"{len(kwargs['system'])} block(s)",
+    )
+    check(
+        all("cache_control" not in b for b in kwargs["system"][:-1]),
+        "and only ONE breakpoint is set, at the end",
     )
     check(
         "do not turn XXL into 2X" in system["text"].lower().replace("xxl", "XXL").replace("2x", "2X")
@@ -893,7 +901,11 @@ def test_multidoc_call_shape(tmp: Path) -> None:
     kwargs = parse.calls[0]
     system = kwargs["system"][0]
     check(system["text"] is ce.MULTI_DOC_SYSTEM_PROMPT, "uses the multi-document system prompt")
-    check(system["cache_control"] == {"type": "ephemeral"}, "multi-doc prompt is cached too")
+    check(kwargs["system"][-1]["cache_control"] == {"type": "ephemeral"},
+          "multi-doc stable prefix is cached too", f"{len(kwargs['system'])} block(s)")
+    check("Leave both fields EMPTY on every other document" in system["text"],
+          "and it tells the model NOT to compose on single-axis documents -- the "
+          "regression risk of adding the axis fields to a shared schema")
     check(
         "column header it sits under" in system["text"],
         "prompt forbids reading figures by left-to-right position",
@@ -1353,6 +1365,140 @@ def test_numeric_size_headers(tmp: Path) -> None:
     check(ac._find_size_header_row(g) == 1,
           "a DESCENDING letter row is still a size header (order is only tested on numbers)",
           str(ac._find_size_header_row(g)))
+
+
+def test_size_composition(tmp: Path) -> None:
+    section("two-axis sizes: composed, validated against the account's list")
+    from extraction_schema import enforce_size_composition
+
+    def row(size, primary="", secondary="", **kw):
+        base = {"po_number": "1725", "style_number": "50144", "color": "NEW INDIGO",
+                "size": size, "quantity": 17, "confidence": "high", "note": "",
+                "source_hint": "ACT!R47", "size_axis_primary": primary,
+                "size_axis_secondary": secondary}
+        base.update(kw)
+        return base
+
+    # -- accepted: the composition IS a real value in the account's size list ---
+    rows = [row("30-32", "30", "INS 32"), row("32-34", "32", "INS 34")]
+    warnings = enforce_size_composition(rows)
+    check(not warnings, "two valid compositions produce no warnings", str(warnings))
+    check([r["size"] for r in rows] == ["30-32", "32-34"], "sizes kept as composed")
+    check(all(r["confidence"] == "high" for r in rows),
+          "and confidence is untouched -- a valid composition is not suspicious")
+    prov = rows[0].get("size_composition") or {}
+    check(prov.get("method") == "COMPOSED", "provenance records the method", str(prov.get("method")))
+    check(prov.get("primary") == "30" and prov.get("secondary") == "INS 32",
+          "BOTH printed axes are recorded verbatim -- 'INS 32', not '32'", str(prov))
+    check(prov.get("composed") == "30-32", "and the composed result")
+
+    # -- rejected: not a value in the list. Flag, never repair ------------------
+    bad = [row("30/32", "30", "INS 32"), row("31-33", "31", "INS 33")]
+    warnings = enforce_size_composition(bad)
+    check(len(warnings) == 1 and "NOT valid values" in warnings[0],
+          "an invalid composition warns", str(warnings)[:120])
+    check(all(r["confidence"] == "low" for r in bad),
+          "both are forced to low confidence, so they route to a human")
+    check(bad[0]["size"] == "30/32",
+          "the size is NOT rewritten -- no separator is guessed", bad[0]["size"])
+    check((bad[0].get("size_composition") or {}).get("method") == "COMPOSITION_REJECTED",
+          "the rejection is recorded as its own method")
+    check("30" in bad[0]["note"] and "INS 32" in bad[0]["note"],
+          "and BOTH axes appear in the note the reviewer reads", bad[0]["note"][:100])
+    check((bad[0].get("size_composition") or {}).get("primary") == "30",
+          "a REJECTED composition still keeps its axes -- that is when they matter most")
+
+    # -- THE REGRESSION GUARD: single-axis rows are not touched ----------------
+    # Inprotex prints XXL, which is NOT in the account's list (NetSuite says 2X).
+    # Validating it here would break a vendor that has been correct for months.
+    singles = [row("XXL"), row("XXXL"), row("S"), row("2XL")]
+    warnings = enforce_size_composition(singles)
+    check(not warnings, "single-axis sizes produce NO warnings, valid list value or not",
+          str(warnings))
+    check([r["size"] for r in singles] == ["XXL", "XXXL", "S", "2XL"],
+          "and pass through verbatim")
+    check(all(r["confidence"] == "high" for r in singles),
+          "XXL is not in the size list and is still accepted -- SIZE_ALIASES owns that")
+    check(all("size_composition" not in r for r in singles),
+          "no composition provenance is invented for them")
+
+    # A primary axis alone does not declare a composition: the SECOND axis is the
+    # gate, because that is the one that cannot be read from the size string.
+    half = [row("XXL", primary="XXL")]
+    check(not enforce_size_composition(half),
+          "a primary axis WITHOUT a secondary is not a composition")
+    check("size_composition" not in half[0], "and records nothing")
+
+    # -- no vocabulary at all: refuse, never wave through ----------------------
+    strict = [row("30-32", "30", "INS 32")]
+    warnings = enforce_size_composition(strict, vocabulary=frozenset())
+    check(len(warnings) == 1, "with an EMPTY vocabulary every composition is rejected",
+          str(warnings)[:90])
+    check(strict[0]["confidence"] == "low",
+          "unvalidated is treated as invalid -- the safe direction")
+
+    # -- the real file's axes, against the real list ---------------------------
+    import size_vocabulary as sv
+
+    vocabulary = sv.size_labels()
+    waists = ["30", "32", "34", "36", "38", "40", "42"]
+    for inseam in ("32", "34"):
+        composed = [f"{w}-{inseam}" for w in waists]
+        missing = [s for s in composed if s not in vocabulary]
+        check(not missing,
+              f"every waist paired with INS {inseam} is a real size in the account",
+              f"missing: {missing}" if missing else f"all 7 present")
+    # 16 pairs in the account (waists 30-44 x inseams 32/34); PO 1725 uses 14 of
+    # them, having no 44. So the list is a superset, which is the right shape --
+    # the constraint checks membership, it does not expect an exact match.
+    pairs = sorted(s for s in vocabulary if "-" in s)
+    check(len(pairs) == 16, "the account holds 16 waist-inseam pairs (waists 30-44)",
+          str(len(pairs)))
+    po_1725 = {f"{w}-{i}" for w in waists for i in ("32", "34")}
+    check(po_1725 <= set(pairs) and len(po_1725) == 14,
+          "PO 1725's 14 pairs are all in it -- a subset, not the whole list",
+          f"{len(po_1725)} of {len(pairs)}")
+
+    # Aggregation must NOT collapse two inseams into one waist -- that is what
+    # produced 22 where NetSuite expected 17 and 5.
+    from extraction_schema import aggregate_lines
+
+    merged, _w = aggregate_lines(
+        [row("30-32", "30", "INS 32", quantity=17), row("30-34", "30", "INS 34", quantity=5)],
+        document_label="ACT",
+    )
+    check(len(merged) == 2, "the two inseams stay two lines after aggregation",
+          f"{len(merged)} line(s)")
+    check(sorted(m["quantity"] for m in merged) == [5, 17],
+          "with their own quantities, NOT summed to 22",
+          str(sorted(m["quantity"] for m in merged)))
+    # Same waist, same inseam, two cartons: that SHOULD still merge.
+    merged, _w = aggregate_lines(
+        [row("30-32", "30", "INS 32", quantity=10), row("30-32", "30", "INS 32", quantity=7)],
+        document_label="ACT",
+    )
+    check(len(merged) == 1 and merged[0]["quantity"] == 17,
+          "while genuine carton duplicates of ONE size still merge",
+          f"{len(merged)} line(s) of {merged[0]['quantity']}")
+
+    # -- the empty-size line, which composition does NOT fix ------------------
+    # On the real file this came from REV!R85, where the carton range reads '18-'
+    # (truncated) -- a data-entry error in the sheet, unrelated to the MIXED
+    # carton rows and unrelated to the two axes. It stays flagged: a blank size
+    # is not a size, and it must never be merged into a neighbouring line.
+    blank = [row("", quantity=0, confidence="low",
+                 note="carton range reads '18-'; cartons appear skipped")]
+    check(not enforce_size_composition(blank),
+          "an empty-size row is not treated as a failed composition")
+    check("size_composition" not in blank[0],
+          "and gets no composition provenance -- there were no axes to combine")
+    merged, agg_warnings = aggregate_lines(
+        blank + [row("30-32", "30", "INS 32", quantity=17)], document_label="REV")
+    check(len(merged) == 2, "it survives aggregation as its own row", f"{len(merged)}")
+    check(any("no size" in w for w in agg_warnings),
+          "and aggregation says so rather than dropping it", str(agg_warnings)[:110])
+    check(next(m for m in merged if not m["size"])["confidence"] == "low",
+          "still low confidence, so it still routes to a human")
 
 
 def test_legacy_xls_reader(tmp: Path) -> None:
@@ -2480,12 +2626,28 @@ def test_prompt_version(tmp: Path) -> None:
     # PROMPT_VERSION and update this hash in the same commit. That pairing is the
     # only thing stopping a calibration corpus from mixing two prompts under one
     # label, which would make its false-negative rate meaningless.
-    EXPECTED = "d8e08cdb8a82fc11"
+    EXPECTED = "cdc18807cc252f0e"
     actual = ce.prompt_fingerprint()
     check(actual == EXPECTED,
           "prompt text matches the fingerprint pinned for this PROMPT_VERSION",
           f"expected {EXPECTED}, got {actual} -- if you edited a prompt, bump "
           f"PROMPT_VERSION (now {ce.PROMPT_VERSION}) and update this hash")
+
+    # The size list is shown to the model but is NOT part of the fingerprint,
+    # deliberately: it is data read from NetSuite, and a `size_vocabulary.py
+    # --refresh` would otherwise fail this test and look like a forgotten version
+    # bump. What guarantees a composed size is `enforce_size_composition`, not
+    # what the model was shown -- so the list is an aid, and its provenance lives
+    # in the snapshot's own `fetched_at`.
+    vocabulary = ce.size_vocabulary_block()
+    check("30-32" in vocabulary and "32-34" in vocabulary,
+          "the model IS shown the waist-inseam pairs it has to match")
+    check(vocabulary not in ce.PACKING_SYSTEM_PROMPT,
+          "but the list is a separate block, not pasted into the pinned prompt")
+    blocks = ce.extraction_system_blocks(ce.PACKING_SYSTEM_PROMPT)
+    check(len(blocks) == 2 and "cache_control" in blocks[-1],
+          "instructions + size list, with the cache breakpoint after both",
+          str([len(b["text"]) for b in blocks]))
     check(len(actual) == 16, "the fingerprint is short enough to read", actual)
     check(actual != ce.PROMPT_VERSION,
           "and is NOT used as the version itself -- an opaque hash in a database "
@@ -3139,6 +3301,7 @@ def main() -> int:
             test_shipping_date_label_anchoring, test_pdf_layout_rendering,
             test_multidoc_call_shape, test_attachment_classifier_offline,
             test_filename_never_excludes, test_numeric_size_headers,
+            test_size_composition,
             test_legacy_xls_reader,
             test_canonical_form, test_size_header_canonical,
             test_verbatim_source_preserved,

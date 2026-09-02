@@ -64,6 +64,7 @@ from extraction_schema import (
     aggregate_lines,
     ShippingAdviceExtraction,
     deterministic_line_to_dict,
+    enforce_size_composition,
     line_to_dict,
     meaningful,
 )
@@ -213,16 +214,19 @@ def parse_packing_slip(
     # covers the xlsx AND pdf paths with one implementation. NOT applied in
     # parse_shipment_documents -- that spans several documents, which must be
     # reconciled against each other, never summed together.
-    lines, agg_warnings = aggregate_lines(
-        [line_to_dict(l) for l in extraction.lines], document_label=path.name
-    )
+    rows = [line_to_dict(l) for l in extraction.lines]
+    # The hard constraint on two-axis sizes, BEFORE aggregation: aggregation keys
+    # on `size`, so a rejected composition must already be flagged rather than
+    # merging into a neighbour as though it were a settled size.
+    comp_warnings = enforce_size_composition(rows)
+    lines, agg_warnings = aggregate_lines(rows, document_label=path.name)
     return ParseResult(
         lines=lines,
         parser="claude-assisted",
         vendor_name=extraction.vendor_name,
         document_summary=extraction.document_summary,
         unparsed_regions=meaningful(extraction.unparsed_regions),
-        warnings=warnings + meaningful(extraction.warnings) + agg_warnings,
+        warnings=warnings + meaningful(extraction.warnings) + comp_warnings + agg_warnings,
         notes=notes,
         usage=dict(extractor.last_usage),
     )
@@ -529,13 +533,19 @@ def parse_shipment_documents(
     extractor = extractor or ClaudeExtractor()
     extraction = extractor.extract_documents(sources, focus=focus)
 
+    # Same hard constraint as the single-document path. NOT followed by
+    # aggregation here, deliberately -- this path spans several documents, which
+    # must be reconciled against each other rather than summed.
+    rows = [line_to_dict(l) for l in extraction.lines]
+    comp_warnings = enforce_size_composition(rows)
+
     return ParseResult(
-        lines=[line_to_dict(l) for l in extraction.lines],
+        lines=rows,
         parser="claude-assisted-multidoc",
         vendor_name=extraction.vendor_name,
         document_summary=extraction.document_summary,
         unparsed_regions=meaningful(extraction.unparsed_regions),
-        warnings=warnings + meaningful(extraction.warnings),
+        warnings=warnings + meaningful(extraction.warnings) + comp_warnings,
         notes=[f"combined {len(sources)} rendered source(s): " + "; ".join(s.label for s in sources)]
         + ([f"scope limited to: {focus}"] if focus else []),
         usage=dict(extractor.last_usage),

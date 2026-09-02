@@ -447,6 +447,131 @@ def _po_rows(engine) -> list[dict]:
         ]
 
 
+def test_size_composition_persisted() -> None:
+    section("a composed size reaches the database with both source axes")
+    engine = fresh_db()
+
+    def vendor_line(size, primary, secondary, qty, **kw):
+        row = line(po="1725", style="50144", color="NIN", size=size, qty=qty)
+        row["size_axis_primary"] = primary
+        row["size_axis_secondary"] = secondary
+        row["size_composition"] = {
+            "method": kw.get("method", "COMPOSED"), "primary": primary,
+            "secondary": secondary, "composed": size,
+        }
+        return row
+
+    # Two inseams of one waist: two NetSuite lines, two changes, no collapsing.
+    client = NetSuiteClient(mock_data={"1725": [
+        ns_line("1", style="50144", color="NIN", size="30-32", qty=16),
+        ns_line("8", style="50144", color="NIN", size="30-34", qty=4),
+    ]})
+    with tempfile.TemporaryDirectory() as td:
+        docs = make_docs(Path(td), ("tainan.xls",))
+        classification = FakeClassification(
+            selected=[FakeClassification.Item(docs[0], "packing_list")])
+        parsed = ParseResult(
+            lines=[vendor_line("30-32", "30", "INS 32", 17),
+                   vendor_line("30-34", "30", "INS 34", 5),
+                   # A rejected composition, which must still land with its axes.
+                   vendor_line("31-33", "31", "INS 33", 3,
+                               method="COMPOSITION_REJECTED")],
+            parser="claude-assisted", vendor_name="Tainan")
+        monkey: dict = {}
+        install_stub_parse(monkey, parsed, classification)
+        try:
+            ing.ingest_shipment(engine, docs, message=msg(), client=client, now=NOW)
+        finally:
+            restore(monkey)
+
+    with engine.connect() as conn:
+        rows = [dict(r._mapping) for r in conn.execute(
+            select(proposed_changes.c.src_size_text,
+                   proposed_changes.c.key_size,
+                   proposed_changes.c.size_composition_method,
+                   proposed_changes.c.src_size_axis_primary,
+                   proposed_changes.c.src_size_axis_secondary,
+                   proposed_changes.c.ns_line_id,
+                   proposed_changes.c.proposed_quantity,
+                   proposed_changes.c.state)
+            .order_by(proposed_changes.c.src_size_text)).all()]
+
+    check(len(rows) == 3, "three rows persisted, not two merged into one", str(len(rows)))
+    by_size = {r["src_size_text"]: r for r in rows}
+
+    for size, line_id, qty in (("30-32", "1", 17), ("30-34", "8", 5)):
+        row = by_size.get(size, {})
+        check(row.get("size_composition_method") == "COMPOSED",
+              f"{size}: recorded as COMPOSED", str(row.get("size_composition_method")))
+        check(row.get("src_size_axis_primary") == "30",
+              f"{size}: the printed waist is stored verbatim",
+              str(row.get("src_size_axis_primary")))
+        check(row.get("src_size_axis_secondary") == f"INS {size[-2:]}",
+              f"{size}: and the printed inseam LABEL, not just its number",
+              str(row.get("src_size_axis_secondary")))
+        check(row.get("ns_line_id") == line_id,
+              f"{size}: matched NetSuite line {line_id}", str(row.get("ns_line_id")))
+        check(row.get("proposed_quantity") == qty,
+              f"{size}: with its own quantity, not the two summed", str(row.get("proposed_quantity")))
+
+    check(by_size["30-32"]["key_size"] != by_size["30-34"]["key_size"],
+          "the two inseams have DIFFERENT canonical keys -- that is what makes "
+          "them two lines rather than one of 22")
+
+    rejected = by_size.get("31-33", {})
+    check(rejected.get("size_composition_method") == "COMPOSITION_REJECTED",
+          "a rejected composition is persisted as such, not dropped",
+          str(rejected.get("size_composition_method")))
+    check(rejected.get("src_size_axis_primary") == "31"
+          and rejected.get("src_size_axis_secondary") == "INS 33",
+          "with both axes kept -- the case where they matter most", str(rejected))
+    check(rejected.get("ns_line_id") is None and rejected.get("state") == "NEEDS_ATTENTION",
+          "and it matched nothing, so it flags", str(rejected.get("state")))
+
+    # The provenance constraint: claiming a composition without both axes is
+    # rejected by the database, not merely discouraged.
+    from sqlalchemy.exc import IntegrityError
+
+    def half_composition():
+        with engine.begin() as conn:
+            conn.execute(proposed_changes.update()
+                         .where(proposed_changes.c.src_size_text == "30-32")
+                         .values(src_size_axis_secondary=None))
+
+    try:
+        half_composition()
+        check(False, "DB rejects a composition missing an axis", "the update succeeded")
+    except IntegrityError as exc:
+        check("composition_needs_both_axes" in str(exc),
+              "DB rejects a composition missing an axis", str(exc).splitlines()[0][:80])
+
+    # And the single-axis path writes NULLs, not empty strings -- so "was this
+    # composed" stays a yes/no question.
+    engine2 = fresh_db()
+    with tempfile.TemporaryDirectory() as td:
+        docs = make_docs(Path(td), ("inprotex.xlsx",), payload=b"other-bytes")
+        classification = FakeClassification(
+            selected=[FakeClassification.Item(docs[0], "packing_list")])
+        parsed = ParseResult(lines=[line(size="S")], parser="inprotex-deterministic",
+                             vendor_name="Inprotex")
+        monkey = {}
+        install_stub_parse(monkey, parsed, classification)
+        try:
+            ing.ingest_shipment(engine2, docs, message=msg(), client=NetSuiteClient(
+                mock_data={"1662": [ns_line("18", size="S")]}), now=NOW)
+        finally:
+            restore(monkey)
+    with engine2.connect() as conn:
+        single = conn.execute(select(
+            proposed_changes.c.size_composition_method,
+            proposed_changes.c.src_size_axis_primary,
+            proposed_changes.c.src_size_axis_secondary)).one()
+    check(single.size_composition_method is None,
+          "a single-axis vendor writes NULL, not a method", str(single.size_composition_method))
+    check(single.src_size_axis_primary is None and single.src_size_axis_secondary is None,
+          "and NULL axes -- nothing is invented for the four vendors that compose nothing")
+
+
 def test_multi_po_document() -> None:
     section("one slip, six POs: one shipment_pos row each")
     engine = fresh_db()
@@ -937,6 +1062,7 @@ def main() -> int:
         test_ingest_writes_every_table,
         test_double_ingest_is_a_no_op,
         test_po_key_is_canonical,
+        test_size_composition_persisted,
         test_multi_po_document,
         test_multi_candidate_line,
         test_audit_and_state_guard,

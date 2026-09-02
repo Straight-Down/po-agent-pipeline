@@ -673,7 +673,7 @@ def _render_window(grid: SheetGrid, start: int, end: int, split: bool) -> str:
 #: `prompt_fingerprint()` hashes the actual prompt text, and a test pins the pair.
 #: Edit a prompt without bumping this and that test fails with both values, which
 #: is the cheapest available reminder.
-PROMPT_VERSION = "2026-08-31.1"
+PROMPT_VERSION = "2026-09-02.1"
 
 # Stable across every call, so it sits in front of the cache breakpoint.
 PACKING_SYSTEM_PROMPT = """\
@@ -719,8 +719,94 @@ you could not read it is always acceptable.
 reconcile, duplicated rows, ambiguous units, multiple PO blocks that might have \
 been confused.
 
+8. **A sheet may split the size across two axes.** Part of the size is a column \
+header and the other part is a row-block label or section heading — for example \
+waist sizes 30/32/34 across the columns, with the rows divided into an 'INS 32' \
+block and an 'INS 34' block. On such a sheet the same column means a DIFFERENT \
+size in each block, and neither axis identifies a size on its own.
+
+When you see this, the size is the COMBINATION of the two axes, and you should:
+
+  - emit the combined size in `size`, spelled exactly as one of the valid sizes \
+listed for you below — match one of those strings character for character, \
+including its separator. Do not invent a separator or a format of your own.
+  - put the first axis's printed label in `size_axis_primary` (e.g. '30') and \
+the second axis's printed label, complete, in `size_axis_secondary` (e.g. \
+'INS 32' — the whole label as printed, not just the number).
+  - emit one line per combination, so a waist column appearing under two \
+inseam blocks becomes two lines, never one summed line.
+
+Leave both axis fields EMPTY on an ordinary sheet whose size labels are printed \
+in full. Setting `size_axis_secondary` is what declares a size to be composed, \
+and a composed size is checked against the valid list afterwards.
+
+If you can see two axes but cannot produce a combination that matches the valid \
+list, still emit the line: set `size` to your best reading, fill in BOTH axis \
+fields with what was printed, set confidence to 'low', and say so in the note. \
+A flagged line reaches a human. A confidently wrong size reaches the ERP.
+
 Set source_hint to SHEET!R<row> for the row you read each line from, so a human \
 can find it in the original file."""
+
+
+def size_vocabulary_block() -> str:
+    """
+    The account's valid sizes, as a system-prompt block.
+
+    Why the model is shown this at all: rule 8 asks it to produce a *combination*,
+    and "30-32" versus "30/32" versus "30x32" is not something the sheet reveals
+    — only this account's own list does. Showing the list turns an invention into
+    a lookup.
+
+    Why it is a SEPARATE block from `PACKING_SYSTEM_PROMPT` rather than pasted
+    into it: the list is data read from NetSuite, and a `size_vocabulary.py
+    --refresh` would otherwise change `prompt_fingerprint()` and fail the
+    version-pin test, making a legitimate refresh look like a forgotten version
+    bump. Kept apart, `PROMPT_VERSION` names the *instructions* and the snapshot
+    file carries its own `fetched_at` provenance.
+
+    This block is an aid, not the guarantee. The guarantee is
+    `extraction_schema.enforce_size_composition`, which rejects any composed size
+    absent from the list regardless of what the model was shown.
+    """
+    import size_vocabulary as sv
+
+    try:
+        labels = sorted(sv.size_labels())
+    except sv.SizeVocabularyUnavailable:
+        logger.warning(
+            "no size-list snapshot, so the extractor is not being told what a valid "
+            "composed size looks like; every composition will be rejected downstream"
+        )
+        return ""
+    return (
+        "Valid sizes in this ERP account, for rule 8. A COMPOSED size must match "
+        "one of these exactly, character for character:\n"
+        + ", ".join(labels)
+        + "\n\nNote the two shapes present: plain labels (letter sizes, and single "
+        "numbers for footwear and women's sizing) and waist-inseam pairs written "
+        "with a hyphen. Sizes printed in full on the sheet are NOT checked against "
+        "this list — emit those verbatim per rule 1, even if they are absent here "
+        "(a vendor writing XXL where this account writes 2X is normal and is "
+        "mapped downstream)."
+    )
+
+def extraction_system_blocks(instructions: str) -> list[dict]:
+    """
+    The system blocks for an extraction call: instructions, then the size list.
+
+    Both are stable across every call in a run, so both sit in front of the cache
+    breakpoint and a multi-sheet workbook pays for them once. Two blocks rather
+    than one concatenated string so the instruction text keeps its own identity
+    for `prompt_fingerprint()` -- see `size_vocabulary_block`.
+    """
+    blocks = [{"type": "text", "text": instructions}]
+    vocabulary = size_vocabulary_block()
+    if vocabulary:
+        blocks.append({"type": "text", "text": vocabulary})
+    blocks[-1]["cache_control"] = {"type": "ephemeral"}
+    return blocks
+
 
 # Used when one shipment's data is split across several documents. Kept separate
 # from PACKING_SYSTEM_PROMPT so each stays a stable, cacheable prefix.
@@ -773,7 +859,20 @@ rather than inventing a size split.
 
 8. Put anything else a reviewer should know in warnings, and describe in \
 unparsed_regions anything that looked like shipment line data you could not \
-turn into a line. Silently omitting data is the one unacceptable outcome."""
+turn into a line. Silently omitting data is the one unacceptable outcome.
+
+9. `size_axis_primary` and `size_axis_secondary` exist for one specific layout: \
+a document that splits the size across TWO axes, with part of it in a column \
+header and part in a row-block or section label (waist across the columns, an \
+'INS 32' / 'INS 34' block down the rows). On such a document, emit the COMBINED \
+size — matching one of the valid sizes listed for you exactly, separator \
+included — and record each printed axis verbatim in those two fields.
+
+**Leave both fields EMPTY on every other document.** Almost all of them are \
+single-axis: the size is printed in full in one place, and you emit it verbatim \
+per rule 4. Filling these fields in when there is no second axis declares a \
+composition that did not happen, and the size will then be rejected for not \
+being a valid list value — turning a correctly-read line into a flagged one."""
 
 SHIPPING_SYSTEM_PROMPT = """\
 You extract shipment-level fields from freight documents (shipping advices, \
@@ -953,13 +1052,7 @@ class ClaudeExtractor:
             schema=PackingSlipExtraction,
             # Cache the stable instructions; the volatile grid goes after, in
             # the user turn, so the cached prefix survives across sheets/files.
-            system=[
-                {
-                    "type": "text",
-                    "text": PACKING_SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
+            system=extraction_system_blocks(PACKING_SYSTEM_PROMPT),
             content=[{"type": "text", "text": f"{preamble}{rendered}"}],
         )
 
@@ -1149,13 +1242,7 @@ class ClaudeExtractor:
                 )
             part = self._parse_with_retry(
                 schema=PackingSlipExtraction,
-                system=[
-                    {
-                        "type": "text",
-                        "text": PACKING_SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
+                system=extraction_system_blocks(PACKING_SYSTEM_PROMPT),
                 content=[
                     {
                         "type": "text",
@@ -1297,13 +1384,7 @@ class ClaudeExtractor:
 
         return self._parse_with_retry(
             schema=PackingSlipExtraction,
-            system=[
-                {
-                    "type": "text",
-                    "text": MULTI_DOC_SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
+            system=extraction_system_blocks(MULTI_DOC_SYSTEM_PROMPT),
             content=content,
         )
 

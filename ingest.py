@@ -394,6 +394,13 @@ def _change_row(change: mt.ProposedChange, line: dict, shipment_id, po_id, sha, 
         "colour_name_source_item_id": (
             (change.colour_provenance or {}).get("name_source_item_id")
         ),
+        # How the size was composed, when it was. NULL on single-axis documents.
+        # Written for the same reason as the colour columns: the pairing of a
+        # column header with a row-block label is the whole inference and the
+        # size string does not carry it.
+        "size_composition_method": (change.size_composition or {}).get("method"),
+        "src_size_axis_primary": (change.size_composition or {}).get("primary"),
+        "src_size_axis_secondary": (change.size_composition or {}).get("secondary"),
         "created_at": now,
         "updated_at": now,
     }

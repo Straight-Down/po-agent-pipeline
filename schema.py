@@ -481,6 +481,20 @@ proposed_changes = Table(
     Column("colour_resolved_code", String(64)),  # the NetSuite code it resolved to
     Column("colour_resolved_name", String(200)),  # the long name that supplied it
     Column("colour_name_source_item_id", String(40)),  # whose item record said so
+    # -- how the SIZE was arrived at, when it was composed from two axes rather
+    # -- than printed in one place (migration 0003). Tainan's sheet puts the waist
+    # -- in a column header and the inseam in a row-block label several rows above,
+    # -- so `32-34` exists in neither cell. Persisted for the same reason as the
+    # -- colour columns: "why is this line 32-34" is answerable only from the pair
+    # -- of cells it came from, and nothing downstream can reconstruct that pairing
+    # -- from the size string. NULL on single-axis documents, which is most of them.
+    # --   COMPOSED              both axes read, and the result IS a real size
+    # --   COMPOSITION_REJECTED  the result is not a value in the account's size
+    # --                         list, so it was flagged and never treated as a
+    # --                         matchable size
+    Column("size_composition_method", String(24)),
+    Column("src_size_axis_primary", String(60)),    # verbatim, e.g. '30'
+    Column("src_size_axis_secondary", String(60)),  # verbatim, e.g. 'INS 32'
     # -- the five figures the review screen needs, so a human can read the
     # -- situation directly: "ordered 300, received 0, this slip 128" makes a
     # -- partial delivery self-evident. `outstanding` is derived
@@ -550,6 +564,20 @@ proposed_changes = Table(
         "(colour_resolved_code IS NOT NULL AND colour_resolved_name IS NOT NULL "
         " AND colour_name_source_item_id IS NOT NULL)",
         name="name_resolution_needs_provenance",
+    ),
+    CheckConstraint(
+        "size_composition_method IS NULL OR size_composition_method IN "
+        "('COMPOSED','COMPOSITION_REJECTED')",
+        name="size_composition_method",
+    ),
+    # Same principle as the colour constraint above: a claim that a size was
+    # composed is not provenance unless BOTH source axes are recorded. Half a
+    # composition is unauditable -- '32-34' with only the waist kept leaves no way
+    # to tell whether the inseam was read or assumed.
+    CheckConstraint(
+        "size_composition_method IS NULL OR "
+        "(src_size_axis_primary IS NOT NULL AND src_size_axis_secondary IS NOT NULL)",
+        name="composition_needs_both_axes",
     ),
     # No target line => cannot be approved or written. This is what makes
     # NEEDS_RESOLUTION a real state rather than a null FK with a comment beside it.
@@ -704,7 +732,10 @@ SELECT pc.id                        AS change_id,
        pc.current_quantity - COALESCE(pc.current_quantity_received, 0) AS outstanding,
        pc.colour_resolution_method  AS colour_resolution_method,
        pc.colour_resolved_code      AS colour_resolved_code,
-       pc.colour_resolved_name      AS colour_resolved_name
+       pc.colour_resolved_name      AS colour_resolved_name,
+       pc.size_composition_method   AS size_composition_method,
+       pc.src_size_axis_primary     AS size_axis_primary_printed,
+       pc.src_size_axis_secondary   AS size_axis_secondary_printed
 FROM proposed_changes pc
 JOIN shipment_pos sp ON sp.id = pc.shipment_po_id
 """

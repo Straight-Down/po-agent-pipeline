@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from canonical import canonical
 from pydantic import BaseModel, Field
@@ -64,9 +64,27 @@ class ExtractedLine(BaseModel):
         "Do not translate, expand, or normalize it."
     )
     size: str = Field(
-        description="Size label exactly as the vendor printed it, e.g. 'XXL'. "
-        "Do NOT convert to another convention (do not turn XXL into 2X) — a "
-        "downstream component owns that mapping."
+        description="The size for this line. Normally the label exactly as the "
+        "vendor printed it, e.g. 'XXL' — do NOT convert to another convention "
+        "(do not turn XXL into 2X), a downstream component owns that mapping. "
+        "The ONE exception is a two-axis sheet, where half the size is a column "
+        "header and half is a row-block or section label: there, emit the "
+        "COMBINATION, spelled exactly as one of the valid sizes you were given. "
+        "See size_axis_primary / size_axis_secondary."
+    )
+    size_axis_primary: str = Field(
+        default="",
+        description="On a two-axis sheet, the printed label of the FIRST axis "
+        "(normally the column header), verbatim — e.g. '30' from a waist column. "
+        "Empty string on an ordinary single-axis sheet."
+    )
+    size_axis_secondary: str = Field(
+        default="",
+        description="On a two-axis sheet, the printed label of the SECOND axis "
+        "(normally the row-block or section label), verbatim and complete — e.g. "
+        "'INS 32', including the word, not just the number. Empty string on an "
+        "ordinary single-axis sheet. Setting this is what declares the size to "
+        "be a composition, so leave it empty unless it genuinely is one."
     )
     quantity: int = Field(
         description="Units shipped for this PO/style/colour/size. Use 0 only if "
@@ -229,6 +247,110 @@ def _worst_confidence(values: list[str]) -> str:
     return max(values, key=_confidence_rank) if values else "high"
 
 
+#: The confidence a composed-but-invalid size is forced down to. Not a new state
+#: -- it routes through the existing low-confidence path, which the matcher and
+#: the review screen already treat as "a human decides".
+_COMPOSITION_FAILED_CONFIDENCE = "low"
+
+
+def enforce_size_composition(
+    rows: list[dict], vocabulary: Optional[frozenset] = None
+) -> list[str]:
+    """
+    The hard constraint on two-axis sizes. Mutates `rows`; returns warnings.
+
+    **A composed size is only accepted if it exists in the account's size list.**
+    This is enforced here, in code, and deliberately not left to the model: the
+    model is told what a well-formed size looks like and is good at reading the
+    layout, but "the size I emitted is a real value in this ERP" is a factual
+    claim that can be checked, and anything checkable should not rest on a
+    generation. A composed size that is not a real list value would otherwise
+    match nothing, or worse, match the wrong line.
+
+    A row is treated as composed **only** when it declares a second axis
+    (`size_axis_secondary`). That is the whole gate, and it is what keeps this
+    inert for every single-axis vendor: Inprotex prints `XXL`, which is not in
+    the account's list at all (NetSuite spells it `2X`), and validating it here
+    would break a vendor that has been correct for months. Single-axis sizes pass
+    through untouched, exactly as before, and `matcher.SIZE_ALIASES` keeps owning
+    the vendor-label-to-NetSuite mapping.
+
+    On failure the row is **flagged, never repaired**:
+      - confidence forced to 'low', so it routes to a human,
+      - both printed axes preserved verbatim in the note and in the row,
+      - `size` left exactly as the model emitted it -- not blanked, not rewritten.
+
+    No separator is ever guessed. If the model emits `30/32` for a list that holds
+    `30-32`, this flags rather than rewriting the separator: a rule inferred from
+    one document would be applied silently to the next, and the account's own
+    spelling is the only authority on how a size is written.
+    """
+    if vocabulary is None:
+        import size_vocabulary as sv
+
+        try:
+            vocabulary = sv.size_labels_canon()
+        except sv.SizeVocabularyUnavailable as exc:
+            # No snapshot: refuse to validate rather than pretending to. Every
+            # composed row flags, which is the safe direction -- silently
+            # accepting unvalidated compositions is what this function exists
+            # to prevent.
+            vocabulary = frozenset()
+            logger.warning("size vocabulary unavailable, so every composition flags: %s", exc)
+
+    warnings: list[str] = []
+    failures: list[str] = []
+    composed = 0
+
+    for row in rows:
+        secondary = str(row.get("size_axis_secondary") or "").strip()
+        if not secondary:
+            continue  # single-axis: not a composition, nothing to enforce
+        composed += 1
+
+        primary = str(row.get("size_axis_primary") or "").strip()
+        size = str(row.get("size") or "").strip()
+        provenance = {
+            "method": "COMPOSED",
+            "primary": primary,
+            "secondary": secondary,
+            "composed": size,
+        }
+
+        if size and canonical(size) in vocabulary:
+            row["size_composition"] = provenance
+            continue
+
+        provenance["method"] = "COMPOSITION_REJECTED"
+        row["size_composition"] = provenance
+        row["confidence"] = _COMPOSITION_FAILED_CONFIDENCE
+        detail = (
+            f"size {size!r} was composed from axes {primary!r} and {secondary!r}, "
+            f"but {size!r} is not a value in the account's size list, so it was "
+            f"NOT accepted. Both printed axes are preserved; a human decides what "
+            f"this size is."
+        )
+        row["note"] = "; ".join(p for p in (str(row.get("note") or "").strip(), detail) if p)
+        failures.append(
+            f"{row.get('style_number')}/{row.get('color')}: {primary!r} + {secondary!r} "
+            f"-> {size!r}"
+        )
+
+    if failures:
+        warnings.append(
+            f"{len(failures)} composed size(s) are NOT valid values in the account's size "
+            f"list and were flagged rather than emitted as matchable sizes: "
+            + "; ".join(failures[:6])
+            + (f" (and {len(failures) - 6} more)" if len(failures) > 6 else "")
+        )
+    if composed:
+        logger.info(
+            "size composition: %d of %d composed row(s) validated against the size list",
+            composed - len(failures), composed,
+        )
+    return warnings
+
+
 def aggregate_lines(
     lines: list[dict], document_label: str = ""
 ) -> tuple[list[dict], list[str]]:
@@ -328,7 +450,8 @@ def aggregate_lines(
         # "NEW  INDIGO" and "NEW INDIGO"), pick the variant deterministically and
         # record every rendering -- so the displayed value is stable across runs
         # and the discrepancy stays visible for audit instead of being erased.
-        for field_name in ("po_number", "style_number", "color", "size"):
+        for field_name in ("po_number", "style_number", "color", "size",
+                           "size_axis_primary", "size_axis_secondary"):
             variants = sorted({str(g.get(field_name) or "") for g in group})
             first[field_name] = variants[0]
             if len(variants) > 1:
@@ -416,6 +539,11 @@ def line_to_dict(line: ExtractedLine) -> dict[str, Any]:
         "confidence": line.confidence,
         "note": line.note.strip(),
         "source_hint": line.source_hint.strip(),
+        # Both axes, verbatim. Empty on a single-axis sheet, which is nearly all
+        # of them -- their presence is what marks `size` as composed rather than
+        # printed, and `enforce_size_composition` gates on exactly that.
+        "size_axis_primary": line.size_axis_primary.strip(),
+        "size_axis_secondary": line.size_axis_secondary.strip(),
     }
 
 

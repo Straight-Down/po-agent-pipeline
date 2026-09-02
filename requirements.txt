@@ -13,5 +13,9 @@ SQLAlchemy>=2.0             # one table definition, rendered for SQLite AND Azur
 alembic>=1.13               # migrations, with render_as_batch for SQLite's ALTER limits
 
 # Document reading -- also used by the Phase 0 prototypes (parse_packing_slip.py)
-openpyxl>=3.1              # xlsx cell grids
+openpyxl>=3.1              # xlsx cell grids (OOXML)
+xlrd>=2.0                  # legacy .xls cell grids (OLE2/BIFF). Tainan's packing list
+                           # is one, and it is that PO's only size-level source.
+                           # 2.x reads .xls ONLY -- openpyxl keeps .xlsx; the reader is
+                           # chosen by file signature, not extension.
 pdfplumber>=0.11           # PDF text layer

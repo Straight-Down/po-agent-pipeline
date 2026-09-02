@@ -50,6 +50,7 @@ from netsuite_client import (
     NS_UPDATED_RECEIPT_DATE,
     NetSuiteClient,
     POLine,
+    po_number_key,
 )
 
 # Vendor size label -> NetSuite canonical size label.
@@ -161,6 +162,9 @@ class ProposedChange:
     `confirmed_receipt_date`, which only a human sets.
     """
 
+    #: The CANONICAL key ("1624"), not the vendor's rendering -- one PO written two
+    #: ways on one document is one PO here. The verbatim text is kept on
+    #: `shipment_pos.po_number_printed`.
     po_number: str
     style_number: str
     color: str
@@ -700,12 +704,17 @@ def build_proposed_changes(
     reference_eta = eta_date.isoformat() if eta_date else (str(eta).strip() if eta else None)
     reference_etd = etd_date.isoformat() if etd_date else (str(etd).strip() if etd else None)
 
-    po_numbers = sorted({str(vl.get("po_number") or "").strip() for vl in vendor_lines})
+    # Grouped by CANONICAL key, so a document whose extraction rendered the same PO
+    # as both `1624` and `PO0001624` reads that PO once and shares one colour
+    # vocabulary for it -- and lines up with the key `ingest` stores. See
+    # netsuite_client.po_number_key.
+    po_numbers = sorted({po_number_key(vl.get("po_number")) for vl in vendor_lines
+                         if str(vl.get("po_number") or "").strip()})
     ns_lines_by_po = {po: client.get_purchase_order(po) for po in po_numbers if po}
 
     changes: list[ProposedChange] = []
     for vl in vendor_lines:
-        po_number = str(vl.get("po_number") or "").strip()
+        po_number = po_number_key(vl.get("po_number"))
         confidence = str(vl.get("confidence") or "high").lower()
         note = str(vl.get("note") or "")
         ns_lines = ns_lines_by_po.get(po_number, [])

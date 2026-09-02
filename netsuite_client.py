@@ -47,6 +47,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
+from canonical import canonical
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -520,6 +522,41 @@ def po_tranid(printed: str) -> str:
         )
 
     return f"{TRANID_PREFIX}{int(groups[0]):0{TRANID_MIN_DIGITS}d}"
+
+
+def po_number_key(printed: str) -> str:
+    """
+    The stable grouping and storage key for a printed PO reference: `'1624'`.
+
+    Every place that groups extracted lines by PO, or writes
+    `shipment_pos.po_number_key`, must go through this. The reason is idempotency,
+    and it is not hypothetical: one extraction of the footwear workbook returned
+    `'1624'` for two of its three sheets and `'PO0001624'` for the third, and
+    which sheet got which varied between runs. `po_tranid` normalises both to the
+    same tranId, so PO *resolution* never noticed -- but the raw strings were also
+    being used as dict keys and written to the database, so the same document
+    ingested twice produced different `shipment_pos` rows, which is exactly what
+    the idempotency check is supposed to prevent. Same class as the `NEW  INDIGO`
+    double-space nondeterminism.
+
+    Derived through `po_tranid`, so there is ONE digit-extraction rule in this
+    module rather than two that can drift apart. The key is the digits without
+    padding because that is what a human recognises and what
+    `po_number_printed` will look like; `ns_tranid` carries the padded form.
+
+    A reference `po_tranid` refuses -- no digits, or more than one distinct number
+    -- falls back to the canonical form of the text itself. That keeps grouping
+    deterministic (the whole point) without inventing a PO number: resolution
+    still fails on it and the row is still reported NOT_FOUND. Collapsing
+    `'#1720, 1721'` to one number here would silently attach a shipment to the
+    wrong order, which is the mistake `po_tranid` exists to refuse.
+    """
+    text = str(printed or "").strip()
+    try:
+        tranid = po_tranid(text)
+    except PONumberUnresolvable:
+        return canonical(text)
+    return str(int(tranid[len(TRANID_PREFIX) :]))
 
 
 def assert_po_reference(printed: str) -> str:

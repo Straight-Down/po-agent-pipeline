@@ -47,6 +47,9 @@ from typing import Any, Optional, Sequence, Union
 
 from canonical import canonical_key
 from claude_extractor import (
+    FORMAT_PDF,
+    FORMAT_XLSX,
+    WORKBOOK_FORMATS,
     ClaudeExtractor,
     DocumentUnreadable,
     ExtractionError,
@@ -54,6 +57,7 @@ from claude_extractor import (
     credentials_available,
     open_pdf,
     open_workbook,
+    sniff_format,
 )
 from extraction_schema import (
     ParseResult,
@@ -86,7 +90,15 @@ def looks_like_inprotex(xlsx_path: Union[str, Path]) -> tuple[bool, str]:
     Deliberately strict: a false positive here means running a parser tuned to a
     different layout, which produces confidently wrong lines. A false negative
     just costs one Claude call.
+
+    Answers False for anything that is not an OOXML workbook, without opening it.
+    Inprotex sends `.xlsx`, and the deterministic parser is built on openpyxl, so
+    a legacy `.xls` cannot be this layout by construction -- saying so plainly is
+    better than reporting it as a file that would not open.
     """
+    if sniff_format(xlsx_path) != FORMAT_XLSX:
+        return False, "not an OOXML .xlsx workbook, so not the Inprotex layout"
+
     try:
         wb = open_workbook(xlsx_path, data_only=True, read_only=True)
     except DocumentUnreadable as exc:
@@ -164,7 +176,9 @@ def parse_packing_slip(
     # `notes` is informational routing detail; `warnings` means a human must look.
     notes: list[str] = []
     warnings: list[str] = []
-    is_pdf = path.suffix.lower() == ".pdf"
+    # By signature, not by suffix -- see claude_extractor.sniff_format.
+    fmt = sniff_format(path)
+    is_pdf = fmt == FORMAT_PDF
 
     if is_pdf:
         if force == "deterministic":
@@ -393,8 +407,9 @@ def build_source_documents(paths: Sequence[Union[str, Path]]) -> tuple[list, lis
         # One unopenable attachment must flag itself and let the batch continue --
         # a corrupt or password-protected file is a routine vendor-email event,
         # not a reason to abandon the other attachments.
+        fmt = sniff_format(path)
         try:
-            if path.suffix.lower() in (".xlsx", ".xlsm"):
+            if fmt in WORKBOOK_FORMATS:
                 grids = [g for g in read_workbook_grids(path) if not g.is_empty]
                 if not grids:
                     warnings.append(f"{path.name}: no non-empty worksheets")
@@ -407,8 +422,11 @@ def build_source_documents(paths: Sequence[Union[str, Path]]) -> tuple[list, lis
                         )
                     )
                 continue
-            if path.suffix.lower() != ".pdf":
-                raise ExtractionError(f"unsupported source document type: {path.name}")
+            if fmt != FORMAT_PDF:
+                raise ExtractionError(
+                    f"unsupported source document type: {path.name} (its leading bytes "
+                    f"match no workbook or PDF format)"
+                )
         except DocumentUnreadable as exc:
             warnings.append(
                 f"COULD NOT OPEN {path.name}: {exc.reason}. Skipped; the remaining "
@@ -417,7 +435,7 @@ def build_source_documents(paths: Sequence[Union[str, Path]]) -> tuple[list, lis
             logger.warning("Skipping unreadable document %s: %s", path.name, exc.reason)
             continue
 
-        if path.suffix.lower() == ".pdf":
+        if fmt == FORMAT_PDF:
             try:
                 with open_pdf(path) as pdf:
                     total_pages = len(pdf.pages)

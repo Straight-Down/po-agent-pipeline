@@ -18,7 +18,21 @@ Two hard rules, both from real mistakes rather than theory:
    - `0626...Invoice_Packing.xlsx` (Inprotex) also says "Invoice" — and *is* the
      real, size-level packing slip, validated 77/77.
    Identical filename signals, opposite answers. So a filename match is a
-   candidate, not a verdict; ambiguous cases are settled by looking at content.
+   candidate, not a verdict; every case is settled by looking at content.
+
+   Stated as the rule the code now enforces: **a filename hint may prioritise or
+   deprioritise an attachment. It may never exclude one.** Only content, or a
+   file that will not open, excludes. This is not a refinement — an earlier
+   version let a confident-looking filename skip the content check entirely, and
+   a file named `... - Clearance Invoice.xlsx` was dropped unopened. It held
+   three packing-list sheets with full per-size grids, each headed
+   `Packing list`. The content check is the part of this classifier that
+   demonstrably works; short-circuiting it with the signal known to be
+   unreliable inverted the design.
+
+   The cost is one preview per readable attachment instead of per suspicious
+   one. That is a few thousand tokens in a single API call, against the price of
+   discarding a vendor's only size-level source.
 
 2. **Inspection reports are never a data source.** Paula's explicit ruling
    (2026-08-11), not a design preference open to revisiting. An inspection
@@ -140,6 +154,12 @@ class AttachmentClassification:
     preview_chars: int = 0
     #: Set when the file cannot be opened at all (corrupt, truncated, encrypted).
     unreadable_reason: Optional[str] = None
+    #: What the NAME suggested, kept even after content overrides `doc_type`.
+    #: Retained for two reasons: it is the audit trail for a disagreement (the
+    #: reviewer sees that the name said invoice and the content said packing
+    #: list), and it is the only thing a filename is now allowed to influence --
+    #: the ordering in `ClassificationResult.primary`.
+    filename_hint: Optional[DocType] = None
 
     @property
     def usable_as_shipment_data(self) -> bool:
@@ -187,10 +207,24 @@ class ClassificationResult:
         carton-by-carton detail: both extract correctly (verified live on
         Symmetry's pair, which agreed exactly), but the rollup is already in the
         target shape and costs far fewer tokens.
+
+        This ordering is the whole of what a filename is allowed to do. Among
+        attachments that content has already confirmed as size-level packing
+        lists, one whose *name* also says packing list goes first, and one whose
+        name said invoice goes last. Deprioritising, never excluding: a
+        misleadingly named file that content vouched for is still selected, still
+        parsed, and still available as a cross-check.
         """
         if not self.selected:
             return None
-        return sorted(self.selected, key=lambda c: (not c.is_rollup, c.path.name))[0]
+        return sorted(
+            self.selected,
+            key=lambda c: (
+                not c.is_rollup,
+                c.filename_hint != DocType.PACKING_LIST,
+                c.path.name,
+            ),
+        )[0]
 
     @property
     def cross_checks(self) -> list[AttachmentClassification]:
@@ -240,24 +274,70 @@ _PREVIEW_ROWS_PER_SHEET = 16
 _PREVIEW_CHARS_PER_PART = 1800
 _PREVIEW_MAX_PARTS = 6
 
-#: Size labels seen across real vendor documents. Used to locate a sheet's size
-#: header row, which is the single most decisive thing a classifier can see.
-_SIZE_TOKENS = {
-    "XS", "S", "M", "L", "XL", "XXL", "XXXL", "2X", "3X", "4X",
-    "2XL", "3XL", "4XL", "OS", "ONE SIZE",
+#: Letter-size spellings vendors use that the account's own list does not hold.
+#: NetSuite is canonical on `2X`/`3X`; Inprotex writes `XXL`/`XXXL`, and other
+#: vendors write `OS`/`ONE SIZE` for what NetSuite calls `ALL`. These are
+#: *recognition* aliases for finding a header row, NOT a mapping to a NetSuite
+#: size -- that is `matcher.SIZE_ALIASES`, which is not touched here.
+_EXTRA_SIZE_SPELLINGS = {
+    "XXL", "XXXL", "XXXXL", "2XL", "3XL", "4XL", "4X", "OS", "ONE SIZE",
 }
 
-#: The same vocabulary in canonical form. Comparing vendor cell text against our
-#: vocabulary is the same class of problem as the matcher sites, so it goes
-#: through the same canonical form: a sheet writing "２Ｘ" (full-width) or
-#: "One  Size" (double space) must still be recognised.
-_SIZE_TOKENS_CANON = {canonical(t) for t in _SIZE_TOKENS}
 
-#: How many size labels must appear on one row for it to be the size header.
+def _size_vocabulary() -> frozenset[str]:
+    """
+    The account's real size labels, in canonical form, plus vendor spellings.
+
+    Read from the generated `netsuite_size_list.json` snapshot of
+    `customlist_psgss_product_size` -- not a hardcoded set. A hardcoded set is
+    what caused this detector to be blind to every numeric size the company
+    sells; see `size_vocabulary.py`. If the snapshot is missing the detector
+    falls back to letter sizes alone and says so loudly, because a silent
+    fallback would restore the original bug.
+    """
+    import size_vocabulary as sv
+
+    try:
+        return sv.size_labels_canon(extra=_EXTRA_SIZE_SPELLINGS)
+    except sv.SizeVocabularyUnavailable as exc:
+        logger.warning(
+            "%s -- size-header detection is running on vendor letter-size spellings "
+            "ONLY, so numerically-sized sheets (footwear, bottoms) will not be "
+            "recognised. Refresh the snapshot.",
+            exc,
+        )
+        return frozenset(canonical(t) for t in _EXTRA_SIZE_SPELLINGS)
+
+
+#: How many distinct size labels must appear on one row for it to be the size
+#: header.
 _SIZE_HEADER_MIN_TOKENS = 3
 
 
-def _find_size_header_row(grid: Any) -> Optional[int]:
+def _classify_size_cell(text: str, vocabulary: frozenset[str]) -> tuple[Optional[str], bool]:
+    """
+    `(label, is_bare_number)` for one cell, or `(None, False)` if not a size.
+
+    A bare number is flagged because it is the only ambiguous kind. `S` or
+    `32-34` in a cell means one thing; `12` could equally be a carton count, a
+    quantity or a shoe size, and the caller applies an extra test to those.
+    """
+    import size_vocabulary as sv
+
+    stripped = str(text or "").strip()
+    if not stripped:
+        return None, False
+
+    numeric = sv.numeric_label(stripped)
+    if numeric is not None:
+        canon = canonical(numeric)
+        return (canon if canon in vocabulary else None), True
+
+    canon = canonical(stripped)
+    return (canon if canon in vocabulary else None), False
+
+
+def _find_size_header_row(grid: Any, vocabulary: Optional[frozenset[str]] = None) -> Optional[int]:
     """
     1-based index of the row that looks like a sheet's size header, if any.
 
@@ -267,23 +347,62 @@ def _find_size_header_row(grid: Any) -> Optional[int]:
     concludes, correctly but uselessly, that it cannot see any. Finding this row
     puts the decisive evidence in front of it instead.
 
-    Cell text is compared in CANONICAL form. This is vendor-supplied text being
-    matched against our own vocabulary, so it belongs to the same class as the
-    matcher's comparisons: a full-width "２Ｘ" or a double-spaced "One  Size"
-    would otherwise go unrecognised. The stakes rose once a missing packing sheet
-    became a routed outcome -- an unrecognised size header can make a real packing
-    sheet look sizeless, which cascades to NoPackingSheetFound and sends an entire
-    document to manual entry.
+    Cell text is compared in CANONICAL form against the account's own size list.
+    Two separate failures made that necessary. The first was encoding: a
+    full-width `２Ｘ` or a double-spaced `One  Size` went unrecognised, which
+    canonicalisation fixed. The second was vocabulary, and it was worse -- the
+    list was hand-written letter sizes, so **every numeric size the company
+    sells was invisible**. Footwear's `8`…`14` row and Tainan's `30`…`42` waist
+    row both read as "no size evidence", the sheets classified as sizeless
+    packing lists, and two vendors' only size-level source was dropped.
+
+    Bare numbers need one more test than letters do, because a row of quantities
+    or carton counts is also a row of bare numbers. Two things separate them:
+
+      - **List validity.** A quantity happens to be a valid size only by
+        coincidence. On Tainan's own sheet, the quantity row `30 | 30 | 3 | 90 |
+        6` yields just two list-valid values and the net-weight row `0.39 …
+        0.48` yields none.
+      - **Monotonicity.** A size scale is printed in ascending order; quantities
+        are in whatever order the cartons came out. Required only when *every*
+        hit is a bare number -- a row containing `S` or `32-34` has already
+        identified itself.
+
+    Neither test is airtight, and a deliberately adversarial row (ascending,
+    all-list-valid quantities) would still match. That is an acceptable residual
+    because of where this sits: a hit only adds a preview region for the
+    classifier to read, so a false positive costs a few hundred tokens, while a
+    false negative sends a whole shipment to manual entry.
     """
+    if vocabulary is None:
+        vocabulary = _size_vocabulary()
+
     for index, row in enumerate(grid.rows, start=1):
-        hits = {
-            canonical(cell)
-            for cell in row
-            if cell and canonical(cell) in _SIZE_TOKENS_CANON
-        }
-        if len(hits) >= _SIZE_HEADER_MIN_TOKENS:
-            return index
+        labels: set[str] = set()
+        numeric_run: list[tuple[int, float]] = []
+        all_numeric = True
+        for column, cell in enumerate(row):
+            label, is_number = _classify_size_cell(cell, vocabulary)
+            if label is None:
+                continue
+            labels.add(label)
+            if is_number:
+                numeric_run.append((column, float(str(cell).strip())))
+            else:
+                all_numeric = False
+
+        if len(labels) < _SIZE_HEADER_MIN_TOKENS:
+            continue
+        if all_numeric and not _ascends(numeric_run):
+            continue
+        return index
     return None
+
+
+def _ascends(cells: Sequence[tuple[int, float]]) -> bool:
+    """Do these (column, value) pairs strictly ascend left to right?"""
+    values = [value for _column, value in sorted(cells)]
+    return all(earlier < later for earlier, later in zip(values, values[1:]))
 
 
 def sheet_preview(grid: Any) -> str:
@@ -431,8 +550,11 @@ def _preview(path: Path, max_chars: int = 9000) -> str:
     concluded "commercial invoice, no sizes" and would have excluded the one
     vendor whose parser is fully validated.
     """
+    from claude_extractor import FORMAT_PDF, WORKBOOK_FORMATS, sniff_format
+
+    fmt = sniff_format(path)
     try:
-        if path.suffix.lower() in (".xlsx", ".xlsm"):
+        if fmt in WORKBOOK_FORMATS:
             from claude_extractor import read_workbook_grids
 
             grids = [g for g in read_workbook_grids(path) if not g.is_empty]
@@ -446,7 +568,7 @@ def _preview(path: Path, max_chars: int = 9000) -> str:
                 parts.append(f"[{len(grids) - _PREVIEW_MAX_PARTS} further sheet(s) not previewed]")
             return "\n".join(parts)[:max_chars]
 
-        if path.suffix.lower() == ".pdf":
+        if fmt == FORMAT_PDF:
             from claude_extractor import read_pdf_layouts
 
             pages = read_pdf_layouts(path)
@@ -471,15 +593,31 @@ def open_failure_reason(path: Path) -> Optional[str]:
     Called during triage so a corrupt or password-protected attachment is
     reported as its own specific condition ("could not open: encrypted") rather
     than being indistinguishable from a document that simply has no size data.
-    """
-    from claude_extractor import DocumentUnreadable, open_pdf, open_workbook
 
-    suffix = path.suffix.lower()
+    Routes on the file's own signature, not its extension. That matters here more
+    than anywhere: this function is the ONLY thing allowed to exclude an
+    attachment before content is read, so getting "unopenable" wrong is getting
+    an exclusion wrong. A legacy `.xls` used to land on openpyxl and report
+    itself unreadable, which excluded a perfectly good packing list.
+    """
+    from claude_extractor import (
+        FORMAT_PDF,
+        WORKBOOK_FORMATS,
+        DocumentUnreadable,
+        open_pdf,
+        read_workbook_grids,
+        sniff_format,
+    )
+
+    fmt = sniff_format(path)
     try:
-        if suffix in (".xlsx", ".xlsm"):
-            open_workbook(path, data_only=True, read_only=True).close()
+        if fmt in WORKBOOK_FORMATS:
+            # Reads the whole workbook rather than just opening it. Costs more
+            # than the old `read_only` open, and buys the thing that open alone
+            # missed: a file that opens but whose sheets cannot be read.
+            read_workbook_grids(path)
             return None
-        if suffix == ".pdf":
+        if fmt == FORMAT_PDF:
             with open_pdf(path) as pdf:
                 _ = len(pdf.pages)
             return None
@@ -487,7 +625,10 @@ def open_failure_reason(path: Path) -> Optional[str]:
         return exc.reason
     except Exception as exc:  # noqa: BLE001
         return f"{type(exc).__name__}: {exc}"
-    return None
+    return (
+        f"not a workbook or a PDF — the file's leading bytes match no format this "
+        f"pipeline can read (extension {path.suffix or 'none'!r})"
+    )
 
 
 def classify_attachments(
@@ -515,7 +656,12 @@ def classify_attachments(
             result.warnings.append(f"attachment not found, skipped: {path}")
             continue
 
-        doc_type, ambiguous, reason = classify_by_filename(path.name)
+        # The `ambiguous` flag is deliberately not read here any more. It used to
+        # decide who got a content check; now everyone does, so there is nothing
+        # left for it to gate. It remains part of `classify_by_filename`'s answer
+        # because "the name genuinely cannot decide this" is still true and still
+        # worth stating in the reason text.
+        doc_type, _ambiguous, reason = classify_by_filename(path.name)
         item = AttachmentClassification(
             path=path,
             doc_type=doc_type,
@@ -524,6 +670,7 @@ def classify_attachments(
             reason=reason,
             method="filename",
             is_rollup=looks_like_rollup(path.name),
+            filename_hint=doc_type,
         )
 
         # An inspection report is settled: banned regardless of content, so don't
@@ -546,10 +693,13 @@ def classify_attachments(
             candidates.append(item)
             continue
 
-        # Everything that could plausibly be the packing list needs its size-level
-        # claim verified, and anything ambiguous needs its type verified.
-        if ambiguous or doc_type == DocType.PACKING_LIST:
-            needs_content.append(item)
+        # EVERY readable attachment goes to the content check, whatever its name
+        # said. A filename hint that looked confident is exactly the case that
+        # went wrong: "... - Clearance Invoice.xlsx" matched the invoice rule,
+        # skipped this step, and took three packing-list sheets down with it.
+        # The name's only remaining jobs are to seed a prior (overridden below by
+        # whatever the content says) and to order the survivors.
+        needs_content.append(item)
         candidates.append(item)
 
     if needs_content and use_content_check:

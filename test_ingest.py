@@ -339,6 +339,114 @@ def test_double_ingest_is_a_no_op() -> None:
           "every ingest attempt is audited, including the two skips", str(after["audit_log"]))
 
 
+def test_po_key_is_canonical() -> None:
+    section("one PO written two ways on one document is ONE PO")
+    from netsuite_client import po_number_key
+
+    check(po_number_key("1624") == "1624", "bare digits")
+    check(po_number_key("PO0001624") == "1624", "a padded tranId collapses to the same key",
+          po_number_key("PO0001624"))
+    check(po_number_key("PO#1624") == po_number_key(" 1624 ") == po_number_key("PO NO : 1624"),
+          "every rendering seen in the corpus lands on one key")
+    check(po_number_key("PO0001624") == po_number_key("1624"),
+          "THE DEFECT: these two used to be different dict keys and different DB rows")
+    # Unresolvable references stay deterministic without inventing a number.
+    check(po_number_key("#1720, 1721") == po_number_key("#1720, 1721"),
+          "a two-PO reference is still deterministic")
+    check(po_number_key("#1720, 1721") not in ("1720", "1721"),
+          "but is NOT collapsed onto either one", po_number_key("#1720, 1721"))
+    check(po_number_key("") == po_number_key(None) == "", "and empty stays empty")
+
+    # The footwear extraction really did return '1624' for two sheets and
+    # 'PO0001624' for the third, and which sheet got which varied between runs.
+    # Both splits must produce the same database.
+    def run(renderings):
+        engine = fresh_db()
+        reads = []
+
+        class CountingClient(NetSuiteClient):
+            def get_purchase_order(self, po_number):
+                reads.append(po_number)
+                return super().get_purchase_order(po_number)
+
+        client = CountingClient(mock_data={"1624": [
+            ns_line("18", size="S"), ns_line("19", size="M", qty=71),
+            ns_line("20", size="L", qty=40)]})
+        with tempfile.TemporaryDirectory() as td:
+            docs = make_docs(Path(td), ("footwear.xlsx",))
+            classification = FakeClassification(
+                selected=[FakeClassification.Item(docs[0], "packing_list")])
+            parsed = ParseResult(
+                lines=[line(po=po, size=size)
+                       for po, size in zip(renderings, ("S", "M", "L"))],
+                parser="claude-opus-5", vendor_name="Footwear")
+            monkey: dict = {}
+            install_stub_parse(monkey, parsed, classification)
+            try:
+                first = ing.ingest_shipment(engine, docs, message=msg(), client=client, now=NOW)
+                po_rows = _po_rows(engine)
+                first_ids = ids(engine, shipment_pos)
+                # Same document again: the rows and their ids must not move.
+                ing.ingest_shipment(engine, docs, message=msg(), client=client, now=NOW)
+            finally:
+                restore(monkey)
+        return first, po_rows, first_ids, ids(engine, shipment_pos), reads, counts(engine)
+
+    mixed = ("1624", "1624", "PO0001624")
+    swapped = ("PO0001624", "1624", "1624")
+
+    a_report, a_rows, a_first_ids, a_second_ids, a_reads, a_counts = run(mixed)
+    b_report, b_rows, _b_first, _b_second, b_reads, b_counts = run(swapped)
+
+    check(len(a_rows) == 1,
+          "THE DEFECT: mixed renderings produce ONE shipment_pos row, not two",
+          f"{len(a_rows)} row(s): {[r['po_number_key'] for r in a_rows]}")
+    check(a_rows and a_rows[0]["po_number_key"] == "1624",
+          "and the stored key is the canonical digits",
+          a_rows[0]["po_number_key"] if a_rows else "-")
+    check(a_rows and a_rows[0]["ns_tranid"] == "1624",
+          "resolution is unaffected (it always normalised)", str(a_rows[0]["ns_tranid"]))
+    check(a_counts["proposed_changes"] == 3,
+          "all three lines hang off that single parent", str(a_counts["proposed_changes"]))
+    check(len(a_reads) == 1, "and the PO was read from NetSuite ONCE, not twice",
+          f"{a_reads}")
+
+    check(a_second_ids == a_first_ids,
+          "re-ingesting the same document mints no new shipment_pos ids")
+    check(len(a_second_ids) == 1, "still exactly one row after the second ingest",
+          str(len(a_second_ids)))
+
+    # Run-to-run: the same document, the renderings split differently.
+    strip = lambda rows: [{k: v for k, v in r.items() if k != "id"} for r in rows]
+    check(strip(a_rows) == strip(b_rows),
+          "the two runs produce IDENTICAL shipment_pos rows -- idempotency restored",
+          f"{strip(a_rows)} vs {strip(b_rows)}")
+    check(a_counts == b_counts, "and identical row counts across every table")
+    check(a_reads == b_reads, "and the same NetSuite reads", f"{a_reads} vs {b_reads}")
+
+    # The verbatim renderings are not lost -- they are what the reviewer sees --
+    # and BOTH are kept, because picking one of them was itself nondeterministic.
+    check(a_rows and a_rows[0]["po_number_printed"] == "1624 / PO0001624",
+          "both verbatim renderings are stored, sorted, alongside the key",
+          str(a_rows[0]["po_number_printed"]))
+
+
+def _po_rows(engine) -> list[dict]:
+    with engine.connect() as conn:
+        return [
+            dict(r._mapping)
+            for r in conn.execute(
+                select(
+                    shipment_pos.c.id,
+                    shipment_pos.c.po_number_key,
+                    shipment_pos.c.po_number_printed,
+                    shipment_pos.c.ns_tranid,
+                    shipment_pos.c.resolution_status,
+                ).order_by(shipment_pos.c.po_number_key)
+            ).all()
+        ]
+
+
 def test_multi_po_document() -> None:
     section("one slip, six POs: one shipment_pos row each")
     engine = fresh_db()
@@ -828,6 +936,7 @@ def main() -> int:
     for fn in (
         test_ingest_writes_every_table,
         test_double_ingest_is_a_no_op,
+        test_po_key_is_canonical,
         test_multi_po_document,
         test_multi_candidate_line,
         test_audit_and_state_guard,

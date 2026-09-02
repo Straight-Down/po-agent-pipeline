@@ -53,6 +53,7 @@ from netsuite_client import (
     NetSuiteError,
     POLine,
     PONumberUnresolvable,
+    po_number_key,
     po_tranid,
 )
 from schema import (
@@ -477,7 +478,11 @@ def ingest_shipment(
     parsed = parse_shipment_email(paths, extractor=extractor, cross_check=cross_check)
     report.parse_warnings = list(parsed.warnings)
 
-    po_keys = sorted({str(ln.get("po_number") or "").strip() for ln in parsed.lines if ln.get("po_number")})
+    # ONE canonical key per PO, however the extractor rendered it on each line.
+    # Ungrouped raw strings made the same document ingest differently run to run --
+    # see netsuite_client.po_number_key.
+    po_keys = sorted({po_number_key(ln.get("po_number")) for ln in parsed.lines
+                      if str(ln.get("po_number") or "").strip()})
     lines_by_key, resolution = _fetch_po_lines(client, po_keys)
     report.po_resolution = resolution
 
@@ -495,7 +500,7 @@ def ingest_shipment(
             printed = {
                 mt.canonical(ln.get("color"))
                 for ln in parsed.lines
-                if str(ln.get("po_number") or "").strip() == key
+                if po_number_key(ln.get("po_number")) == key
             }
             codes = {mt.canonical(line.color) for line in lines}
             if not printed - codes:
@@ -592,10 +597,20 @@ def ingest_shipment(
         po_ids = {}
         for key in po_keys:
             info = resolution.get(key, {})
-            printed = next(
-                (str(ln.get("po_number")) for ln in parsed.lines
-                 if str(ln.get("po_number") or "").strip() == key), key
-            )
+            # EVERY distinct rendering the vendor used for this PO, sorted.
+            # Taking the first line's rendering looked fine and was not
+            # deterministic: when one document says both `1624` and `PO0001624`,
+            # which one came first varied between extractions, so this column
+            # changed run to run even after the key stopped doing so. Showing both
+            # is also the more truthful answer -- the column exists so a reviewer
+            # sees what the vendor actually wrote, and the vendor wrote two things.
+            renderings = sorted({
+                str(ln.get("po_number")).strip()
+                for ln in parsed.lines
+                if po_number_key(ln.get("po_number")) == key
+                and str(ln.get("po_number") or "").strip()
+            })
+            printed = " / ".join(renderings) if renderings else key
             po_id = sc.new_id()
             conn.execute(shipment_pos.insert(), {
                 "id": po_id, "shipment_id": shipment_id,
@@ -610,7 +625,7 @@ def ingest_shipment(
             counts["shipment_pos"] += 1
 
         for change, line in zip(changes, parsed.lines):
-            key = str(line.get("po_number") or "").strip()
+            key = po_number_key(line.get("po_number"))
             po_id = po_ids.get(key)
             if po_id is None:
                 # A line with no PO number at all. The matcher already flags it;

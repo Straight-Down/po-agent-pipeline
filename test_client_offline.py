@@ -673,6 +673,34 @@ def test_tranid_transformation() -> None:
         check(po_tranid(printed) == expected, f"{printed!r} -> {expected}",
               po_tranid(printed))
 
+    # The GROUPING key, which is a different question from the lookup value: it is
+    # what gets used as a dict key and written to shipment_pos.po_number_key, so it
+    # has to be stable for renderings po_tranid merely happens to normalise.
+    from netsuite_client import po_number_key
+
+    check(po_number_key("1624") == po_number_key("PO0001624") == "1624",
+          "both renderings of one PO share one key -- the idempotency defect",
+          f"{po_number_key('1624')} / {po_number_key('PO0001624')}")
+    check(po_number_key("PO NO. : 1721") == "1721", "and so does a labelled cell",
+          po_number_key("PO NO. : 1721"))
+    check(po_number_key("0001725") == "1725", "leading zeros are stripped",
+          po_number_key("0001725"))
+    check(po_number_key(po_number_key("1624")) == po_number_key("1624"),
+          "the key is idempotent under reapplication")
+    # Derived through po_tranid, so there is ONE digit-extraction rule, not two.
+    for printed in ("1662", "PO#1720", "PO NO : 1721", "7", "0001725"):
+        check(po_tranid(printed) == f"PO{int(po_number_key(printed)):07d}",
+              f"key and tranId agree for {printed!r}", po_number_key(printed))
+    # A reference po_tranid refuses stays deterministic but is NOT resolved to a
+    # number -- collapsing "#1720, 1721" onto one PO is the mistake it refuses.
+    check(po_number_key("#1720, 1721") == po_number_key("#1720, 1721")
+          and po_number_key("#1720, 1721") not in ("1720", "1721"),
+          "a multi-PO reference is deterministic without being guessed",
+          po_number_key("#1720, 1721"))
+    check(po_number_key("no digits here") == po_number_key("NO DIGITS HERE"),
+          "a digitless reference canonicalises rather than raising",
+          po_number_key("no digits here"))
+
     class Resp:
         def __init__(self, status, payload):
             self.status_code = status

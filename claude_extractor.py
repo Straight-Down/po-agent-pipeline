@@ -208,18 +208,100 @@ def _describe_open_failure(exc: BaseException, path: Path) -> str:
     return f"could not be opened ({name}: {exc})"
 
 
+#: File-format signatures, checked against the first bytes of the file itself.
+#:
+#: Routing by extension was wrong twice over. It is wrong in principle -- a
+#: vendor who saves a workbook under the wrong suffix, or a mail client that
+#: renames an attachment, lands the file on a reader that cannot read it -- and it
+#: was wrong in practice: Tainan's `.xls` really is a legacy OLE2/BIFF workbook,
+#: openpyxl cannot open one at all, and that file is the ONLY size-level source
+#: for its PO. The bytes are the authority; the suffix is a hint at best.
+_MAGIC = (
+    (b"PK\x03\x04", "xlsx"),  # zip container: .xlsx/.xlsm (and .docx, .odt...)
+    (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", "xls"),  # OLE2 compound file: legacy BIFF
+    (b"%PDF", "pdf"),
+)
+
+#: What `sniff_format` can return.
+FORMAT_XLSX = "xlsx"
+FORMAT_XLS = "xls"
+FORMAT_PDF = "pdf"
+FORMAT_UNKNOWN = "unknown"
+
+#: Formats `read_workbook_grids` can read.
+WORKBOOK_FORMATS = (FORMAT_XLSX, FORMAT_XLS)
+
+#: Suffixes openpyxl will accept without complaint. It validates the extension
+#: before looking at the file, so anything outside this set has to be handed to it
+#: as bytes -- see `open_workbook`.
+_OPENPYXL_SUFFIXES = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+
+
+def sniff_format(path: Union[str, Path]) -> str:
+    """
+    What this file actually is, from its leading bytes: one of the FORMAT_* values.
+
+    The single routing decision for every reader in the pipeline. An empty or
+    unreadable file returns FORMAT_UNKNOWN rather than raising -- deciding what to
+    do about that belongs to the caller, which has the context to report it
+    against the right attachment.
+    """
+    file_path = Path(path)
+    try:
+        with open(file_path, "rb") as handle:
+            head = handle.read(8)
+    except OSError:
+        return FORMAT_UNKNOWN
+    for signature, name in _MAGIC:
+        if head.startswith(signature):
+            return name
+    return FORMAT_UNKNOWN
+
+
 def open_workbook(path: Union[str, Path], **kwargs: Any) -> Any:
     """
     openpyxl.load_workbook with explicit handling for unopenable files.
 
     Raises DocumentUnreadable rather than letting a zipfile/openpyxl exception
     escape into the middle of a batch job.
+
+    **Still openpyxl-only, deliberately.** Callers of this get a real openpyxl
+    Workbook and use its API (`wb[name]`, `ws.iter_rows`, `cell.coordinate`);
+    wrapping xlrd in a convincing imitation of that would be a lot of surface
+    area for one vendor. Legacy `.xls` is handled where it is actually needed --
+    `read_workbook_grids`, the format-agnostic entry point that the classifier
+    and the Claude extractor both use. The one caller that genuinely needs the
+    openpyxl object is `parse_packing_slip.py`, which is Inprotex-specific and
+    whose format is `.xlsx`.
     """
     import openpyxl
 
     file_path = Path(path)
+    if sniff_format(file_path) == FORMAT_XLS:
+        raise DocumentUnreadable(
+            file_path,
+            "a legacy .xls (OLE2/BIFF) workbook, which openpyxl cannot read. Read it "
+            "with read_workbook_grids(), which routes by file signature.",
+        )
+
+    # openpyxl validates the EXTENSION, not the content: a genuine OOXML workbook
+    # saved as `.xls` is refused with InvalidFileException before it is opened.
+    # Handing it the bytes bypasses that check, so signature-based routing actually
+    # holds end to end -- otherwise `sniff_format` says xlsx and openpyxl still
+    # refuses on the name, which is the bug we just removed one layer down.
+    source: Any = file_path
+    if file_path.suffix.lower() not in _OPENPYXL_SUFFIXES:
+        import io
+
+        try:
+            source = io.BytesIO(file_path.read_bytes())
+        except OSError as exc:
+            raise DocumentUnreadable(
+                file_path, _describe_open_failure(exc, file_path), exc
+            ) from exc
+
     try:
-        return openpyxl.load_workbook(file_path, **kwargs)
+        return openpyxl.load_workbook(source, **kwargs)
     except DocumentUnreadable:
         raise
     except Exception as exc:  # noqa: BLE001 -- deliberately broad; classified below
@@ -311,36 +393,136 @@ def read_workbook_grids(xlsx_path: Union[str, Path]) -> list[SheetGrid]:
     """
     Read every worksheet into a SheetGrid, trimming empty edge rows/columns.
 
+    The format-agnostic entry point: routes on the file's own signature, so a
+    modern `.xlsx`, a legacy `.xls` and a file saved under the wrong suffix all
+    land on a reader that can read them. Both readers produce identical
+    SheetGrids, so nothing downstream knows or cares which ran.
+
     `data_only=True` so formula cells yield their cached values — the same
     setting `parse_packing_slip.py` uses.
     """
-    wb = open_workbook(xlsx_path, data_only=True)
-    grids: list[SheetGrid] = []
-    for name in wb.sheetnames:
-        ws = wb[name]
-        raw = [[_fmt(c) for c in row] for row in ws.iter_rows(values_only=True)]
-        if not raw:
-            grids.append(SheetGrid(name=name, rows=[], first_col=1))
-            continue
+    path = Path(xlsx_path)
+    fmt = sniff_format(path)
+    if fmt == FORMAT_XLS:
+        raw_sheets = _read_xls_sheets(path)
+    elif fmt == FORMAT_XLSX:
+        raw_sheets = _read_xlsx_sheets(path)
+    elif fmt == FORMAT_PDF:
+        raise DocumentUnreadable(
+            path,
+            "is a PDF, not a workbook (whatever the file name says) — read it with "
+            "read_pdf_layouts()",
+        )
+    else:
+        raise DocumentUnreadable(
+            path,
+            "not a recognised workbook: the file does not begin with a zip signature "
+            "(.xlsx) or an OLE2 signature (.xls). A truncated or half-transferred "
+            "attachment looks exactly like this.",
+        )
+    return [_trim_to_grid(name, raw) for name, raw in raw_sheets]
 
-        # Trim trailing empty columns; find the first non-empty column so a
-        # sheet whose data starts at column F doesn't waste tokens on A-E.
-        width = max(len(r) for r in raw)
-        raw = [r + [""] * (width - len(r)) for r in raw]
-        non_empty_cols = [c for c in range(width) if any(r[c] for r in raw)]
-        if not non_empty_cols:
-            grids.append(SheetGrid(name=name, rows=[], first_col=1))
-            continue
-        lo, hi = non_empty_cols[0], non_empty_cols[-1]
-        trimmed = [r[lo : hi + 1] for r in raw]
 
-        # Trim trailing empty rows only -- leading rows are kept so printed row
-        # numbers stay aligned with the real spreadsheet.
-        while trimmed and not any(trimmed[-1]):
-            trimmed.pop()
+def _read_xlsx_sheets(path: Path) -> list[tuple[str, list[list[str]]]]:
+    """Every sheet of a modern (zip/OOXML) workbook, as formatted strings."""
+    wb = open_workbook(path, data_only=True)
+    try:
+        return [
+            (name, [[_fmt(c) for c in row] for row in wb[name].iter_rows(values_only=True)])
+            for name in wb.sheetnames
+        ]
+    finally:
+        try:
+            wb.close()
+        except Exception:  # noqa: BLE001 -- a close failure must not mask the result
+            logger.debug("Ignoring error while closing %s", path.name)
 
-        grids.append(SheetGrid(name=name, rows=trimmed, first_col=lo + 1))
-    return grids
+
+def _read_xls_sheets(path: Path) -> list[tuple[str, list[list[str]]]]:
+    """
+    Every sheet of a legacy OLE2/BIFF workbook, as formatted strings.
+
+    xlrd 2.x reads `.xls` and nothing else, which is exactly the split we want:
+    openpyxl for OOXML, xlrd for BIFF, chosen by signature.
+
+    Two conversions matter for parity with the openpyxl path, because the whole
+    point is that downstream code cannot tell which reader ran:
+
+      - **Dates.** BIFF stores a date as a float with a workbook-level epoch, so
+        an unconverted cell renders as `46244` where the `.xlsx` path renders a
+        real date. Converted here using the book's own `datemode`.
+      - **Numbers.** Everything numeric arrives as a float, so a size cell holding
+        30 arrives as `30.0`. `_fmt` already renders an integral float as `30`,
+        which is what the size list holds and what a human sees in Excel.
+    """
+    import xlrd
+
+    try:
+        book = xlrd.open_workbook(str(path))
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad; classified below
+        raise DocumentUnreadable(path, _describe_open_failure(exc, path), exc) from exc
+
+    out: list[tuple[str, list[list[str]]]] = []
+    try:
+        for name in book.sheet_names():
+            sheet = book.sheet_by_name(name)
+            rows = [
+                [
+                    _fmt(_xls_cell_value(sheet.cell(r, c), book.datemode))
+                    for c in range(sheet.ncols)
+                ]
+                for r in range(sheet.nrows)
+            ]
+            out.append((name, rows))
+    finally:
+        try:
+            book.release_resources()
+        except Exception:  # noqa: BLE001
+            logger.debug("Ignoring error while releasing %s", path.name)
+    return out
+
+
+def _xls_cell_value(cell: Any, datemode: int) -> Any:
+    """One BIFF cell as the Python value openpyxl would have produced."""
+    import xlrd
+
+    if cell.ctype == xlrd.XL_CELL_DATE:
+        try:
+            return xlrd.xldate_as_datetime(cell.value, datemode)
+        except (ValueError, OverflowError):
+            # An out-of-range serial is real vendor data, not a reason to fail:
+            # keep the raw number so a human can see what was in the cell.
+            return cell.value
+    if cell.ctype == xlrd.XL_CELL_BOOLEAN:
+        return bool(cell.value)
+    if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+        return None
+    if cell.ctype == xlrd.XL_CELL_ERROR:
+        return None  # a formula error cell; openpyxl data_only gives None too
+    return cell.value
+
+
+def _trim_to_grid(name: str, raw: list[list[str]]) -> SheetGrid:
+    """Trim a raw string matrix's empty edges into a SheetGrid."""
+    if not raw:
+        return SheetGrid(name=name, rows=[], first_col=1)
+
+    # Trim trailing empty columns; find the first non-empty column so a sheet
+    # whose data starts at column F doesn't waste tokens on A-E.
+    width = max(len(r) for r in raw)
+    padded = [r + [""] * (width - len(r)) for r in raw]
+    non_empty_cols = [c for c in range(width) if any(r[c] for r in padded)]
+    if not non_empty_cols:
+        return SheetGrid(name=name, rows=[], first_col=1)
+    lo, hi = non_empty_cols[0], non_empty_cols[-1]
+    trimmed = [r[lo : hi + 1] for r in padded]
+
+    # Trim trailing empty rows only -- leading rows are kept so printed row
+    # numbers stay aligned with the real spreadsheet.
+    while trimmed and not any(trimmed[-1]):
+        trimmed.pop()
+
+    return SheetGrid(name=name, rows=trimmed, first_col=lo + 1)
 
 
 def plan_windows(

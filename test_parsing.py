@@ -93,6 +93,21 @@ SYMMETRY_PAYMENT_REQUEST = HERE / "fixtures" / "SD Vendor Payment Request SAMPLE
 SYMMETRY_INSPECTION = HERE / "FA26 7TH W600001 PO1721 FINAL INSPECTION REPORT.pdf"
 SYMMETRY_INSPECTION_2 = HERE / "FA26 7TH W520005 PO#1721 FINAL INSPECTION REPORT.pdf"
 
+# The two NUMERICALLY-sized vendors, and between them all three of the pre-matcher
+# defects found on their first run:
+#   - the footwear workbook's name is invoice-shaped, so it was excluded UNOPENED,
+#     losing the three `PO-1624 ...` packing sheets inside it;
+#   - its size header is a row of bare numbers ('8'..'14'), which the letter-only
+#     detector could not see;
+#   - Tainan's packing list is a legacy OLE2/BIFF `.xls` that openpyxl cannot open
+#     at all, and it is the ONLY size-level source for its PO.
+# The footwear file here is the invoice-sheet-removed copy: the original carried
+# the mill's bank details on a fourth tab (RUNBOOK section 6 item 1).
+FOOTWEAR_XLSX = HERE / "FW26 footwear PO-1624 packing sheets (invoice sheet removed).xlsx"
+TAINAN_XLS = (
+    HERE / "50144--- PO 0001725   packing list  ( Correction on Aug.10 from Aug.07 ).xls"
+)
+
 #: Hand-derived from the Legendz sheet: carton rows aggregated per size, with the
 #: per-block subtotal rows (11/14/18) and GRAND TOTAL (19) excluded.
 LEGENDZ_EXPECTED = {
@@ -1143,11 +1158,278 @@ def test_size_header_canonical(tmp: Path) -> None:
     check(ac._find_size_header_row(g) is None, "unrelated headers are not mistaken for sizes",
           str(ac._find_size_header_row(g)))
 
-    check(canonical("\uff12\uff38") in ac._SIZE_TOKENS_CANON,
-          "the canonical token set contains the folded form of 2X")
-    check(len(ac._SIZE_TOKENS_CANON) == len({canonical(t) for t in ac._SIZE_TOKENS}),
-          "canonical token set is derived from _SIZE_TOKENS, not duplicated by hand")
+    # The vocabulary itself: canonical, and READ FROM NETSUITE rather than typed
+    # here. `_SIZE_TOKENS` used to be a hand-written letter-size set, which is
+    # exactly what made every numeric size the company sells invisible.
+    vocab = ac._size_vocabulary()
+    check(canonical("\uff12\uff38") in vocab,
+          "the canonical vocabulary contains the folded form of 2X")
+    check(all(canonical(t) in vocab for t in ("XS", "2X", "3X", "L")),
+          "letter sizes from the account's own list are present")
+    check(not hasattr(ac, "_SIZE_TOKENS"),
+          "the hand-written size set is GONE, not merely supplemented")
 
+
+
+def test_filename_never_excludes(tmp: Path) -> None:
+    section("a filename may prioritise or deprioritise — NEVER exclude")
+    import attachment_classifier as ac
+
+    if not FOOTWEAR_XLSX.exists():
+        _missing_coverage.append(
+            f"filename-exclusion regression test skipped: {FOOTWEAR_XLSX.name} is absent"
+        )
+        print("  [MISSING] the footwear workbook is absent")
+        return
+
+    def verdicts(*specs):
+        return response(
+            ac._ContentVerdicts(
+                verdicts=[
+                    ac._ContentVerdict(doc_type=dt, has_size_breakdown=sz, reason=why)
+                    for dt, sz, why in specs
+                ]
+            )
+        )
+
+    # Under the name Paula's vendor actually sent it under. The copy in the repo
+    # was renamed when its invoice sheet was stripped, and the original name is the
+    # whole point of this test: "Clearance Invoice" says invoice and nothing else.
+    as_sent = tmp / "FW26 STRAIGHT DOWN CMG26A019A PO-1624 USA -  Clearance Invoice.xlsx"
+    as_sent.write_bytes(FOOTWEAR_XLSX.read_bytes())
+
+    # The name is invoice-shaped, and unambiguously so -- this is the rule that
+    # used to fire and skip the content check entirely.
+    hint, ambiguous, _reason = ac.classify_by_filename(as_sent.name)
+    check(hint == ac.DocType.COMMERCIAL_INVOICE,
+          "the name reads as a commercial invoice (the hint is unchanged)", hint.value)
+    check(not ambiguous, "and reads that way CONFIDENTLY -- which is what made it dangerous")
+
+    # THE DEFECT: it was excluded on that hint alone, unopened. Now content
+    # decides, so a verdict of "packing list with sizes" selects it.
+    client, parse = fake_client([verdicts(("packing_list", True, "H8 'Packing list', per-size grid"))])
+    result = ac.classify_attachments([as_sent], extractor=ce.ClaudeExtractor(client=client))
+
+    check(len(parse.calls) == 1, "the file was sent for content classification at all",
+          f"{len(parse.calls)} call(s)")
+    selected = result.selected
+    check(len(selected) == 1, "an invoice-NAMED file that content vouches for is SELECTED",
+          f"{len(selected)} selected, {len(result.excluded)} excluded")
+    if selected:
+        item = selected[0]
+        check(item.preview_chars > 0, "it was actually opened and previewed",
+              f"{item.preview_chars} preview chars")
+        check(item.method == "filename+content", "the verdict is content-based", item.method)
+        check(item.doc_type == ac.DocType.PACKING_LIST, "content overrode the name")
+        check(item.filename_hint == ac.DocType.COMMERCIAL_INVOICE,
+              "and the name's claim is KEPT as the audit trail for the disagreement")
+
+    # Every sheet of it reaches sheet-level classification -- the three packing
+    # sheets were the actual loss, and they can only be found by opening the file.
+    grids = [g for g in ce.read_workbook_grids(as_sent) if not g.is_empty]
+    check(len(grids) == 3, "all three PO-1624 sheets are readable", str([g.name for g in grids]))
+    client, parse = fake_client(
+        [verdicts(*[("packing_list", True, "Packing list with an 8-14 size row")] * 3)]
+        + [
+            response(packing(lines=[line(po="1624", style="20138", color="PAT", size="9", qty=24)]))
+            for _ in range(3)
+        ]
+    )
+    dp.parse_packing_slip(as_sent, extractor=ce.ClaudeExtractor(client=client), force="claude")
+    extracted = [
+        t
+        for call in parse.calls[1:]
+        for t in (b["text"] for b in call["messages"][0]["content"])
+    ]
+    check(sum("PO-1624" in t for t in extracted) == 3,
+          "all THREE packing-list sheets go to extraction, not one and not none",
+          f"{len(parse.calls) - 1} extraction call(s)")
+
+    # Deprioritise, not exclude: given two content-vouched packing lists, the one
+    # whose NAME also says packing list is primary -- but the other is still
+    # selected and still available as a cross-check.
+    packing_named = tmp / "vendor PACKING LIST.xlsx"
+    write_inprotex_like(packing_named)
+    client, _parse = fake_client([
+        verdicts(("packing_list", True, "size grid"), ("packing_list", True, "size grid"))
+    ])
+    both = ac.classify_attachments(
+        [as_sent, packing_named], extractor=ce.ClaudeExtractor(client=client)
+    )
+    check(len(both.selected) == 2, "both are selected", str(len(both.selected)))
+    if both.primary:
+        check(both.primary.path == packing_named,
+              "the packing-NAMED one is primary (the name prioritises)", both.primary.path.name)
+        check(any(c.path == as_sent for c in both.cross_checks),
+              "the invoice-named one is deprioritised but retained as a cross-check")
+
+    # The one exception, unchanged: the inspection-report ban is keyed on document
+    # TYPE and is Paula's ruling, not a filename heuristic.
+    if SYMMETRY_INSPECTION.exists():
+        res = ac.classify_attachments([SYMMETRY_INSPECTION], use_content_check=False)
+        check(res.excluded and res.excluded[0].preview_chars == 0,
+              "the inspection-report ban still short-circuits BEFORE any content read")
+
+
+def test_numeric_size_headers(tmp: Path) -> None:
+    section("size-header detection: numbers, not just letters")
+    import attachment_classifier as ac
+    import size_vocabulary as sv
+
+    # The vocabulary comes from the account, so the detector cannot drift from it.
+    snapshot = sv.load_snapshot()
+    check(snapshot["source_list"] == "customlist_psgss_product_size",
+          "the vocabulary is the NetSuite size list", snapshot["source_list"])
+    labels = sv.size_labels()
+    for label in ("8", "14", "30", "42", "9.5", "32-34", "ALL"):
+        check(label in labels, f"the account's list carries {label!r}")
+
+    # Rendering: a float cell must land on the label the list actually holds.
+    check(sv.numeric_label("8") == "8", "a bare string integer")
+    check(sv.numeric_label(30.0) == "30", "a FLOAT 30.0 renders as '30', not '30.0'",
+          repr(sv.numeric_label(30.0)))
+    check(sv.numeric_label("9.5") == "9.5", "a decimal keeps its half size")
+    check(sv.numeric_label("10.50") == "10.5", "trailing zeros trimmed to the list's spelling",
+          repr(sv.numeric_label("10.50")))
+    check(sv.numeric_label("8-14#") is None, "a size RANGE annotation is not a bare number")
+    check(sv.numeric_label("Qty 8") is None, "and neither is a labelled number")
+
+    def grid(*rows):
+        return ce._trim_to_grid("SHEET", [[str(c) for c in row] for row in rows])
+
+    # -- the two real rows this was blind to --------------------------------
+    if FOOTWEAR_XLSX.exists():
+        sheets = [g for g in ce.read_workbook_grids(FOOTWEAR_XLSX) if not g.is_empty]
+        found = ac._find_size_header_row(sheets[0])
+        check(found == 28, "footwear: the REAL K28..Q28 '8'..'14' row is the size header",
+              f"row {found}")
+
+    if TAINAN_XLS.exists():
+        sheets = [g for g in ce.read_workbook_grids(TAINAN_XLS) if not g.is_empty]
+        found = ac._find_size_header_row(sheets[0])
+        check(found == 7, "Tainan: the REAL I7..O7 waist row (floats 30.0..42.0) is found",
+              f"row {found}")
+
+    # -- a decimal footwear scale, which only exists in the numeric path -----
+    g = grid(["CTN", "COLOR", "8", "9", "9.5", "10", "10.5", "11", "TOTAL"])
+    check(ac._find_size_header_row(g) == 1, "a half-size row (9.5 / 10.5) is a size header",
+          str(ac._find_size_header_row(g)))
+
+    # -- waist-inseam pairs, exempt from the ascending test because the label
+    #    itself is unmistakable ------------------------------------------------
+    g = grid(["SIZE", "30-32", "30-34", "32-32", "32-34"])
+    check(ac._find_size_header_row(g) == 1, "waist-inseam pairs are recognised as written",
+          str(ac._find_size_header_row(g)))
+
+    # -- NEGATIVE CONTROLS: bare numbers that are NOT sizes ------------------
+    # Taken from the real sheets, because a synthetic non-size row proves less.
+    # Footwear row 29 is a carton line: 1, 3, 24, 8, 3, 24, 7.2, 21.6, 11, 33...
+    g = grid(["CARTON", 1, 3, 24, 8, 3, 24, 7.2, 21.6, 11, 33])
+    check(ac._find_size_header_row(g) is None,
+          "a real CARTON/quantity row is not mistaken for a size header",
+          str(ac._find_size_header_row(g)))
+
+    # Tainan row 14, a quantity line: 30, 30, 3, 90, 6 -- three list-valid values
+    # but not ascending.
+    g = grid(["4-6", 13.75, 12.6, 30, 30, 3, 90, 6])
+    check(ac._find_size_header_row(g) is None,
+          "quantities that HAPPEN to be valid sizes are rejected for not ascending",
+          str(ac._find_size_header_row(g)))
+
+    # Ascending, but not sizes.
+    g = grid(["CTN", 1, 3, 5, 7, 15, 17])
+    check(ac._find_size_header_row(g) is None,
+          "ascending numbers absent from the size list are rejected",
+          str(ac._find_size_header_row(g)))
+
+    # Two hits is not enough, however valid.
+    g = grid(["CTN", 8, 100, 200])
+    check(ac._find_size_header_row(g) is None, "two valid labels is under the threshold",
+          str(ac._find_size_header_row(g)))
+
+    # And a descending size row is still a size row only if it is not all-numeric:
+    # letters carry their own order.
+    g = grid(["SIZE", "XL", "L", "M", "S"])
+    check(ac._find_size_header_row(g) == 1,
+          "a DESCENDING letter row is still a size header (order is only tested on numbers)",
+          str(ac._find_size_header_row(g)))
+
+
+def test_legacy_xls_reader(tmp: Path) -> None:
+    section("legacy .xls (OLE2/BIFF), routed by magic bytes")
+
+    if not TAINAN_XLS.exists():
+        _missing_coverage.append(f".xls reader test skipped: {TAINAN_XLS.name} is absent")
+        print("  [MISSING] the Tainan .xls is absent")
+        return
+
+    check(TAINAN_XLS.read_bytes()[:8].hex() == "d0cf11e0a1b11ae1",
+          "the file really is an OLE2 compound document")
+    check(ce.sniff_format(TAINAN_XLS) == ce.FORMAT_XLS, "sniffed as xls",
+          ce.sniff_format(TAINAN_XLS))
+
+    grids = ce.read_workbook_grids(TAINAN_XLS)
+    names = [g.name for g in grids]
+    check(len(grids) >= 1, "the workbook opens and its sheets are enumerable", str(names))
+    check(names == ["ACT", "REV"], "both sheets are present, in order", str(names))
+
+    body = grids[0]
+    check(body.n_rows > 100, "rows are read, not just the sheet list", f"{body.n_rows} rows")
+    rendered = body.render(1, 10)
+    check("TAINAN" in rendered.upper(), "cell text survives the BIFF read")
+    check("30" in rendered and "42" in rendered, "and the numeric waist row is in the grid")
+    # Parity with the openpyxl path: an integral float must not render as '30.0'.
+    check("30.0" not in rendered, "an integral float is rendered as an integer, as openpyxl does")
+    # A BIFF date is a float with a workbook epoch; unconverted it renders as 46244.
+    check("46244" not in rendered, "a BIFF date serial is converted, not printed raw")
+    check("2026" in rendered, "the converted date shows a real year")
+
+    # Signature, not extension: a renamed file lands on the right reader.
+    renamed = tmp / "actually_an_xls.xlsx"
+    renamed.write_bytes(TAINAN_XLS.read_bytes())
+    check(ce.sniff_format(renamed) == ce.FORMAT_XLS, "a mislabelled .xlsx is still sniffed as xls")
+    check([g.name for g in ce.read_workbook_grids(renamed)] == names,
+          "and reads identically despite the wrong suffix")
+
+    if LEGENDZ_XLSX.exists():
+        mislabelled = tmp / "actually_an_xlsx.xls"
+        mislabelled.write_bytes(LEGENDZ_XLSX.read_bytes())
+        check(ce.sniff_format(mislabelled) == ce.FORMAT_XLSX,
+              "and the reverse: a mislabelled .xls is sniffed as xlsx")
+        check(len(ce.read_workbook_grids(mislabelled)) >= 1, "and reads on the openpyxl path")
+
+    # The classifier no longer excludes it as unopenable -- that exclusion is what
+    # blocked the vendor entirely.
+    import attachment_classifier as ac
+
+    check(ac.open_failure_reason(TAINAN_XLS) is None,
+          "triage reports NO open failure for a legacy .xls")
+    preview = ac._preview(TAINAN_XLS)
+    check(len(preview) > 0, "and a preview is built for it", f"{len(preview)} chars")
+    check("ACT" in preview, "the preview names its sheets")
+
+    # open_workbook stays openpyxl-only, and says so usefully rather than leaking
+    # an InvalidFileException.
+    expect_raises(
+        ce.DocumentUnreadable,
+        lambda: ce.open_workbook(TAINAN_XLS),
+        "open_workbook refuses an .xls with an actionable reason",
+    )
+
+    # A PDF handed to the workbook reader is a routing bug, not a corrupt file.
+    if SYMMETRY_COVERING.exists():
+        expect_raises(
+            ce.DocumentUnreadable,
+            lambda: ce.read_workbook_grids(SYMMETRY_COVERING),
+            "a PDF sent to read_workbook_grids is reported as a PDF",
+        )
+
+    junk = tmp / "notes.txt"
+    junk.write_text("just some text", encoding="utf-8")
+    check(ce.sniff_format(junk) == ce.FORMAT_UNKNOWN, "unknown bytes -> FORMAT_UNKNOWN")
+    reason = ac.open_failure_reason(junk)
+    check(reason is not None and "leading bytes" in reason,
+          "and triage excludes it explicitly rather than silently", str(reason))
 
 
 def test_canonical_form(tmp: Path) -> None:
@@ -2856,6 +3138,8 @@ def main() -> int:
             test_deterministic_validation, test_shipping_advice_routing,
             test_shipping_date_label_anchoring, test_pdf_layout_rendering,
             test_multidoc_call_shape, test_attachment_classifier_offline,
+            test_filename_never_excludes, test_numeric_size_headers,
+            test_legacy_xls_reader,
             test_canonical_form, test_size_header_canonical,
             test_verbatim_source_preserved,
             test_matcher_canonical_both_sides,

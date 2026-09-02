@@ -19,11 +19,27 @@
 credentials
 credentials.json
 
-# Real vendor documents containing banking details live outside the project at
-# %USERPROFILE%\.po-agent\vendor-documents-private\ — see RUNBOOK §6 item 1.
-# Scoped to the project root: fixtures/ holds the SYNTHETIC stand-in, which the
-# attachment-classifier tests need and which contains no real banking details.
+# Real vendor documents containing banking or third-party commercial data live
+# outside the project at %USERPROFILE%\.po-agent\vendor-documents-private\ — see
+# RUNBOOK §6 item 1. Scoped to the project root: fixtures/ holds the SYNTHETIC
+# stand-in, which the attachment-classifier tests need and which contains no
+# real banking details.
+#
+# These patterns are a net for the NEXT arrival, not a fix for the files already
+# moved (those never reached a commit). A vendor document SET routinely attaches
+# an invoice, a payment request and a bill of lading alongside the packing list,
+# and those carry bank accounts, SWIFT codes, MID codes and other customers'
+# names even when the packing list itself is clean. So the invoice-shaped members
+# of a set are ignored by default and admitted only deliberately.
 /*Payment Request*.pdf
+/*COMMERCIAL INVOICE*.xls
+/*COMMERCIAL INVOICE*.xlsx
+/*Clearance Invoice*.xls
+/*Clearance Invoice*.xlsx
+/*Payment invoice*.xls
+/*Payment invoice*.xlsx
+/*HBL*.pdf
+/*BILL OF LADING*.pdf
 
 # ---------------------------------------------------------------------------
 # Python

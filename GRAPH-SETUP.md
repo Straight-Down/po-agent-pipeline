@@ -11,13 +11,12 @@ convention, not a new one invented for this document — and it is also what kee
 `test_config.test_no_credentials_in_tracked_files` passing, since that scan fails
 on any GUID-shaped string in a tracked file.
 
-One place this doc deliberately differs from its predecessor: `NETSUITE-M2M-SETUP.md`
-Step 6 offers *"just paste those three values back to me in chat and I'll write the
-file"*. Don't. They are identifiers rather than secrets, so it is not an incident —
-but a chat transcript is a permanent record that nothing in this repo controls,
-and this project has already had sensitive values end up in a permanent record
-while being carefully removed from the working tree (RUNBOOK §8 lesson 13). Type
-them into `.env` directly; nobody needs them in two places.
+**Values go in `.env`, never in chat.** Identifiers are not secrets, so pasting
+one is not an incident — but a chat transcript is a permanent record that nothing
+in this repo controls, and this project has already had sensitive values end up in
+a permanent record while being carefully removed from the working tree (RUNBOOK
+§8 lesson 13). Nothing is gained by routing them through anyone. Same rule in
+`NETSUITE-M2M-SETUP.md` Step 6.
 
 ---
 
@@ -128,12 +127,16 @@ uploaded is not this one.
 
 `Mail.Read` **application** permission, admin-consented.
 
-**Scoping: REQUESTED 2026-09-09, NOT CONFIRMED.**
+**Scoping: CONFIRMED BY IT, 2026-09-09 — scoped to the single mailbox.**
 
-This is the one item in the whole setup that fails silently *toward more access*,
-so it does not get to sit as an assumption. `Mail.Read` app-only grants the
-application read access to **every mailbox in the tenant** unless an application
-access policy restricts it to specific ones:
+**How it was confirmed matters, and the distinction is deliberate: this is
+ASSERTED BY IT, not OBSERVED.** IT stated the permission is restricted to the one
+mailbox. Nothing in this repo has yet watched a request to a different mailbox be
+refused, and the two are not the same kind of evidence — an assurance can be
+mistaken, out of date, or about a different app registration.
+
+`Mail.Read` app-only grants read access to **every mailbox in the tenant** unless
+an application access policy restricts it:
 
 ```powershell
 New-ApplicationAccessPolicy -AppId <application (client) id> `
@@ -143,12 +146,15 @@ New-ApplicationAccessPolicy -AppId <application (client) id> `
 
 **The pipeline behaves identically whether or not that policy exists.** It reads
 one mailbox either way, every test passes either way, and no error, log line or
-API response distinguishes the two. So it cannot be verified by observation from
-here — only by asking IT to confirm the policy is in place, or by attempting to
-read a mailbox that *should* be denied and seeing it refused.
+API response distinguishes the two. That is why this item cannot be closed by
+watching the pipeline work — it is the one part of the setup that fails silently
+*toward more access*, so success proves nothing about scope.
 
-Until confirmed, treat this application as having tenant-wide mail read access
-and say so to anyone who asks what it can reach.
+**To turn the assurance into an observation, run `scripts/probe_graph_auth.py`.**
+Its step (d) requests a mailbox that should be denied and asserts a `403`. A `200`
+there would mean the grant is tenant-wide regardless of what was assured, which
+is exactly the finding an assurance cannot produce. Re-run it after any change to
+the app registration, and at rotation.
 
 ## Step 5 — Fill in `.env`
 
@@ -223,19 +229,18 @@ working credential.
 
 ---
 
-## Open item — an earlier certificate
+## Certificates on the registration — CONFIRMED CLEAN, 2026-09-09
 
-**IT generated a certificate for this application before the one above.** If it
-is still on the app registration it is an **unclaimed public key**: nobody in
-this project holds its private half, so it cannot be used by this pipeline, and
-its presence means the application will accept an assertion signed by whoever
-does hold that key.
+IT confirmed the registration carries **exactly one** certificate,
+`E05CF5DB8EBFC7CAF259FD5EA6678B966353F016` — ours, and the only one. An earlier
+certificate had been suspected; it does not exist.
 
-Not urgent and not evidence of anything wrong — most likely a first attempt
-superseded when this pair was generated. But it should be removed, and removal is
-free since nothing here depends on it. Ask IT to list the certificates on the
-registration; anything whose thumbprint is not
-`E05CF5DB8EBFC7CAF259FD5EA6678B966353F016` is not ours.
+Worth re-checking at rotation, since that is the one moment two certificates are
+deliberately present at once (see step 4 of Rotation) and the whole point is that
+only one survives. Any thumbprint on the registration other than the one in
+`.env` is an **unclaimed public key**: nobody here holds its private half, so it
+cannot serve this pipeline, and its presence means the application would accept
+an assertion signed by whoever does hold it.
 
 ---
 

@@ -194,9 +194,13 @@ NS_CERTIFICATE_ID=<Certificate ID from Step 5>
 
 `NS_PRIVATE_KEY_PATH` is already correct. `.env` is gitignored.
 
-You can also just paste those three values back to me in chat and I'll write the
-file — they're identifiers, not secrets (the private key is the secret, and it
-never moves).
+**Edit `.env` directly — these values do not go in chat.** They are identifiers
+rather than secrets (the private key is the secret, and it never moves), so
+pasting one is not an incident. The reason is durability, not sensitivity: **a
+value typed into a chat persists in a transcript long after it stops being useful
+there**, in a place this repo does not control and cannot clean up. There is
+nothing to gain — appending a line to a file is not work that needs delegating —
+and a permanent copy to lose. Same rule in `GRAPH-SETUP.md`.
 
 ---
 

@@ -322,13 +322,13 @@ class NetSuiteConfig:
         Load from environment / .env. Raises NetSuiteConfigError listing every
         missing variable at once rather than failing one at a time.
         """
-        try:
-            from dotenv import load_dotenv
+        # ONE function reads `.env`, shared with `config.GraphConfig.from_env`.
+        # Two loaders would mean two places to keep in step and two error
+        # conventions -- see config.py's module docstring on why that matters
+        # here specifically.
+        from config import load_env_file
 
-            if dotenv_path and Path(dotenv_path).exists():
-                load_dotenv(dotenv_path)
-        except ImportError:  # dotenv is convenience, not a requirement
-            pass
+        load_env_file(dotenv_path)
 
         required = {
             "NS_ACCOUNT_ID": os.environ.get("NS_ACCOUNT_ID"),

@@ -113,6 +113,11 @@ class IngestReport:
     colour_names: dict = field(default_factory=dict)
     unpopulated: list = field(default_factory=list)
     parse_warnings: list = field(default_factory=list)
+    #: Which source sheet supplied the matched lines, and why -- recorded
+    #: rather than left implicit in which rows happened to match. See
+    #: matcher.describe_sheet_selection.
+    source_sheets: list = field(default_factory=list)
+    sheet_selection: str = ""
 
     def summary(self) -> str:
         rows = ", ".join(f"{k}={v}" for k, v in sorted(self.rows.items()) if v)
@@ -540,6 +545,16 @@ def ingest_shipment(
         colour_lookups=colour_lookups,
     )
 
+    # WHICH sheet supplied the matched lines. A multi-sheet workbook can hold
+    # two documents describing one shipment -- Tainan sends a packing record and
+    # an 8%-target plan in one file -- and the plan losing on a style code the PO
+    # does not carry is the right outcome by coincidence, not by decision. This
+    # records the choice so a change in that coincidence is visible.
+    report.source_sheets = mt.source_sheet_summary(changes, parsed.lines)
+    report.sheet_selection = mt.describe_sheet_selection(report.source_sheets)
+    if report.sheet_selection:
+        report.parse_warnings.append(report.sheet_selection)
+
     counts = {k: 0 for k in ("shipments", "shipment_sources", "shipment_pos",
                              "proposed_changes", "change_candidates", "audit_log")}
     counts["attachments"] = len(shas)
@@ -673,7 +688,9 @@ def ingest_shipment(
                event="SHIPMENT_INGESTED", now=now, message_id=message_id,
                shipment_id=shipment_id,
                detail={"parser": parsed.parser, "lines": len(parsed.lines),
-                       "states": states, "po_keys": po_keys})
+                       "states": states, "po_keys": po_keys,
+                       "source_sheets": report.source_sheets,
+                       "sheet_selection": report.sheet_selection or None})
         counts["audit_log"] = 1
 
     report.shipment_id = shipment_id

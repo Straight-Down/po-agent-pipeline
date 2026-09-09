@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import asdict, dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
 
 from canonical import canonical
 from netsuite_client import (
@@ -833,6 +833,96 @@ def build_proposed_changes(
         changes.append(change)
 
     return changes
+
+
+def source_sheet_summary(
+    changes: Sequence[ProposedChange], vendor_lines: Sequence[dict]
+) -> list[dict]:
+    """
+    Per source sheet: which styles it carried, and how many of its lines matched.
+
+    `changes` and `vendor_lines` are parallel -- `build_proposed_changes` emits
+    exactly one change per vendor line, in order -- which is the same pairing
+    `ingest` already relies on.
+
+    The sheet label comes from `source_hint` (`ACT!R47` -> `ACT`). A line whose
+    hint names several rows of one sheet still resolves to that sheet; a line with
+    no usable hint is grouped under `''` rather than dropped.
+    """
+    if len(changes) != len(vendor_lines):
+        raise ValueError(
+            f"source_sheet_summary needs parallel inputs: {len(changes)} changes vs "
+            f"{len(vendor_lines)} vendor lines"
+        )
+
+    by_sheet: dict[str, dict] = {}
+    for change, line in zip(changes, vendor_lines):
+        hint = str(line.get("source_hint") or "")
+        sheets = sorted({part.split("!", 1)[0].strip() for part in hint.split(",") if "!" in part})
+        label = sheets[0] if len(sheets) == 1 else (", ".join(sheets) if sheets else "")
+        entry = by_sheet.setdefault(
+            label, {"sheet": label, "styles": set(), "pos": set(), "lines": 0, "matched": 0}
+        )
+        entry["lines"] += 1
+        if change.style_number:
+            entry["styles"].add(change.style_number)
+        if change.po_number:
+            entry["pos"].add(change.po_number)
+        if change.line_id:
+            entry["matched"] += 1
+
+    return [
+        {
+            "sheet": e["sheet"],
+            "styles": sorted(e["styles"]),
+            "po_numbers": sorted(e["pos"]),
+            "lines": e["lines"],
+            "matched": e["matched"],
+        }
+        for e in sorted(by_sheet.values(), key=lambda e: e["sheet"])
+    ]
+
+
+def describe_sheet_selection(summary: Sequence[dict]) -> str:
+    """
+    One sentence recording WHICH sheet supplied the matched lines, and why.
+
+    Exists because the right answer was being reached by accident. Tainan's
+    workbook holds two sheets describing the same shipment: `ACT` (style `50144`,
+    the packing record) and `REV` (style `50144-2`, an 8%-target plan -- see
+    RUNBOOK section 6 item 20). `ACT`'s lines matched PO 1725 and `REV`'s did not,
+    which is the correct outcome, but only because the plan happened to carry a
+    style code the PO does not have. Nothing recorded the choice, so nothing
+    would have noticed if that coincidence stopped holding.
+
+    Same provenance principle as `colour_resolution` and `size_composition`:
+    write down the decision and its reason at the moment it is made, rather than
+    leaving it implicit in which rows survived. Empty string when there is nothing
+    to explain -- one source sheet, or several that all behaved alike.
+    """
+    if len(summary) < 2:
+        return ""
+    matched = [e for e in summary if e["matched"]]
+    unmatched = [e for e in summary if not e["matched"]]
+    if not matched or not unmatched:
+        return ""
+
+    styles = {e["sheet"]: "/".join(e["styles"]) or "(no style)" for e in summary}
+    pos = sorted({p for e in matched for p in e["po_numbers"]})
+    differing = len({tuple(e["styles"]) for e in summary}) > 1
+    return (
+        f"this document contained {len(summary)} sheets with "
+        + ("different style codes" if differing else "the same style code")
+        + "; "
+        + ", ".join(
+            f"{e['sheet']} ({styles[e['sheet']]}) matched PO {'/'.join(pos)}"
+            f" on {e['matched']} of {e['lines']} line(s)"
+            for e in matched
+        )
+        + "; "
+        + ", ".join(f"{e['sheet']} ({styles[e['sheet']]}) did not" for e in unmatched)
+        + ". The matched sheet supplied the shipment quantities."
+    )
 
 
 def unmatched_netsuite_lines(

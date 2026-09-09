@@ -1501,6 +1501,133 @@ def test_size_composition(tmp: Path) -> None:
           "still low confidence, so it still routes to a human")
 
 
+def test_plan_vs_count_signals(tmp: Path) -> None:
+    section("a plan wearing a count's clothes, and which sheet won")
+    import datetime as dt
+
+    import attachment_classifier as ac
+    from netsuite_client import NetSuiteClient, POLine
+
+    # -- the two signals, on the real file ------------------------------------
+    if TAINAN_XLS.exists():
+        grids = {g.name: g for g in ce.read_workbook_grids(TAINAN_XLS) if not g.is_empty}
+        act_notes = ce.derived_quantity_notes(grids["ACT"])
+        rev_notes = ce.derived_quantity_notes(grids["REV"])
+
+        check(not act_notes, "ACT (the packing record) produces NO derived-quantity notes",
+              f"{len(act_notes)} note(s)")
+        check(len(rev_notes) >= 2, "REV (the 8%-target plan) does", f"{len(rev_notes)} note(s)")
+        check(any("ROUNDED" in n and "45" in n for n in rev_notes),
+              "the rounding coupling is named: R47 is R45 rounded",
+              next((n[:70] for n in rev_notes if "ROUNDED" in n), "-"))
+        check(any("x 1.08" in n for n in rev_notes),
+              "and the factor is named: x 1.08 off the ORDER row",
+              next((n[:70] for n in rev_notes if "x 1.08" in n), "-"))
+        check(all("PLAN" in n or "CALCULATION" in n for n in rev_notes),
+              "every note says which kind of document this is")
+
+        # THE POINT of restricting to the size columns. An unrestricted version
+        # fired 47 times on a clean document; per-size weights are the reason.
+        cols = ac.quantity_columns(grids["ACT"])
+        letters = {ce._col_letter(grids["ACT"].first_col + c) for c in cols}
+        check(letters == set("IJKLMNOPQ"),
+              "the shipped columns are the size grid only (I..Q), not the weight columns",
+              str(sorted(letters)))
+
+    # A clean single-axis vendor must stay silent -- these are notes a human
+    # reads, so one that fires on correct documents is worth nothing.
+    for label, path in (("Inprotex", REAL_XLSX), ("Legendz", LEGENDZ_XLSX),
+                        ("Footwear", FOOTWEAR_XLSX)):
+        if not path.exists():
+            continue
+        notes = [n for g in ce.read_workbook_grids(path) if not g.is_empty
+                 for n in ce.derived_quantity_notes(g)]
+        check(not notes, f"{label} produces NO derived-quantity notes", f"{len(notes)} note(s)")
+
+    if REAL_XLSX.exists():
+        # Inprotex's carton rows put a net and a gross weight beside the sizes, and
+        # its carton NUMBERS are list-valid ascending integers, so the permissive
+        # header seek finds dozens of three-label false positives. Only the fullest
+        # runs may define the shipped columns.
+        packing = next(g for g in ce.read_workbook_grids(REAL_XLSX) if g.name == "PACKING")
+        headers = ac.size_header_rows(packing)
+        check(len(headers) > 10,
+              "the permissive header seek finds many candidate rows on this sheet",
+              f"{len(headers)}")
+        widths = {len(cols) for _r, cols in headers}
+        check(len(widths) > 1, "of differing widths", str(sorted(widths)))
+        letters = {ce._col_letter(packing.first_col + c)
+                   for c in ac.quantity_columns(packing)}
+        check(letters == set("GHIJKL"),
+              "but only the full XS..2XL run defines the shipped columns",
+              str(sorted(letters)))
+
+    # -- synthetic controls ---------------------------------------------------
+    def grid(*rows):
+        return ce._trim_to_grid("S", [[str(c) for c in row] for row in rows])
+
+    header = ["", "", "", "", "", "", "", "", "30", "32", "34", "36", "38", "40", "42"]
+    order = ["", "", "", "", "", "", "", "ORDER", 16, 85, 84, 66, 26, 19, 4]
+    uplift = ["", "", "", "", "", "", "", "", 17.28, 91.8, 90.72, 71.28, 28.08, 20.52, 4.32]
+    rounded = ["", "", "", "", "", "", "", "ACTUAL", 17, 92, 91, 71, 28, 21, 4]
+    notes = ce.derived_quantity_notes(grid(header, order, uplift, rounded))
+    check(any("ROUNDED" in n for n in notes), "synthetic: the rounding coupling fires")
+    check(any("1.08" in n for n in notes), "synthetic: the multiple fires with its factor")
+
+    # A genuine tally that happens to be near-proportional must NOT fire: the
+    # ratios have to be consistent to within 2%, which a real count is not.
+    tally = ["", "", "", "", "", "", "", "ACTUAL", 17, 91, 90, 73, 27, 21, 5]
+    notes = ce.derived_quantity_notes(grid(header, order, tally))
+    check(not notes, "synthetic: ACT's real irregular tally does NOT fire", str(notes)[:90])
+
+    # -- which sheet supplied the lines --------------------------------------
+    import matcher as mt
+
+    def vline(style, sheet, size, qty):
+        return {"po_number": "1725", "style_number": style, "color": "NIN", "size": size,
+                "quantity": qty, "confidence": "high", "note": "",
+                "source_hint": f"{sheet}!R47"}
+
+    lines = [vline("50144", "ACT", "30-32", 17), vline("50144", "ACT", "30-34", 5),
+             vline("50144-2", "REV", "30-32", 17), vline("50144-2", "REV", "30-34", 4)]
+    def ns_line(line_id, size, qty):
+        return POLine(
+            line_id=line_id, item=f"50144 : 50144-NIN-{size}", style_number="50144",
+            vendor_name="Tainan", color="NIN", size=size, quantity=qty, units="Ea",
+            expected_receipt_date=dt.date(2026, 9, 1), override_expected_receipt=False,
+            updated_receipt_date=None,
+        )
+
+    ns = [ns_line("1", "30-32", 16), ns_line("8", "30-34", 4)]
+    changes = mt.build_proposed_changes(lines, NetSuiteClient(mock_data={"1725": ns}))
+    summary = mt.source_sheet_summary(changes, lines)
+
+    check(len(summary) == 2, "one summary entry per source sheet", str(len(summary)))
+    by_sheet = {e["sheet"]: e for e in summary}
+    check(by_sheet["ACT"]["matched"] == 2 and by_sheet["ACT"]["styles"] == ["50144"],
+          "ACT's lines matched the PO", str(by_sheet["ACT"]))
+    check(by_sheet["REV"]["matched"] == 0 and by_sheet["REV"]["styles"] == ["50144-2"],
+          "REV's did not -- its style is not on the PO", str(by_sheet["REV"]))
+
+    sentence = mt.describe_sheet_selection(summary)
+    check("ACT (50144) matched PO 1725" in sentence,
+          "the choice is RECORDED, not left implicit in what happened to match",
+          sentence[:80])
+    check("REV (50144-2) did not" in sentence, "naming the sheet that lost, and its style")
+    check("different style codes" in sentence, "and why the two are distinguishable")
+
+    # The pin: if anyone ever makes the non-matching sheet win, this fails.
+    matched_sheets = {e["sheet"] for e in summary if e["matched"]}
+    check(matched_sheets == {"ACT"},
+          "ONLY the packing record supplies matched lines -- never the plan",
+          str(matched_sheets))
+
+    # One sheet, or several that all behave alike: nothing to explain.
+    single = mt.source_sheet_summary(changes[:2], lines[:2])
+    check(mt.describe_sheet_selection(single) == "",
+          "a single-sheet document gets no sheet-selection note")
+
+
 def test_legacy_xls_reader(tmp: Path) -> None:
     section("legacy .xls (OLE2/BIFF), routed by magic bytes")
 
@@ -3301,7 +3428,7 @@ def main() -> int:
             test_shipping_date_label_anchoring, test_pdf_layout_rendering,
             test_multidoc_call_shape, test_attachment_classifier_offline,
             test_filename_never_excludes, test_numeric_size_headers,
-            test_size_composition,
+            test_size_composition, test_plan_vs_count_signals,
             test_legacy_xls_reader,
             test_canonical_form, test_size_header_canonical,
             test_verbatim_source_preserved,

@@ -374,11 +374,30 @@ def _find_size_header_row(grid: Any, vocabulary: Optional[frozenset[str]] = None
     classifier to read, so a false positive costs a few hundred tokens, while a
     false negative sends a whole shipment to manual entry.
     """
+    rows = size_header_rows(grid, vocabulary)
+    return rows[0][0] if rows else None
+
+
+def size_header_rows(
+    grid: Any, vocabulary: Optional[frozenset[str]] = None
+) -> list[tuple[int, list[int]]]:
+    """
+    EVERY size-header row on the sheet, as `(1-based row, [0-based columns])`.
+
+    `_find_size_header_row` takes the first of these; callers that need the
+    *columns* need all of them, because one sheet can carry more than one size
+    header over different column spans. Tainan's does exactly that: the carton
+    grid's waists sit at I..O and the recap block repeats them at K..Q. Anything
+    reasoning about "which columns hold quantities" has to see both, or it will
+    look in the wrong half of the sheet.
+    """
     if vocabulary is None:
         vocabulary = _size_vocabulary()
 
+    found: list[tuple[int, list[int]]] = []
     for index, row in enumerate(grid.rows, start=1):
         labels: set[str] = set()
+        columns: list[int] = []
         numeric_run: list[tuple[int, float]] = []
         all_numeric = True
         for column, cell in enumerate(row):
@@ -386,6 +405,7 @@ def _find_size_header_row(grid: Any, vocabulary: Optional[frozenset[str]] = None
             if label is None:
                 continue
             labels.add(label)
+            columns.append(column)
             if is_number:
                 numeric_run.append((column, float(str(cell).strip())))
             else:
@@ -395,8 +415,36 @@ def _find_size_header_row(grid: Any, vocabulary: Optional[frozenset[str]] = None
             continue
         if all_numeric and not _ascends(numeric_run):
             continue
-        return index
-    return None
+        found.append((index, columns))
+    return found
+
+
+def quantity_columns(grid: Any, vocabulary: Optional[frozenset[str]] = None) -> set[int]:
+    """
+    The 0-based columns that hold per-size quantities on this sheet.
+
+    This is what "a shipped column" means concretely, and it is the discriminator
+    that makes a fractional-quantity signal usable: a packing sheet is full of
+    legitimately fractional numbers -- net and gross weights, cubic metres, unit
+    prices -- and they live in their own columns, outside the size grid. Without
+    this restriction that signal fired 47 times on one clean document.
+
+    **Only the FULLEST header runs count**, and only the columns where a label
+    actually sat. Both restrictions were learned by measuring. `size_header_rows`
+    is deliberately permissive because a false positive there only adds a preview
+    region, and on Inprotex's carton-per-row sheet it finds 48 "headers" -- rows
+    where a carton number, a net weight and a gross weight happen to be three
+    ascending values that all exist in the size list (`E=4, N=6, O=7`). Taking
+    every such row, and filling in the columns between the outermost labels,
+    dragged the carton-number, line-total and both weight columns into the
+    "shipped" region and produced seven spurious notes. A real size header carries
+    the whole run (6 or 7 labels); a coincidence carries exactly the minimum three.
+    """
+    spans = [cols for _row, cols in size_header_rows(grid, vocabulary) if cols]
+    if not spans:
+        return set()
+    widest = max(len(cols) for cols in spans)
+    return {c for cols in spans if len(cols) == widest for c in cols}
 
 
 def _ascends(cells: Sequence[tuple[int, float]]) -> bool:

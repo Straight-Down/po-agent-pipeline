@@ -502,6 +502,148 @@ def _xls_cell_value(cell: Any, datemode: int) -> Any:
     return cell.value
 
 
+#: How far apart two candidate rows' ratios may sit and still count as "one row
+#: is a clean multiple of the other". Loose enough to survive per-cell rounding
+#: of a percentage uplift, tight enough that two unrelated rows do not qualify.
+_MULTIPLE_TOLERANCE = 0.02
+
+#: A multiple this close to 1.0 is the same row twice, not a derived one.
+_MULTIPLE_MIN_DELTA = 0.01
+
+#: Minimum cells a row pair must share before a ratio means anything.
+_MULTIPLE_MIN_CELLS = 4
+
+#: How far apart two rows may sit and still be treated as the same block.
+_NEARBY_ROWS = 12
+
+#: A plan is a modest over- or under-ship of the order. A factor outside this
+#: range is a unit conversion or a weight row measured against a quantity row --
+#: unrestricted, the check reported a weights row as "x 0.00198".
+_MULTIPLE_MIN_FACTOR = 0.5
+_MULTIPLE_MAX_FACTOR = 2.0
+
+
+def derived_quantity_notes(grid: SheetGrid) -> list[str]:
+    """
+    Notes about quantities on this sheet that look CALCULATED rather than counted.
+
+    **Notes, never a gate.** Nothing branches on these; they go into the
+    extraction's warnings so a reviewer reads them. A derived quantity is not
+    wrong -- a vendor is entitled to plan an 8% overship -- it is just not
+    evidence of what shipped, and that distinction is invisible once the figure
+    has been rounded to an integer and put in a column headed ACTUAL.
+
+    Two signals, both learned from Tainan's `REV` sheet (RUNBOOK section 6 item 20):
+
+    1. **A fractional value in a quantity column is not a count.** You cannot ship
+       17.28 pairs of trousers. `REV` carries `17.28, 91.80, 90.72, 71.28, 28.08,
+       20.52, 4.32` on the row above its ACTUAL figures, summing to exactly the
+       324 its ACTUAL claims. That one row is the whole tell.
+    2. **A row that is a clean multiple of another row is a plan wearing a
+       count's clothes.** `REV`'s ACTUAL is `ORDER x 1.08` rounded -- 7 of 7 cells
+       on two of its four blocks. A tally of cartons does not come out as a
+       constant multiple of the order.
+
+    Either signal would have identified that document as a plan with none of the
+    forensics it actually took. Neither is conclusive alone: a genuinely
+    proportional shipment could trip signal 2. That is precisely why these are
+    notes.
+
+    **Both signals are confined to the size columns**, and that restriction is
+    what makes them usable rather than noise. A packing sheet is full of
+    legitimately fractional numbers -- net and gross weights, cubic metres, unit
+    prices -- and an unrestricted version of signal 1 fired 47 times on one clean
+    footwear document. "A fractional quantity in a shipped column" means the size
+    grid specifically; see `attachment_classifier.quantity_columns`.
+    """
+    from attachment_classifier import quantity_columns
+
+    shipped = quantity_columns(grid)
+    if not shipped:
+        return []  # no size grid found: nothing here is a shipped quantity
+
+    notes: list[str] = []
+    numeric_rows: list[tuple[int, dict[int, float]]] = []
+
+    for index, row in enumerate(grid.rows, start=1):
+        values: dict[int, float] = {}
+        for column, cell in enumerate(row):
+            if column not in shipped:
+                continue
+            text = (cell or "").strip()
+            if not text:
+                continue
+            try:
+                values[column] = float(text)
+            except ValueError:
+                continue
+        if len(values) >= _MULTIPLE_MIN_CELLS:
+            numeric_rows.append((index, values))
+
+    # Signal 1: a fractional row that ROUNDS to another row. The coupling is what
+    # makes it mean something -- an uncoupled fractional row in the size columns is
+    # usually a per-size weight, and requiring only "fractional" fired 24 times on
+    # Inprotex's sheet, whose size grid carries a per-unit weight row per block.
+    for row_a, values_a in numeric_rows:
+        if all(v.is_integer() for v in values_a.values()):
+            continue
+        for row_b, values_b in numeric_rows:
+            if row_b == row_a or abs(row_b - row_a) > _NEARBY_ROWS:
+                continue
+            shared = sorted(set(values_a) & set(values_b))
+            if len(shared) < _MULTIPLE_MIN_CELLS:
+                continue
+            if not all(values_b[c].is_integer() and values_b[c] >= 1 for c in shared):
+                continue
+            if any(round(values_a[c]) != values_b[c] for c in shared):
+                continue
+            shown = ", ".join(
+                f"{_col_letter(grid.first_col + c)}={values_a[c]:g}" for c in shared[:8]
+            )
+            notes.append(
+                f"Sheet '{grid.name}' row {row_b} is row {row_a} ROUNDED, across all "
+                f"{len(shared)} shared size column(s) -- row {row_a} holds fractional "
+                f"values ({shown}). You cannot ship a fraction of a garment, so row "
+                f"{row_a} is a CALCULATION and row {row_b} is that calculation rounded, "
+                f"not a tally of what was counted. Check which row the shipped figures "
+                f"were taken from."
+            )
+            break
+
+    # Signal 2: one row is a clean multiple of another. The base row must look
+    # like a quantity row -- whole numbers, all at least 1 -- and the factor must
+    # be a plausible over/under-ship rather than a unit conversion, or a weight
+    # row against a quantity row reports itself as "x 0.00198".
+    # Both directions, with the whole-number row as the BASE. Forward-only missed
+    # the real case: REV puts its uplift row ABOVE the order row it derives from,
+    # so `ORDER x 1.08` is only visible looking backwards.
+    for row_a, values_a in numeric_rows:
+        if not all(v.is_integer() and v >= 1 for v in values_a.values()):
+            continue
+        for row_b, values_b in numeric_rows:
+            if row_b == row_a or abs(row_b - row_a) > _NEARBY_ROWS:
+                continue
+            shared = sorted(set(values_a) & set(values_b))
+            if len(shared) < _MULTIPLE_MIN_CELLS:
+                continue
+            ratios = [values_b[c] / values_a[c] for c in shared]
+            mean = sum(ratios) / len(ratios)
+            if not _MULTIPLE_MIN_FACTOR <= mean <= _MULTIPLE_MAX_FACTOR:
+                continue
+            if abs(mean - 1.0) < _MULTIPLE_MIN_DELTA:
+                continue
+            if max(abs(r - mean) for r in ratios) > _MULTIPLE_TOLERANCE:
+                continue
+            notes.append(
+                f"Sheet '{grid.name}' row {row_b} is row {row_a} x {mean:.4g} across all "
+                f"{len(shared)} shared size column(s) (+/-{_MULTIPLE_TOLERANCE:.0%}). A row "
+                f"that is a clean multiple of another is a PLAN wearing a count's clothes: "
+                f"a tally of cartons does not come out as a constant multiple of the order. "
+                f"Check which of the two the shipped figures were taken from."
+            )
+    return notes
+
+
 def _trim_to_grid(name: str, raw: list[list[str]]) -> SheetGrid:
     """Trim a raw string matrix's empty edges into a SheetGrid."""
     if not raw:
@@ -1161,6 +1303,12 @@ class ClaudeExtractor:
         )
         merged.warnings.extend(skip_notes)
         summaries: list[str] = []
+
+        # Quantities that look calculated rather than counted. Read off the grid
+        # BEFORE extraction, because the tell is a fractional value the model will
+        # legitimately round away on the way into an integer field.
+        for grid in grids:
+            merged.warnings.extend(derived_quantity_notes(grid))
 
         for grid in grids:
             windows = plan_windows(grid, max_rows_per_call, max_chars_per_call)

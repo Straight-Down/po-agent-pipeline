@@ -574,13 +574,23 @@ Two keys, deliberately asymmetric, and the asymmetry is the design rather than a
 
 The consequence worth holding onto: **an assignment case exists precisely because the extraction key splits while the NetSuite key does not.** N rows meet N lines and neither key resolves which goes with which, which is why the outcome is `NEEDS_ASSIGNMENT` and a human — not a cleverer key.
 
-### Migration 0001 does not freeze its seed data, so every state-adding migration must be conditional
+### Migrations freeze their data as literals and import no application code
 
-`0001` writes `change_states` and `change_state_transitions` by importing the **live** `schema.CHANGE_STATES` and `CHANGE_STATE_TRANSITIONS`. That is unlike its view definitions, which it deliberately spells out verbatim so the migration keeps describing what it actually did. The consequence is that **`0001`'s seed changes as `schema.py` evolves**: a database built fresh today already contains a state added last week, while a database that stopped at an older revision does not.
+**The rule, now enforced by a test rather than by discipline:** a migration writes only literals spelled out in the migration itself. `schema.py` is the *runtime* declaration and the thing tests compare against; it is never a source a migration reads. Any edit to it that changes seeded data requires a paired migration carrying its own frozen literal.
 
-So a migration that adds a state cannot simply `INSERT` it — that succeeds on exactly one of the two paths and raises `IntegrityError` on the other. `0004` therefore uses `INSERT ... SELECT ... WHERE NOT EXISTS` for both the state and its transitions. **Every future state-adding migration has to be written the same way**, and this is worth fixing properly at some point by freezing 0001's seed the way its views are frozen.
+**Migration 0001 violated this for three imports** — `CHANGE_STATES`, `CHANGE_STATE_TRANSITIONS` and `VIEWS` — and wrote whatever those held at the moment it ran. **FIXED 2026-09-09**: replaced with literals recovered from git history at 0001's own commit (`11b2817`) — 11 states, 28 transitions, both view definitions as they stood — generated programmatically and verified to round-trip against that commit exactly rather than transcribed.
 
-Found by running the migration, not by reading it — the failure only appears on a fresh build, which is the path a round-trip test exercises.
+**The drift that had already happened was self-correcting, and that was luck, not design.** By 2026-09-09 `schema.py` held 12 states and 32 transitions against 0001's historical 11 and 28. A database at 0003 converged on upgrade because 0004's inserts are conditional — but **0004 was written to make change 8 work, not to repair 0001**. Nothing had been designed to reconcile the two, and the next state-adding migration written without that conditional would have diverged silently.
+
+**No reconciliation migration was added**, deliberately: there is nothing to reconcile (both paths reach 12/32 today), and a reconciler that read `schema.py` to learn the intended set would be the identical time-dependence bug at a higher revision number. If one is ever needed it carries a frozen literal like anything else.
+
+**Two things worth knowing if you ever freeze a literal from history:**
+- **Do not wrap long strings across adjacent literals.** The first generator did, and dropped a space at each join (`'may still be'` `'wanted on the line.'` → `bewanted`), which would have silently changed the seeded descriptions. The frozen block is deliberately unwrapped however long the lines run.
+- **Check view coverage before freezing, or the freeze can create the divergence.** Freezing 0001 to historical DDL would leave a fresh build at head with a stale view *unless* a later migration recreates it from its own literal. Here both views are recreated by 0002, 0003 **and** 0004, and 0004's literals are whitespace-identical to `schema.py`'s current ones — so head produces today's views on every path. Verified rather than assumed, including that 0002's `VIEW_REVIEW_LINES_0001` downgrade literal matches the real historical DDL, so upgrade-to-0001 and downgrade-to-0001 agree.
+
+`test_schema.test_migration_seed_matches_schema` migrates an empty database to head and compares every row and both view definitions against `schema.py`, **in both directions**; `test_migrations_import_no_application_code` parses each migration's AST and rejects any project import. The second is the one that stops the pattern returning.
+
+One historical note kept because it explains why 0004 looks the way it does: while 0001 still imported live, a state-adding migration could not simply `INSERT` — that succeeded on a fresh build (where 0001 had already seeded the new state) and raised `IntegrityError` on a database upgraded from an older revision. 0004 therefore uses `INSERT ... SELECT ... WHERE NOT EXISTS`, which is now belt-and-braces rather than load-bearing. Found by running the migration, not by reading it: the failure appears only on one of the two paths.
 
 ### Migrations: autogenerate cannot see views, and SQLite will not alter under one
 
@@ -769,7 +779,25 @@ Two working consequences:
   these vendors were all in triage, file reading, and key derivation — the parts
   already considered settled.
 
-### 10. A figure is not verified by having appeared in a prior report
+### 10. A runtime-authoritative table seeded from live code makes behaviour depend on WHEN a database was built
+
+Migration 0001 seeded `change_states` and `change_state_transitions` by importing `schema.py` at migration time. `schema.assert_transition` then reads `change_state_transitions` **at runtime** to decide whether a state change is legal. Put those two together and **a database's behaviour is a function of the date it was migrated, not of its revision** — two databases both reporting `0004` could disagree about what the state machine permits.
+
+**The symptom is that there is no symptom.** `alembic current` reports the same revision on both. `alembic check` compares the metadata to the *table shapes* and is silent about row contents. Nothing in the schema, the migration history, or any drift check distinguishes a correct database from a stale one. The divergence surfaces only as a transition being refused on one machine and allowed on another, arbitrarily far from the cause.
+
+Three properties make a bug this shape, and it is worth recognising the combination rather than the instance:
+
+1. **data written by a migration** (so it is fixed at build time),
+2. **sourced from code that keeps changing** (so what gets fixed varies),
+3. **read at runtime to make a decision** (so the variation changes behaviour).
+
+Drop any one and it is merely untidy. A migration that imports a *column list* is caught by `alembic check`. A seeded table nobody reads at runtime is dead weight. This had all three.
+
+**The fix is the test, not the freeze.** Freezing 0001's literals stops the drift already in flight; what stops the next one is `test_migration_seed_matches_schema`, which migrates an empty database to head and compares every row against `schema.py` **in both directions** — the reverse direction being the one that catches a *deletion*, which is the case that makes two databases genuinely disagree. Plus `test_migrations_import_no_application_code`, which rejects the pattern at the source rather than detecting its consequences later.
+
+**Generalisation for the Azure move:** anything a migration writes and the application later reads must be a literal in the migration. Seed rows, enum tables, default configuration, lookup values. If it is worth writing once at build time, it is worth pinning to that build.
+
+### 11. A figure is not verified by having appeared in a prior report
 
 Two of this project's most confident claims were wrong and survived several rounds of citation, because each was re-quoted from the previous write-up instead of re-read from the source.
 
@@ -781,7 +809,7 @@ The rule: **when a number or an elimination matters, re-derive it from the sourc
 
 Corollary, straight from the footwear case: **when the code and the spec disagree, check the source before assuming the code is wrong.** The implementation had reproduced the document faithfully; the specification had not.
 
-### 11. A signal the tool itself writes is an echo, not evidence
+### 12. A signal the tool itself writes is an echo, not evidence
 
 The sharpest trap found so far, and it is invisible unless you ask where a field's value comes from. When the tool needed to pair two shipment rows with two PO lines (§6 item 23), `custcol_override_expected_receipt` and `custcol_sd_updatedreceiptdate` differed within 31 of 73 duplicate groups — the second-best correlation of any field, and semantically plausible: an already-updated line looks like the settled one.
 
@@ -791,7 +819,7 @@ The check is one question, and it generalises to anything learned from live data
 
 Corollary worth keeping: **the most convincing-looking candidate deserves the most suspicion**, because plausibility is exactly what stops anyone checking provenance.
 
-### 12. Describe removed sensitive data by CATEGORY, never by value
+### 13. Describe removed sensitive data by CATEGORY, never by value
 
 **The hygiene commit is the likeliest place for the data to survive, because you are writing about exactly what you took out.** This is not a hypothetical: the 2026-09-02 commit that moved four third-party files out of the working tree **transcribed all four categories verbatim** into its own commit message *and* into the RUNBOOK entry recording the move — a retailer's name, a MID code, a bank account number and a SWIFT code. The tree was clean and the permanent record was not. Caught only because a later audit grepped the unpushed commits rather than trusting the earlier "moved it out" report; fixed by rewriting all seven unpushed commits before anything was pushed.
 

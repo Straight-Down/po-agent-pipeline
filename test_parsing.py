@@ -1187,12 +1187,11 @@ def test_filename_never_excludes(tmp: Path) -> None:
     section("a filename may prioritise or deprioritise — NEVER exclude")
     import attachment_classifier as ac
 
-    if not FOOTWEAR_XLSX.exists():
-        _missing_coverage.append(
-            f"filename-exclusion regression test skipped: {FOOTWEAR_XLSX.name} is absent"
-        )
-        print("  [MISSING] the footwear workbook is absent")
-        return
+    # The corpus fixtures are COMMITTED, so their absence is a failure rather
+    # than a skip. A test that quietly does nothing on a fresh clone is the
+    # regression-test equivalent of a flag that always fires.
+    check(FOOTWEAR_XLSX.exists(), "the footwear fixture is committed, not optional",
+          FOOTWEAR_XLSX.name)
 
     def verdicts(*specs):
         return response(
@@ -1310,17 +1309,17 @@ def test_numeric_size_headers(tmp: Path) -> None:
         return ce._trim_to_grid("SHEET", [[str(c) for c in row] for row in rows])
 
     # -- the two real rows this was blind to --------------------------------
-    if FOOTWEAR_XLSX.exists():
-        sheets = [g for g in ce.read_workbook_grids(FOOTWEAR_XLSX) if not g.is_empty]
-        found = ac._find_size_header_row(sheets[0])
-        check(found == 28, "footwear: the REAL K28..Q28 '8'..'14' row is the size header",
-              f"row {found}")
+    check(FOOTWEAR_XLSX.exists() and TAINAN_XLS.exists(),
+          "both numeric-size fixtures are committed, not optional")
+    sheets = [g for g in ce.read_workbook_grids(FOOTWEAR_XLSX) if not g.is_empty]
+    found = ac._find_size_header_row(sheets[0])
+    check(found == 28, "footwear: the REAL K28..Q28 '8'..'14' row is the size header",
+          f"row {found}")
 
-    if TAINAN_XLS.exists():
-        sheets = [g for g in ce.read_workbook_grids(TAINAN_XLS) if not g.is_empty]
-        found = ac._find_size_header_row(sheets[0])
-        check(found == 7, "Tainan: the REAL I7..O7 waist row (floats 30.0..42.0) is found",
-              f"row {found}")
+    sheets = [g for g in ce.read_workbook_grids(TAINAN_XLS) if not g.is_empty]
+    found = ac._find_size_header_row(sheets[0])
+    check(found == 7, "Tainan: the REAL I7..O7 waist row (floats 30.0..42.0) is found",
+          f"row {found}")
 
     # -- a decimal footwear scale, which only exists in the numeric path -----
     g = grid(["CTN", "COLOR", "8", "9", "9.5", "10", "10.5", "11", "TOTAL"])
@@ -1509,30 +1508,30 @@ def test_plan_vs_count_signals(tmp: Path) -> None:
     from netsuite_client import NetSuiteClient, POLine
 
     # -- the two signals, on the real file ------------------------------------
-    if TAINAN_XLS.exists():
-        grids = {g.name: g for g in ce.read_workbook_grids(TAINAN_XLS) if not g.is_empty}
-        act_notes = ce.derived_quantity_notes(grids["ACT"])
-        rev_notes = ce.derived_quantity_notes(grids["REV"])
+    check(TAINAN_XLS.exists(), "the Tainan fixture is committed, not optional")
+    grids = {g.name: g for g in ce.read_workbook_grids(TAINAN_XLS) if not g.is_empty}
+    act_notes = ce.derived_quantity_notes(grids["ACT"])
+    rev_notes = ce.derived_quantity_notes(grids["REV"])
 
-        check(not act_notes, "ACT (the packing record) produces NO derived-quantity notes",
-              f"{len(act_notes)} note(s)")
-        check(len(rev_notes) >= 2, "REV (the 8%-target plan) does", f"{len(rev_notes)} note(s)")
-        check(any("ROUNDED" in n and "45" in n for n in rev_notes),
-              "the rounding coupling is named: R47 is R45 rounded",
-              next((n[:70] for n in rev_notes if "ROUNDED" in n), "-"))
-        check(any("x 1.08" in n for n in rev_notes),
-              "and the factor is named: x 1.08 off the ORDER row",
-              next((n[:70] for n in rev_notes if "x 1.08" in n), "-"))
-        check(all("PLAN" in n or "CALCULATION" in n for n in rev_notes),
-              "every note says which kind of document this is")
+    check(not act_notes, "ACT (the packing record) produces NO derived-quantity notes",
+          f"{len(act_notes)} note(s)")
+    check(len(rev_notes) >= 2, "REV (the 8%-target plan) does", f"{len(rev_notes)} note(s)")
+    check(any("ROUNDED" in n and "45" in n for n in rev_notes),
+          "the rounding coupling is named: R47 is R45 rounded",
+          next((n[:70] for n in rev_notes if "ROUNDED" in n), "-"))
+    check(any("x 1.08" in n for n in rev_notes),
+          "and the factor is named: x 1.08 off the ORDER row",
+          next((n[:70] for n in rev_notes if "x 1.08" in n), "-"))
+    check(all("PLAN" in n or "CALCULATION" in n for n in rev_notes),
+          "every note says which kind of document this is")
 
-        # THE POINT of restricting to the size columns. An unrestricted version
-        # fired 47 times on a clean document; per-size weights are the reason.
-        cols = ac.quantity_columns(grids["ACT"])
-        letters = {ce._col_letter(grids["ACT"].first_col + c) for c in cols}
-        check(letters == set("IJKLMNOPQ"),
-              "the shipped columns are the size grid only (I..Q), not the weight columns",
-              str(sorted(letters)))
+    # THE POINT of restricting to the size columns. An unrestricted version
+    # fired 47 times on a clean document; per-size weights are the reason.
+    cols = ac.quantity_columns(grids["ACT"])
+    letters = {ce._col_letter(grids["ACT"].first_col + c) for c in cols}
+    check(letters == set("IJKLMNOPQ"),
+          "the shipped columns are the size grid only (I..Q), not the weight columns",
+          str(sorted(letters)))
 
     # A clean single-axis vendor must stay silent -- these are notes a human
     # reads, so one that fires on correct documents is worth nothing.
@@ -1631,10 +1630,8 @@ def test_plan_vs_count_signals(tmp: Path) -> None:
 def test_legacy_xls_reader(tmp: Path) -> None:
     section("legacy .xls (OLE2/BIFF), routed by magic bytes")
 
-    if not TAINAN_XLS.exists():
-        _missing_coverage.append(f".xls reader test skipped: {TAINAN_XLS.name} is absent")
-        print("  [MISSING] the Tainan .xls is absent")
-        return
+    check(TAINAN_XLS.exists(), "the legacy .xls fixture is committed, not optional",
+          TAINAN_XLS.name)
 
     check(TAINAN_XLS.read_bytes()[:8].hex() == "d0cf11e0a1b11ae1",
           "the file really is an OLE2 compound document")

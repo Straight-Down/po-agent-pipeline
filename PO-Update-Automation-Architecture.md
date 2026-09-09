@@ -168,13 +168,13 @@ audit_log
   | Setup | REST Web Services | Full | use the REST API at all |
   | Setup | Log in using OAuth 2.0 Access Tokens | (checkbox) | required for the role to be *selectable* in M2M setup |
   | Setup | **Custom Lists** | View | read `customlist_psgss_product_size` (the size value list) |
-  | Reports | **SuiteAnalytics Workbook** | **Edit** (View untested) | **gates all collection `GET`, `?q=` filtering and SuiteQL** |
+  | Reports | **SuiteAnalytics Workbook** | **Edit** (the only level offered) | **gates all collection `GET`, `?q=` filtering and SuiteQL** |
 
   **Why SuiteAnalytics Workbook is required, and why that is not obvious:** it is the single gate on *every* record COLLECTION endpoint — `GET /purchaseOrder?limit=1`, `?q=` filtering, and `/query/v1/suiteql` — while **single-record `GET`/`PATCH` by internal id is not gated by it at all**. So the role could read and write PO line items perfectly while every list/search/query call returned `400 USER_ERROR`. That asymmetry is the diagnostic signature: by-id works, collections don't. Confirmed as the sole cause by bisect — `Lists > Subsidiaries` and `Lists > Accounts` were added in the same batch, then removed, and collection GET still returns 200 without them.
 
   **Why Custom Lists is separate, and three things worth knowing:** it lives on the **Setup** subtab (not Lists, despite governing what are called lists), it is **not** `Custom Record Entries` (that governs custom *records*), and custom lists carry **no per-list role restriction** — granting it exposes every custom list in the account, not just the size list. Unlike the collection failures this one names itself: `403 INSUFFICIENT_PERMISSION`, *"You need the 'Custom Lists' permission"*.
 
-  **Open least-privilege check before production:** SuiteAnalytics Workbook is on at **Edit**; whether **View** suffices is untested. The pipeline only reads. Test View and downgrade before the Phase 4 cutover.
+  ~~**Open least-privilege check before production:** whether **View** suffices is untested.~~ **RESOLVED 2026-09-09 — `Edit` is the only level this permission offers.** The role editor's level dropdown for `Reports > SuiteAnalytics Workbook` has no `View` option, so `Edit` is the **minimum NetSuite permits** rather than a compromise. Oracle's documentation says *"set the access to Edit"* rather than describing a range. The pipeline only reads, so the instinct that `Edit` looks too broad is sound — there is simply no narrower level to grant, and a planned retest was cancelled rather than run. **Do not re-open.**
 
   **Tried and NOT required for collection access** — two tiers of confidence, kept distinct on purpose:
   - *Confirmed unnecessary:* `Lists > Subsidiaries`, `Lists > Accounts` (added then removed, still 200), and the `Web Services Only Role` checkbox (confirmed harmless in **either** state, for both authentication and the by-id write path; unchecking it did not restore collection access).

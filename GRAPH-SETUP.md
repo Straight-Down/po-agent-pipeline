@@ -15,7 +15,7 @@ on any GUID-shaped string in a tracked file.
 one is not an incident — but a chat transcript is a permanent record that nothing
 in this repo controls, and this project has already had sensitive values end up in
 a permanent record while being carefully removed from the working tree (RUNBOOK
-§8 lesson 13). Nothing is gained by routing them through anyone. Same rule in
+§8 lesson 14). Nothing is gained by routing them through anyone. Same rule in
 `NETSUITE-M2M-SETUP.md` Step 6.
 
 ---
@@ -127,13 +127,23 @@ uploaded is not this one.
 
 `Mail.Read` **application** permission, admin-consented.
 
-**Scoping: CONFIRMED BY IT, 2026-09-09 — scoped to the single mailbox.**
+**Scoping: OBSERVED 2026-09-09 — genuinely restricted to the single mailbox.**
 
-**How it was confirmed matters, and the distinction is deliberate: this is
-ASSERTED BY IT, not OBSERVED.** IT stated the permission is restricted to the one
-mailbox. Nothing in this repo has yet watched a request to a different mailbox be
-refused, and the two are not the same kind of evidence — an assurance can be
-mistaken, out of date, or about a different app registration.
+**How it was established, because that is the part that matters.** IT first
+*asserted* it. That assurance was then **converted into an observation** by
+`scripts/probe_graph_auth.py` step (d), which requested a real, populated second
+mailbox in the same tenant and got:
+
+```
+GET /users/kiko.barroso@straightdown.com/messages?$top=1
+status: 403
+error code: ErrorAccessDenied
+```
+
+An assurance and an observation are not the same kind of evidence — an assurance
+can be mistaken, out of date, or about a different app registration, and one on
+this very setup turned out to be premature the same day (see *Certificates on the
+registration* below). This one held.
 
 `Mail.Read` app-only grants read access to **every mailbox in the tenant** unless
 an application access policy restricts it:
@@ -146,15 +156,22 @@ New-ApplicationAccessPolicy -AppId <application (client) id> `
 
 **The pipeline behaves identically whether or not that policy exists.** It reads
 one mailbox either way, every test passes either way, and no error, log line or
-API response distinguishes the two. That is why this item cannot be closed by
+API response distinguishes the two. That is why this could never be closed by
 watching the pipeline work — it is the one part of the setup that fails silently
-*toward more access*, so success proves nothing about scope.
+*toward more access*, so success proves nothing about scope. Only a request that
+is expected to be **refused** carries information.
 
-**To turn the assurance into an observation, run `scripts/probe_graph_auth.py`.**
-Its step (d) requests a mailbox that should be denied and asserts a `403`. A `200`
-there would mean the grant is tenant-wide regardless of what was assured, which
-is exactly the finding an assurance cannot produce. Re-run it after any change to
-the app registration, and at rotation.
+**Re-run the probe after any change to the app registration, and at rotation.** A
+`200` at step (d) would mean the grant had become tenant-wide, and nothing else
+in the system would notice.
+
+Also settled by the same run: **`Mail.Read` is both granted and admin-consented.**
+Those fail separately and look identical from outside, and step (c) reading the
+target mailbox (`200`, 1 message) proves both — an unconsented application
+permission returns `403` on the call itself. Note that the probe's step (b),
+which inspects the token's `roles` claim, **cannot** establish this: a Graph
+access token is opaque to the client and carries no readable `roles` claim. See
+RUNBOOK §8 lesson 12.
 
 ## Step 5 — Fill in `.env`
 
@@ -201,6 +218,27 @@ Without it, a mismatch surfaces much later as an opaque `AADSTS700027`.
 The printed config shows presence markers rather than values; `repr` deliberately
 carries no identifier, so it is safe in a log line.
 
+### And then verify against Entra, because the above cannot
+
+**Every check in Step 6 passed on 2026-09-09 at a moment when Entra held no
+certificate for this application at all.** They are local checks: they prove the
+pair on this machine is internally consistent, and they are blind to the other
+half of the arrangement. Nothing on this side can tell "correctly configured" from
+"correctly configured and never uploaded".
+
+```bash
+python scripts/probe_graph_auth.py
+```
+
+Four steps, no pipeline code, nothing written anywhere: mint a token, report the
+token's claims, read **one** message header from `GRAPH_MAILBOX`, then request a
+second mailbox that must be refused. It prints status codes and a message
+**count** — never a subject, sender, address or body — and never the token.
+`CLEAN` requires a token, `200` on the target mailbox and `403` on the other.
+
+Run it after any change to the app registration, after rotation, and any time
+the credential chain is in doubt.
+
 ---
 
 ## Rotation — before 2028-09-08
@@ -220,27 +258,59 @@ working credential.
 6. **Update `.env`**: `GRAPH_CERT_THUMBPRINT`, `GRAPH_CERT_PATH`,
    `GRAPH_CERT_PUBLIC_PATH`, `GRAPH_CERT_KEY_ID` — all four, since the paths
    change with the filename.
-7. **Verify** — Step 6. The pairing and thumbprint checks catch a half-finished
-   swap here, on your machine, rather than at the next poll.
-8. **Run a real intake** end to end on the new credential.
+7. **Verify locally** — Step 6. The pairing and thumbprint checks catch a
+   half-finished swap here, on your machine, rather than at the next poll.
+8. **Run `scripts/probe_graph_auth.py`.** This is the step that proves the new
+   certificate actually reached Entra, which step 7 cannot — and it re-checks
+   mailbox scoping at the same time. Then run a real intake end to end.
 9. **Only now**, ask IT to remove the OLD certificate, identified by its
    `keyId` — which is the entire reason `GRAPH_CERT_KEY_ID` is recorded. Keep the
    old key file until this is done and confirmed; delete it afterwards.
 
 ---
 
-## Certificates on the registration — CONFIRMED CLEAN, 2026-09-09
+## Certificates on the registration — RESOLVED 2026-09-09, and the timeline matters
 
-IT confirmed the registration carries **exactly one** certificate,
-`E05CF5DB8EBFC7CAF259FD5EA6678B966353F016` — ours, and the only one. An earlier
-certificate had been suspected; it does not exist.
+**Our certificate is registered and authenticating.** `scripts/probe_graph_auth.py`
+mints a token with it, so this is observed rather than reported.
 
-Worth re-checking at rotation, since that is the one moment two certificates are
-deliberately present at once (see step 4 of Rotation) and the whole point is that
-only one survives. Any thumbprint on the registration other than the one in
-`.env` is an **unclaimed public key**: nobody here holds its private half, so it
-cannot serve this pipeline, and its presence means the application would accept
-an assertion signed by whoever does hold it.
+The route there is worth keeping, because it is the clearest example in this
+project of a confirmation being honest and the state being wrong anyway:
+
+| When | What |
+|---|---|
+| morning, 2026-09-09 | IT confirmed the certificate for this app is `E05CF5DB…F016` — **correct**, and it was the only one |
+| 21:13 UTC | first probe run: **`AADSTS700027` — "the key was not found"**. Entra did not hold that thumbprint for `<application (client) id>` |
+| immediately after | the local pair re-verified as provably correct — thumbprint matches the certificate, key and certificate are a genuine pair — which isolated the fault to the **Entra side** rather than leaving it ambiguous |
+| later, same day | IT completed the upload; the probe authenticates |
+
+**The confirmation answered "is this the right thumbprint?", and it did so
+accurately. It could not answer "has it been uploaded", because that was never
+the question.** Recorded as RUNBOOK §8 lesson 11.
+
+Note what made this diagnosable rather than a mystery: `AADSTS700027` names the
+thumbprint the client offered *and* the app id it was offered to, so the two
+sides could be compared. That is why the probe prints Microsoft's error text
+verbatim while redacting its own preamble.
+
+### Is an earlier certificate still present?
+
+**Unknown from here, and it needs IT to look.** The probe authenticates *as* the
+application; listing a registration's certificates requires
+`Application.Read.All`, which this app does not have and should not be given for
+this purpose. So the probe proves **ours is present** and can say nothing about
+what sits alongside it.
+
+IT stated in the morning that ours was the only one — but that statement is from
+before the upload that actually put ours there, so it describes a registration
+state that no longer exists. **Ask IT to list the thumbprints now.** Anything
+other than `E05CF5DB8EBFC7CAF259FD5EA6678B966353F016` is an **unclaimed public
+key**: nobody here holds its private half, so it cannot serve this pipeline, and
+its presence means the application would accept an assertion signed by whoever
+does hold it.
+
+Re-check at rotation too, since step 4 there deliberately puts two certificates
+on the registration at once and the whole point is that only one survives.
 
 ---
 

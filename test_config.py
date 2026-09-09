@@ -9,7 +9,7 @@ Two halves, and the second is the one that earns its keep:
   2. **Nothing credential-shaped is in a tracked file.** This repo has already
      had one incident of sensitive values being transcribed into a commit
      message while being removed from the working tree (RUNBOOK section 8
-     lesson 12), so the scan is a standing check rather than a formality.
+     lesson 14), so the scan is a standing check rather than a formality.
 
 Runs entirely offline. Every test that manipulates the environment restores it,
 including on failure, because a leaked variable would silently change the result

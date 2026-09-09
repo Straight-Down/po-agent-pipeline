@@ -434,6 +434,19 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
     **Sheet `20140`'s 600-unit recap row carries NO transport-mode label, and it stays unlabelled.** Its `recap_label` is empty, its 7 lines take the ordinary single-row path, and they account for 7 of the 12 non-assignment changes. **Do not attribute it to a mode.** The temptation is real — 1,440 + 600 reconciling to the grand total makes "so the 600 must be sea" feel obvious — but the sheet does not say so, and extraction rule 2b exists precisely to stop the tool inventing a label the document withholds. If that 600 needs attributing, Paula attributes it.
 
+26. **NEW 2026-09-09 — the Graph credential chain is live, and one thread is still open with IT.** Recorded because it is the state Phase 2's intake job assumes, and because the *way* each part was established differs.
+
+    | | State | How |
+    |---|---|---|
+    | Certificate on the app registration | **working** | `scripts/probe_graph_auth.py` mints a token with it — observed, not reported |
+    | `Mail.Read` granted **and** admin-consented | **working** | the target mailbox read returns `200`; an unconsented application permission returns `403` on the call itself, so the read proves both |
+    | Mailbox scoping (RBAC for Applications) | **OBSERVED** | a second, populated mailbox in the same tenant returns `403 ErrorAccessDenied` at step (d). Previously only asserted by IT |
+    | A second certificate alongside ours | **UNKNOWN — open** | see below |
+
+    **The open thread: ask IT to list the thumbprints currently on the registration.** This tool cannot see them. Listing an app registration's own credentials needs `Application.Read.All`, which this app does not have and should not be given for reading mail. IT did state in the morning that ours was the only certificate — but that was *before* the upload that actually put ours there, so it describes a registration state that no longer exists. Any thumbprint other than `E05CF5DB8EBFC7CAF259FD5EA6678B966353F016` is an **unclaimed public key**: nobody here holds its private half, so it cannot serve this pipeline, and its presence means Entra would accept an assertion signed by whoever does.
+
+    **The certificate took two attempts to land, and the failure mode is worth knowing.** The first probe run got `AADSTS700027` (*the key was not found*) despite that morning's confirmation that the thumbprint was correct — it was correct, and it had not been uploaded. Re-verifying the local pair immediately afterwards is what isolated the fault to the Entra side rather than leaving it ambiguous. `GRAPH-SETUP.md` carries the timeline; the general lesson is §8 lesson 11.
+
 ## 7. Design constraints discovered by testing
 
 These are not open questions — they are settled constraints that later phases must respect. Each was found by measurement, not design review.
@@ -602,7 +615,7 @@ This is not academic: **it produced a false finding in this very repo.** A permi
 icacls C:\dev\po-agent-secrets
 ```
 
-Same class of mistake as §8 lesson 11 (a figure is not verified by having appeared in a prior report): the output *looked* like evidence, so nobody asked what produced it. The general rule — **when a tool translates between two models, its output describes the translation, not the thing.** MSYS on ACLs, `git status` on case-only renames, and `stat` on a network share are all the same shape.
+Same class of mistake as §8 lessons 11 and 12 (a confirmation is only as good as the question it answered; do not gate a verdict on evidence you cannot read): the output *looked* like evidence, so nobody asked what produced it. The general rule — **when a tool translates between two models, its output describes the translation, not the thing.** MSYS on ACLs, `git status` on case-only renames, and `stat` on a network share are all the same shape.
 
 ### Migrations freeze their data as literals and import no application code
 
@@ -827,19 +840,37 @@ Drop any one and it is merely untidy. A migration that imports a *column list* i
 
 **Generalisation for the Azure move:** anything a migration writes and the application later reads must be a literal in the migration. Seed rows, enum tables, default configuration, lookup values. If it is worth writing once at build time, it is worth pinning to that build.
 
-### 11. A figure is not verified by having appeared in a prior report
+### 11. A confirmation is only as good as the question it answered
 
-Two of this project's most confident claims were wrong and survived several rounds of citation, because each was re-quoted from the previous write-up instead of re-read from the source.
+**Three instances now, and in all three the report was honest and the state was wrong.** That is what makes this worth a lesson rather than a grumble: nobody was careless or misleading. Each confirmation answered exactly the question it was asked, and the question was narrower than what the reader took from it.
 
-**The footwear totals.** "By Sea 2,040 / By UPS 140 / Ordered 2,180" travelled through briefs and into a change specification. The workbook actually says **By Sea 1,440, By UPS 60, and an unlabelled 600** — 2,040 is the grand total, and 140 and 2,180 appear nowhere in it (§6 item 25). Self-reinforcing, which is why it lasted: `1,440 + 600 = 2,040` makes the wrong reading arithmetically satisfying, and `2,180 − 2,040` then manufactures a plausible companion figure from nothing. Caught only because the implementation's output disagreed with the specification and the sheets were re-read to settle which was wrong.
+- **"Is this the right thumbprint?"** IT confirmed on 2026-09-09 that `E05CF5DB…F016` was the certificate for this application, and it was. Hours later the auth probe got `AADSTS700027` — *the key was not found* — because the certificate **was not yet on the registration**. The confirmation established that a string matched. It could not establish that an upload had happened, because that was never the question. (`GRAPH-SETUP.md`, *Certificates on the registration*, carries the timeline.)
+- **`SuiteAnalytics Workbook`.** The permission read as set in the role editor across five probe cycles. It had never been *committed* to the role. Every cycle honestly reported what the screen showed; the screen showed intent, not saved state. (Lesson 1.)
+- **The footwear totals.** "By Sea 2,040 / By UPS 140 / Ordered 2,180" travelled through briefs into a change specification, read as verified because it had been stated confidently and repeatedly. The workbook says 1,440 / 60 / an unlabelled 600 (§6 item 25).
 
-**`SuiteAnalytics Workbook`.** Five probe cycles reported "this permission is not the cause" while the permission had never been applied to the role at all (§8 lesson 1). Each cycle cited the previous one's elimination rather than re-checking the role's saved state, and the byte-identical error message that should have been the tell was read as confirmation instead.
+**Ask for an observation, not an assurance.** "Read X and tell me what it says" rather than "is X correct?" — the first has a wrong answer that shows up, the second returns the answerer's belief. And prefer a probe to either: **`scripts/probe_graph_auth.py` found the missing certificate on its first run**, which is the whole argument for building it standalone *ahead* of the pipeline instead of discovering the same fault inside one. Inside the polling job it would have been one candidate cause among several; standalone it was the only thing that could have failed.
 
-The rule: **when a number or an elimination matters, re-derive it from the source — and say in the report which of the two you did.** A figure repeated from an earlier report inherits that report's confidence without inheriting any of its evidence. The tells are cheap to watch for: a figure nobody can point at a cell for, a difference that is suspiciously round, an elimination whose only evidence is another elimination.
+Corollary from the footwear case: **when the code and the spec disagree, check the source before assuming the code is wrong.** The implementation had reproduced the document faithfully; the specification had not.
 
-Corollary, straight from the footwear case: **when the code and the spec disagree, check the source before assuming the code is wrong.** The implementation had reproduced the document faithfully; the specification had not.
+### 11a. And re-derive, rather than re-quote
 
-### 12. A signal the tool itself writes is an echo, not evidence
+The mechanic behind all three: a figure or an elimination repeated from an earlier report **inherits that report's confidence without inheriting any of its evidence**. So when one matters, re-derive it from the source — and say in the report which of the two you did. The tells are cheap to watch for: a figure nobody can point at a cell for, a difference that is suspiciously round, an elimination whose only evidence is another elimination, a confirmation whose subject is a string rather than a state.
+
+### 12. Do not gate a verdict on evidence you cannot read
+
+The auth probe's step (b) checked the token's `roles` claim for `Mail.Read`. **Microsoft Graph access tokens are opaque to the client** — they carry a `nonce` in the JWT header marking Graph's protected format, and the payload a client can decode holds 29 claims with no `roles` and no `scp` at all. The claim is absent **by design**, on a healthy system, always.
+
+So the probe reported a **fully working credential chain as `NOT CLEAN`**: token minted, target mailbox read, second mailbox correctly refused — and a red verdict, because one input to it could never be true.
+
+**A check that cannot pass when the system is healthy is worse than no check.** It gets ignored, which is the best case. Then it gets *trusted* on the day it happens to matter, and by then nobody remembers it was always red. A missing check leaves a known gap; a permanently failing one manufactures a false gap and hides the real state behind it.
+
+**The behaviour was already proving what the proxy was asking.** Step (c)'s `200` establishes that `Mail.Read` was both granted *and* admin-consented, because an unconsented application permission returns `403` on the call itself. The claim inspection added nothing even in principle — it was a worse instrument aimed at a question already answered one step later.
+
+The general form: **prefer a check that exercises the behaviour over one that inspects a proxy for it.** Read the mailbox rather than reading the token that authorises reading the mailbox; write the row and read it back rather than asserting the column exists. A proxy can be unreadable, stale, or renamed by a vendor without notice — and when it disagrees with the behaviour, the behaviour is what is true.
+
+Related: this is the same shape as §7's note that `ls -l` lies about Windows ACLs. In both cases the instrument sat one translation away from the thing being measured, and its output described the translation.
+
+### 13. A signal the tool itself writes is an echo, not evidence
 
 The sharpest trap found so far, and it is invisible unless you ask where a field's value comes from. When the tool needed to pair two shipment rows with two PO lines (§6 item 23), `custcol_override_expected_receipt` and `custcol_sd_updatedreceiptdate` differed within 31 of 73 duplicate groups — the second-best correlation of any field, and semantically plausible: an already-updated line looks like the settled one.
 
@@ -849,7 +880,7 @@ The check is one question, and it generalises to anything learned from live data
 
 Corollary worth keeping: **the most convincing-looking candidate deserves the most suspicion**, because plausibility is exactly what stops anyone checking provenance.
 
-### 13. Describe removed sensitive data by CATEGORY, never by value
+### 14. Describe removed sensitive data by CATEGORY, never by value
 
 **The hygiene commit is the likeliest place for the data to survive, because you are writing about exactly what you took out.** This is not a hypothetical: the 2026-09-02 commit that moved four third-party files out of the working tree **transcribed all four categories verbatim** into its own commit message *and* into the RUNBOOK entry recording the move — a retailer's name, a MID code, a bank account number and a SWIFT code. The tree was clean and the permanent record was not. Caught only because a later audit grepped the unpushed commits rather than trusting the earlier "moved it out" report; fixed by rewriting all seven unpushed commits before anything was pushed.
 

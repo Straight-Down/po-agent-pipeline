@@ -302,6 +302,24 @@ def test_certificate_validation() -> None:
     check(config.CERT_EXPIRY_WARN_DAYS == 60,
           "the expiry warning window is 60 days", str(config.CERT_EXPIRY_WARN_DAYS))
 
+    # GRAPH_CERT_KEY_ID is documentation only -- the Entra keyId, recorded in
+    # `.env` so rotation knows which credential entry to remove, and read by
+    # nothing. An unread variable must not be able to fail a load, or it stops
+    # being documentation and becomes a trap.
+    with env(GRAPH_CLIENT="mock", GRAPH_CERT_PATH=key,
+             GRAPH_CERT_PUBLIC_PATH=cer, GRAPH_CERT_THUMBPRINT=thumb):
+        os.environ["GRAPH_CERT_KEY_ID"] = "not-a-guid-and-obviously-garbage"
+        try:
+            cfg = GraphConfig.from_env(dotenv_path=None)
+        finally:
+            os.environ.pop("GRAPH_CERT_KEY_ID", None)
+    check(cfg.client_kind == "mock",
+          "a garbage GRAPH_CERT_KEY_ID trips NO validation -- it is unread")
+    check("GRAPH_CERT_KEY_ID" not in Path(config.__file__).read_text(encoding="utf-8"),
+          "and config.py never mentions it, so it cannot start being read by accident")
+    check(not any("key_id" in f for f in GraphConfig.__dataclass_fields__),
+          "GraphConfig has no field for it either")
+
 
 def test_repr_leaks_nothing() -> None:
     section("repr/str carry no identifiers and no key material")
@@ -436,7 +454,8 @@ def test_no_credentials_in_tracked_files() -> None:
     check((HERE / ".env.example").is_file(), ".env.example exists and is the contract")
     example = (HERE / ".env.example").read_text(encoding="utf-8")
     documented = set(re.findall(r"^\s*#?\s*([A-Z][A-Z0-9_]*)=", example, re.M))
-    for name in _GRAPH_VARS + ("NS_ACCOUNT_ID", "NS_CLIENT_ID", "NS_CERTIFICATE_ID",
+    for name in _GRAPH_VARS + ("GRAPH_CERT_KEY_ID",
+                               "NS_ACCOUNT_ID", "NS_CLIENT_ID", "NS_CERTIFICATE_ID",
                                "NS_PRIVATE_KEY_PATH", "NS_JWT_ALGORITHM",
                                "NS_PRIVATE_KEY_PASSPHRASE", "NS_HTTP_TIMEOUT"):
         check(name in documented, f".env.example documents {name}")

@@ -293,6 +293,7 @@ STATE_INSERT = "(insert)"
 STATE_PENDING_REVIEW = "PENDING_REVIEW"
 STATE_NEEDS_ATTENTION = "NEEDS_ATTENTION"
 STATE_NEEDS_RESOLUTION = "NEEDS_RESOLUTION"
+STATE_NEEDS_ASSIGNMENT = "NEEDS_ASSIGNMENT"
 STATE_MANUAL_ENTRY_REQUIRED = "MANUAL_ENTRY_REQUIRED"
 STATE_NO_CHANGE = "NO_CHANGE"
 STATE_APPROVED = "APPROVED"
@@ -327,6 +328,14 @@ CHANGE_STATES: tuple[tuple[str, bool, str], ...] = (
         STATE_NEEDS_RESOLUTION,
         False,
         "Matched SEVERAL open lines. Candidates recorded; no target chosen; a human picks.",
+    ),
+    (
+        STATE_NEEDS_ASSIGNMENT,
+        False,
+        "The slip split this size across SEVERAL transport-mode rows (By Sea, By UPS) "
+        "and the PO holds several lines for it. Both sides recorded; no pairing made; "
+        "a human assigns. Distinct from NEEDS_RESOLUTION, which is picking one line "
+        "for ONE shipment row -- this is pairing N rows to N lines.",
     ),
     (
         STATE_MANUAL_ENTRY_REQUIRED,
@@ -366,6 +375,7 @@ CHANGE_STATE_TRANSITIONS: tuple[tuple[str, str, str, str], ...] = (
     (STATE_INSERT, STATE_NO_CHANGE, "matched, quantity already correct", "SYSTEM"),
     (STATE_INSERT, STATE_NEEDS_ATTENTION, "cannot propose", "SYSTEM"),
     (STATE_INSERT, STATE_NEEDS_RESOLUTION, "several open lines match", "SYSTEM"),
+    (STATE_INSERT, STATE_NEEDS_ASSIGNMENT, "several shipment rows and several lines share a key", "SYSTEM"),
     (STATE_INSERT, STATE_MANUAL_ENTRY_REQUIRED, "no acceptable source document", "SYSTEM"),
     (STATE_INSERT, STATE_APPROVED, "Paula-directed instruction, no proposal step", "HUMAN"),
     (STATE_PENDING_REVIEW, STATE_APPROVED, "approved", "HUMAN"),
@@ -378,6 +388,9 @@ CHANGE_STATE_TRANSITIONS: tuple[tuple[str, str, str, str], ...] = (
     (STATE_NEEDS_RESOLUTION, STATE_APPROVED, "human selected a candidate line", "HUMAN"),
     (STATE_NEEDS_RESOLUTION, STATE_DISCARDED, "closed without writing", "HUMAN"),
     (STATE_NEEDS_RESOLUTION, STATE_SUPERSEDED, "re-proposed by a later shipment", "SYSTEM"),
+    (STATE_NEEDS_ASSIGNMENT, STATE_APPROVED, "human assigned this row to a line", "HUMAN"),
+    (STATE_NEEDS_ASSIGNMENT, STATE_DISCARDED, "closed without writing", "HUMAN"),
+    (STATE_NEEDS_ASSIGNMENT, STATE_SUPERSEDED, "re-proposed by a later shipment", "SYSTEM"),
     (STATE_NO_CHANGE, STATE_APPROVED, "quantity fine, a receipt date is still wanted", "HUMAN"),
     (STATE_NO_CHANGE, STATE_DISCARDED, "closed without writing", "HUMAN"),
     (STATE_NO_CHANGE, STATE_SUPERSEDED, "re-proposed by a later shipment", "SYSTEM"),
@@ -495,6 +508,15 @@ proposed_changes = Table(
     Column("size_composition_method", String(24)),
     Column("src_size_axis_primary", String(60)),    # verbatim, e.g. '30'
     Column("src_size_axis_secondary", String(60)),  # verbatim, e.g. 'INS 32'
+    # -- the transport-mode recap row this shipment row came off (migration 0004).
+    # -- `key_recap_label` is canonical and NEVER NULL -- '' means "the slip had a
+    # -- single recap row", which is the normal case. It is part of the canonical
+    # -- key because the SLIP labels its own rows, so the distinction genuinely
+    # -- exists in the source; contrast the NetSuite side, where no field
+    # -- distinguishes a sea line from an air line and the key therefore cannot be
+    # -- improved (RUNBOOK section 6 item 10).
+    Column("key_recap_label", String(40), nullable=False, server_default=""),
+    Column("src_recap_label", String(60)),  # verbatim, e.g. 'By Sea'
     # -- the five figures the review screen needs, so a human can read the
     # -- situation directly: "ordered 300, received 0, this slip 128" makes a
     # -- partial delivery self-evident. `outstanding` is derived
@@ -614,11 +636,37 @@ Index(
     proposed_changes.c.key_style,
     proposed_changes.c.key_color,
     proposed_changes.c.key_size,
+    # Widened by migration 0004. A slip that splits one size across `By Sea` and
+    # `By UPS` legitimately produces TWO rows for the same style/colour/size, and
+    # the un-widened index forbade exactly that -- it would have rejected the
+    # second row instead of letting a human assign it. `''` for the single-recap
+    # documents keeps the original invariant intact for them.
+    proposed_changes.c.key_recap_label,
     unique=True,
     **_partial("key_size <> ''"),
 )
 Index("ix_proposed_changes_state", proposed_changes.c.state)
 Index("ix_proposed_changes_shipment_id", proposed_changes.c.shipment_id)
+
+# TWO CHANGES MUST NOT TARGET ONE NETSUITE LINE. Added by migration 0004, and it
+# closes the mirror image of an existing guard: `ux_change_candidates_one_selected`
+# stops one change selecting two candidate lines, and nothing stopped two changes
+# selecting one line. That is the failure this change makes reachable -- a slip
+# with two transport-mode rows for one size, where an automatic pairing (or a
+# careless human one) points both at the same line and the second write silently
+# overwrites the first.
+#
+# Scoped per SHIPMENT, not globally: a later shipment updating the same line again
+# is normal and correct. `IS NOT NULL` is required rather than tidy -- Azure SQL
+# treats NULLs as equal in a unique index, so without it the many rows that have
+# no target yet would collide with each other there while passing on SQLite.
+Index(
+    "ux_proposed_changes_one_line_per_shipment",
+    proposed_changes.c.shipment_id,
+    proposed_changes.c.ns_line_id,
+    unique=True,
+    **_partial("ns_line_id IS NOT NULL"),
+)
 
 change_candidates = Table(
     "change_candidates",
@@ -724,6 +772,7 @@ SELECT pc.id                        AS change_id,
        pc.src_style_text            AS style_printed,
        pc.src_color_text            AS color_printed,
        pc.src_size_text             AS size_printed,
+       pc.src_recap_label           AS recap_label_printed,
        pc.state                     AS state,
        pc.ns_line_id                AS ns_line_id,
        pc.current_quantity          AS current_quantity,

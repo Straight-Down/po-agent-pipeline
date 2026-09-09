@@ -73,6 +73,13 @@ STATUS_NEEDS_ATTENTION = "NEEDS_ATTENTION"
 #: and does not sum -- a human chooses. See `_resolve_target_line`.
 STATUS_NEEDS_RESOLUTION = "NEEDS_RESOLUTION"
 
+#: SEVERAL extracted lines and SEVERAL NetSuite lines share one key -- a slip that
+#: split the shipment across transport modes (`By Sea`, `By UPS`) against a PO that
+#: holds a line per mode. Distinct from NEEDS_RESOLUTION: that is picking one line
+#: out of several for ONE shipment row, this is PAIRING N shipment rows to N lines.
+#: A human assigns; see `_assignment_payload`.
+STATUS_NEEDS_ASSIGNMENT = "NEEDS_ASSIGNMENT"
+
 
 class LineClosed(Exception):
     """
@@ -236,6 +243,18 @@ class ProposedChange:
     #: them.
     size_composition: dict = field(default_factory=dict)
 
+    #: The transport-mode recap row this line came off, verbatim (`By Sea`,
+    #: `By UPS`). Empty on the single-recap documents, which is four of the five
+    #: corpus vendors. Part of the extraction-side key -- see
+    #: `extraction_schema.aggregate_lines` on why keying on it is legitimate
+    #: where keying on a NetSuite field would not be.
+    recap_label: str = ""
+
+    #: Populated only for STATUS_NEEDS_ASSIGNMENT: every candidate PO line and
+    #: every sibling extracted line, so a human can pair them without opening
+    #: NetSuite. See `_assignment_payload`.
+    assignment: dict = field(default_factory=dict)
+
     #: Every NetSuite line whose canonical key matched, when the match was not a
     #: clean 1:1. Populated for NEEDS_RESOLUTION (several open lines) and for the
     #: no-open-line case, so a human has what they need to decide without going
@@ -361,6 +380,79 @@ def _candidate_payload(line: POLine) -> dict:
         "rate": line.rate,
         "is_open": line.is_open,
     }
+
+
+def _assignment_payload(candidates: list[POLine], siblings: list[dict]) -> dict:
+    """
+    Everything a human needs to PAIR N shipment rows with N NetSuite lines.
+
+    Not a selection and not a suggestion. The payload lists both sides and stops;
+    the pairing is Paula's, permanently.
+
+    **There is no field that says which PO line is the sea line and which is the
+    air line, and this is measured rather than assumed** (73 duplicate-key groups
+    across six POs, 2026-09-09):
+
+      - No per-line transport-mode column exists at all -- 49 line fields, none
+        of them mode, carrier, incoterm, freight or vessel.
+      - `rate` and `leadTime` are **identical on both lines in all 73 groups**.
+        If mode were modelled per line, those two are precisely what would
+        differ, so their agreement is the strongest available evidence that it
+        is not.
+      - The header's `shipMethod` is per-PO, empty on 3 of 6 surveyed, and reads
+        `BOAT` on the very PO that carries a UPS portion.
+      - Quantity equality only appeared to work on PO0001624 because the
+        receipts were already posted there, so both lines already reflected the
+        shipment and one side happened to match exactly. On a PO awaiting the
+        update -- the only kind this tool acts on -- both lines carry ordered
+        quantities and match neither recap row.
+
+    **NEVER key the assignment on `custcol_override_expected_receipt` or
+    `custcol_sd_updatedreceiptdate`.** They differ within 31 of 73 groups, so they
+    look like signal. They are an echo: **this tool writes both fields**, so
+    pairing on them would let the tool's own past writes decide its future
+    pairings, and the correlation would strengthen with every run regardless of
+    whether it was ever right. That is the most dangerous candidate here because
+    it is the most convincing-looking one.
+
+    `custcol_sd_fg_excluderepspark` differs in 51 of 73 groups -- the most of any
+    custom column -- and is likewise never used: it is a RepSpark feed flag Paula
+    maintains by hand, and this tool does not read, write or display it.
+    """
+    return {
+        "candidate_lines": [_candidate_payload(line) for line in candidates],
+        "extracted_lines": [
+            {
+                "recap_label": str(s.get("recap_label") or ""),
+                "quantity": _as_quantity(s.get("quantity")),
+                "source_hint": str(s.get("source_hint") or ""),
+                "confidence": str(s.get("confidence") or ""),
+            }
+            for s in siblings
+        ],
+        "candidate_count": len(candidates),
+        "extracted_count": len(siblings),
+        # Stated so the review screen does not have to infer it, and so nobody
+        # later mistakes an even count for permission to pair by position.
+        "auto_assignable": False,
+    }
+
+
+def _sibling_key(vl: dict) -> tuple:
+    """
+    The key a shipment row shares with its OTHER transport-mode rows.
+
+    Deliberately EXCLUDES the recap label: this groups `By Sea 52` with
+    `By UPS 5` for one size, which is what makes them visible to each other as an
+    assignment case. The label is in the key everywhere else (aggregation, the
+    database) precisely so they stay separate rows.
+    """
+    return (
+        po_number_key(vl.get("po_number")),
+        canonical(vl.get("style_number")),
+        canonical(vl.get("color")),
+        _size_key(vl.get("size")),
+    )
 
 
 def _find_matching_lines(
@@ -724,6 +816,13 @@ def build_proposed_changes(
                          if str(vl.get("po_number") or "").strip()})
     ns_lines_by_po = {po: client.get_purchase_order(po) for po in po_numbers if po}
 
+    # Shipment rows that share a key with each other -- i.e. one size split across
+    # several transport-mode recap rows. Built once, keyed WITHOUT the recap label
+    # so the siblings can see each other; see `_sibling_key`.
+    siblings_by_key: dict[tuple, list[dict]] = {}
+    for vl in vendor_lines:
+        siblings_by_key.setdefault(_sibling_key(vl), []).append(vl)
+
     changes: list[ProposedChange] = []
     for vl in vendor_lines:
         po_number = po_number_key(vl.get("po_number"))
@@ -734,7 +833,42 @@ def build_proposed_changes(
         candidates, colour_resolution, colour_problem, colour_provenance = (
             _find_matching_lines(vl, ns_lines, (colour_lookups or {}).get(po_number))
         )
-        match, resolution_problem, ambiguous_lines = _resolve_target_line(candidates)
+        siblings = siblings_by_key.get(_sibling_key(vl), [vl])
+
+        # An ASSIGNMENT case: several shipment rows AND several PO lines share one
+        # key. Never resolved automatically -- not even when the counts match and
+        # exactly one pairing is arithmetically possible, because "arithmetically
+        # possible" is not evidence about which line is which mode. See
+        # `_assignment_payload` for what was measured and rejected.
+        assignment_problem = None
+        assignment: dict = {}
+        if len(siblings) > 1 and len(candidates) > 1:
+            match, resolution_problem, ambiguous_lines = None, None, []
+            assignment = _assignment_payload(candidates, siblings)
+            labels = ", ".join(
+                repr(str(x.get("recap_label") or "(unlabelled)")) for x in siblings
+            )
+            assignment_problem = (
+                f"this slip splits the shipment across {len(siblings)} transport-mode "
+                f"row(s) ({labels}) and PO {po_number} holds {len(candidates)} line(s) "
+                f"for this style/colour/size. Assign each row to a line -- the tool "
+                f"does not pair them, because NetSuite carries no field distinguishing "
+                f"a sea line from an air line"
+            )
+        elif len(siblings) > 1 and len(candidates) == 1:
+            # Two shipment rows, one PO line. Nothing to assign, and writing both
+            # to that line would double-write it -- which the database now
+            # refuses outright (ux_proposed_changes_one_line_per_shipment).
+            match, resolution_problem, ambiguous_lines = None, None, []
+            assignment = _assignment_payload(candidates, siblings)
+            assignment_problem = (
+                f"this slip splits the shipment across {len(siblings)} transport-mode "
+                f"row(s) but PO {po_number} holds only ONE line for this "
+                f"style/colour/size. Both rows cannot be written to one line; a human "
+                f"decides what this means"
+            )
+        else:
+            match, resolution_problem, ambiguous_lines = _resolve_target_line(candidates)
 
         change = ProposedChange(
             po_number=po_number,
@@ -760,6 +894,8 @@ def build_proposed_changes(
             # was already validated against the account's size list by
             # `extraction_schema.enforce_size_composition`.
             size_composition=dict(vl.get("size_composition") or {}),
+            recap_label=str(vl.get("recap_label") or "").strip(),
+            assignment=assignment,
             # Display context on every change, flagged or not. Nothing branches on
             # it -- see `_line_balance` for why a gate here was cancelled.
             line_balance=_line_balance(match, _as_quantity(vl.get("quantity"))),
@@ -779,6 +915,8 @@ def build_proposed_changes(
             reasons.append(colour_problem)
         if resolution_problem:
             reasons.append(resolution_problem)
+        if assignment_problem:
+            reasons.append(assignment_problem)
         if match is None and candidates and all(line.closed for line in candidates):
             # Nothing writable and the candidates were deliberately closed. Keep
             # the structural guard alive: to_netsuite_fields() must still refuse,
@@ -819,9 +957,15 @@ def build_proposed_changes(
         if reasons:
             # NEEDS_RESOLUTION is the narrow case: several open lines, a human
             # picks one. Everything else that blocks a write stays NEEDS_ATTENTION.
-            change.status = (
-                STATUS_NEEDS_RESOLUTION if ambiguous_lines else STATUS_NEEDS_ATTENTION
-            )
+            if assignment:
+                # Pairing N rows to N lines. Checked before NEEDS_RESOLUTION,
+                # which is the different question of picking one of several for a
+                # single row.
+                change.status = STATUS_NEEDS_ASSIGNMENT
+            elif ambiguous_lines:
+                change.status = STATUS_NEEDS_RESOLUTION
+            else:
+                change.status = STATUS_NEEDS_ATTENTION
             change.attention_reason = "; ".join(reasons)
         elif change.quantity_changed:
             change.status = STATUS_PENDING_REVIEW

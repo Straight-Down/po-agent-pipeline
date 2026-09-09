@@ -815,7 +815,7 @@ def _render_window(grid: SheetGrid, start: int, end: int, split: bool) -> str:
 #: `prompt_fingerprint()` hashes the actual prompt text, and a test pins the pair.
 #: Edit a prompt without bumping this and that test fails with both values, which
 #: is the cheapest available reminder.
-PROMPT_VERSION = "2026-09-02.1"
+PROMPT_VERSION = "2026-09-09.1"
 
 # Stable across every call, so it sits in front of the cache breakpoint.
 PACKING_SYSTEM_PROMPT = """\
@@ -840,6 +840,28 @@ it will be wrong if you have already converted them.
 per-colour, per-size total table). Do not sum individual carton rows yourself \
 when a recap total is printed — and if a recap total disagrees with the carton \
 rows, extract the recap figure and add a warning saying so.
+
+2b. **A sheet may have SEVERAL recap rows, one per transport mode** — for \
+example a `By Sea` row and a `By UPS` row, each giving its own per-size \
+quantities, because part of the shipment went by ocean freight and part by air \
+courier. When that happens, emit lines for **EVERY** transport-mode recap row \
+and put that row's label in `recap_label`, verbatim as printed (`By Sea`, \
+`By UPS`). One line per size per recap row.
+
+Do **not** pick one row, do not prefer the largest, and do not add the rows \
+together — they are separate shipments against separate purchase-order lines, \
+and a downstream human assigns which line each belongs to. Picking one silently \
+loses the other, which is what happened before this rule existed.
+
+**An ORDERED / PO-quantity row is not a shipment and must not be emitted at \
+all.** These sheets often print an `Ordered Qty` row beside the mode rows for \
+comparison. It is context, not something shipped. If the mode rows do not sum to \
+the ordered row, say so in warnings rather than emitting the difference as a \
+line.
+
+Leave `recap_label` EMPTY when the sheet has a single recap row, which is the \
+normal case — nearly every vendor. Setting it when there is only one row implies \
+a split that does not exist.
 
 3. Skip rows whose quantity is zero or blank.
 
@@ -1014,7 +1036,14 @@ included — and record each printed axis verbatim in those two fields.
 single-axis: the size is printed in full in one place, and you emit it verbatim \
 per rule 4. Filling these fields in when there is no second axis declares a \
 composition that did not happen, and the size will then be rejected for not \
-being a valid list value — turning a correctly-read line into a flagged one."""
+being a valid list value — turning a correctly-read line into a flagged one.
+
+10. `recap_label` is for a document that splits the shipment across several \
+TRANSPORT MODE recap rows — a `By Sea` row and a `By UPS` row, each with its own \
+per-size quantities. Emit lines for EVERY such row, tagging each with that row's \
+label verbatim, and never merge or pick between them. An ORDERED / PO-quantity \
+row is not a shipment: do not emit it. Leave `recap_label` EMPTY when there is a \
+single recap row, which is the normal case."""
 
 SHIPPING_SYSTEM_PROMPT = """\
 You extract shipment-level fields from freight documents (shipping advices, \

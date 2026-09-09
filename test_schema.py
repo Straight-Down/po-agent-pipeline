@@ -15,6 +15,7 @@ apart. Everything else builds the tables from the metadata directly, for speed.
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import tempfile
 import traceback
 from pathlib import Path
@@ -156,6 +157,15 @@ def mk_po(conn, shipment_id, printed="PO#1662", key="1662", **kw):
     return row["id"]
 
 
+#: Distinct NetSuite line per fixture row. A real PO line carries exactly one
+#: style/colour/size, so two different canonical keys can never target the same
+#: line -- and `ux_proposed_changes_one_line_per_shipment` now enforces that.
+#: The old fixture hardcoded line "18" on every row, which modelled something
+#: NetSuite cannot represent; tests that specifically want a collision pass
+#: `ns_line_id=` explicitly.
+_fixture_line_no = itertools.count(100)
+
+
 def mk_change(conn, shipment_id, po_id, size="s", state=sc.STATE_PENDING_REVIEW, **kw):
     row = {
         "id": sc.new_id(),
@@ -170,7 +180,7 @@ def mk_change(conn, shipment_id, po_id, size="s", state=sc.STATE_PENDING_REVIEW,
         "src_size_text": size.upper(),
         "src_quantity_text": "9",
         "source_hint": "PACKING!R42",
-        "ns_line_id": "18",
+        "ns_line_id": str(next(_fixture_line_no)),
         "current_quantity": 12,
         "current_quantity_received": 0,
         "proposed_quantity": 9,

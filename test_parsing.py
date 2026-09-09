@@ -1627,6 +1627,123 @@ def test_plan_vs_count_signals(tmp: Path) -> None:
           "a single-sheet document gets no sheet-selection note")
 
 
+def test_transport_mode_recap_rows(tmp: Path) -> None:
+    section("two transport-mode recap rows: two changes, and a human assigns")
+    import datetime as dt
+
+    import matcher as mt
+    from extraction_schema import aggregate_lines
+    from netsuite_client import NetSuiteClient, POLine
+
+    def slip(size, qty, label, hint="PO-1624!R39"):
+        return {"po_number": "1624", "style_number": "20138", "color": "PAT",
+                "size": size, "quantity": qty, "confidence": "high", "note": "",
+                "source_hint": hint, "recap_label": label}
+
+    def ns(line_id, qty, is_open=True, recv=0.0, billed=0.0,
+           exp=dt.date(2026, 6, 19), upd=None):
+        return POLine(
+            line_id=line_id, item="20138 : 20138-PAT-12", style_number="20138",
+            vendor_name="Footwear", color="PAT", size="12", quantity=qty, units="Ea",
+            expected_receipt_date=exp, override_expected_receipt=bool(upd),
+            updated_receipt_date=upd, closed=False, is_open=is_open,
+            quantity_received=recv, quantity_billed=billed, rate=29.2,
+            item_internal_id="item-PAT-12",
+        )
+
+    # -- 3. AGGREGATION must not merge across recap rows ----------------------
+    merged, warns = aggregate_lines(
+        [slip("12", 52, "By Sea"), slip("12", 5, "By UPS")], document_label="PO-1624")
+    check(len(merged) == 2,
+          "52 By Sea + 5 By UPS stay TWO lines, never one of 57", f"{len(merged)} line(s)")
+    check(sorted(m["quantity"] for m in merged) == [5, 52],
+          "with their own quantities intact", str(sorted(m["quantity"] for m in merged)))
+    check({m["recap_label"] for m in merged} == {"By Sea", "By UPS"},
+          "each keeping its own label", str(sorted(m["recap_label"] for m in merged)))
+
+    # Carton rows WITHIN one recap row still sum, which is aggregation's whole job.
+    merged, _w = aggregate_lines(
+        [slip("12", 30, "By Sea", "PO-1624!R29"), slip("12", 22, "By Sea", "PO-1624!R30")],
+        document_label="PO-1624")
+    check(len(merged) == 1 and merged[0]["quantity"] == 52,
+          "two carton rows of ONE recap row still sum to 52",
+          f"{len(merged)} line(s) of {merged[0]['quantity']}")
+
+    # And a single-recap document is untouched -- no label, same behaviour as ever.
+    plain = [dict(slip("12", 52, ""), source_hint="PACKING!R42")]
+    merged, _w = aggregate_lines(plain, document_label="x")
+    check(len(merged) == 1 and merged[0]["recap_label"] == "",
+          "a single-recap row carries an empty label and does not become a split")
+
+    # -- 5. MATCHER produces an ASSIGNMENT, never a pairing -------------------
+    lines = [slip("12", 52, "By Sea"), slip("12", 5, "By UPS")]
+    po = [ns("5", 44), ns("43", 3, is_open=False, recv=3.0, billed=3.0,
+             exp=dt.date(2026, 6, 1), upd=dt.date(2026, 6, 1))]
+    changes = mt.build_proposed_changes(lines, NetSuiteClient(mock_data={"1624": po}))
+
+    check(len(changes) == 2, "two shipment rows produce two changes", str(len(changes)))
+    check(all(c.status == mt.STATUS_NEEDS_ASSIGNMENT for c in changes),
+          "both are NEEDS_ASSIGNMENT", str({c.status for c in changes}))
+    check(all(c.line_id is None for c in changes),
+          "NEITHER is auto-assigned to a line -- not even the one open line")
+    check({c.recap_label for c in changes} == {"By Sea", "By UPS"},
+          "each change carries its recap label")
+    check(mt.STATUS_NEEDS_ASSIGNMENT != mt.STATUS_NEEDS_RESOLUTION,
+          "assignment is its own state, not reused NEEDS_RESOLUTION")
+
+    payload = changes[0].assignment
+    check(payload.get("auto_assignable") is False,
+          "the payload states outright that it is not auto-assignable")
+    check(payload.get("candidate_count") == 2 and payload.get("extracted_count") == 2,
+          "both counts are stated", str((payload.get("candidate_count"),
+                                         payload.get("extracted_count"))))
+
+    # Every field the ruling asked to be surfaced, per candidate line.
+    required = {"line_id", "quantity", "quantity_received", "quantity_billed",
+                "is_open", "expected_receipt_date", "updated_receipt_date"}
+    for cand in payload["candidate_lines"]:
+        missing = required - set(cand)
+        check(not missing, f"candidate line {cand.get('line_id')} carries every field",
+              f"missing {sorted(missing)}" if missing else "all present")
+    by_line = {c["line_id"]: c for c in payload["candidate_lines"]}
+    check(by_line["5"]["is_open"] is True and by_line["43"]["is_open"] is False,
+          "isOpen is surfaced per line, both values")
+    check(by_line["43"]["quantity_billed"] == 3.0 and by_line["5"]["quantity_billed"] == 0.0,
+          "quantityBilled distinguishes them for a human to read")
+    check(by_line["43"]["updated_receipt_date"] == "2026-06-01",
+          "and custcol_sd_updatedreceiptdate is SHOWN", str(by_line["43"]["updated_receipt_date"]))
+    check("custcol_sd_fg_excluderepspark" not in str(payload),
+          "the RepSpark field appears nowhere in the payload")
+
+    # Per extracted line: its label and quantity.
+    ext = {e["recap_label"]: e for e in payload["extracted_lines"]}
+    check(ext["By Sea"]["quantity"] == 52 and ext["By UPS"]["quantity"] == 5,
+          "each shipment row is surfaced with its label and quantity", str(sorted(ext)))
+
+    # Never auto-assign even when the arithmetic leaves one possibility: here only
+    # line 5 is open, which the single-row path WOULD have targeted.
+    single = mt.build_proposed_changes([slip("12", 52, "By Sea")],
+                                       NetSuiteClient(mock_data={"1624": po}))
+    check(single[0].line_id == "5",
+          "ONE shipment row against the same PO still targets the one open line",
+          str(single[0].line_id))
+    check(single[0].status != mt.STATUS_NEEDS_ASSIGNMENT,
+          "and is not an assignment case -- the trigger is several rows, not several lines")
+
+    # Two rows but only ONE PO line: nothing to assign, and it must not double-write.
+    one_line = mt.build_proposed_changes(lines, NetSuiteClient(mock_data={"1624": [ns("5", 44)]}))
+    check(all(c.line_id is None for c in one_line),
+          "two rows against ONE line assign nothing rather than both targeting it")
+    check(all("only ONE line" in (c.attention_reason or "") for c in one_line),
+          "and the reason says so", (one_line[0].attention_reason or "")[:70])
+
+    # -- the reasoning that must not be re-litigated --------------------------
+    doc = mt._assignment_payload.__doc__ or ""
+    for phrase in ("custcol_override_expected_receipt", "custcol_sd_updatedreceiptdate",
+                   "echo", "rate", "leadTime", "shipMethod"):
+        check(phrase in doc, f"the docstring records why {phrase!r} is not a discriminator")
+
+
 def test_legacy_xls_reader(tmp: Path) -> None:
     section("legacy .xls (OLE2/BIFF), routed by magic bytes")
 
@@ -2750,7 +2867,7 @@ def test_prompt_version(tmp: Path) -> None:
     # PROMPT_VERSION and update this hash in the same commit. That pairing is the
     # only thing stopping a calibration corpus from mixing two prompts under one
     # label, which would make its false-negative rate meaningless.
-    EXPECTED = "cdc18807cc252f0e"
+    EXPECTED = "4775ce9ded060fe1"
     actual = ce.prompt_fingerprint()
     check(actual == EXPECTED,
           "prompt text matches the fingerprint pinned for this PROMPT_VERSION",
@@ -3426,6 +3543,7 @@ def main() -> int:
             test_multidoc_call_shape, test_attachment_classifier_offline,
             test_filename_never_excludes, test_numeric_size_headers,
             test_size_composition, test_plan_vs_count_signals,
+            test_transport_mode_recap_rows,
             test_legacy_xls_reader,
             test_canonical_form, test_size_header_canonical,
             test_verbatim_source_preserved,

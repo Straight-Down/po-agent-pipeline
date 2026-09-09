@@ -363,10 +363,15 @@ def _change_row(change: mt.ProposedChange, line: dict, shipment_id, po_id, sha, 
         "key_style": mt.canonical(change.style_number),
         "key_color": mt.canonical(change.color),
         "key_size": mt._size_key(change.size),
+        # The transport-mode recap row, canonical and never NULL -- '' for the
+        # single-recap documents. Part of the canonical key, so it must be
+        # written on EVERY row, not just the split ones.
+        "key_recap_label": mt.canonical(change.recap_label),
         # verbatim -- never compared, only displayed and audited
         "src_style_text": change.style_number,
         "src_color_text": change.color,
         "src_size_text": change.size,
+        "src_recap_label": (change.recap_label or None),
         "src_quantity_text": (
             None if line.get("quantity") is None else str(line["quantity"])
         ),
@@ -668,7 +673,16 @@ def ingest_shipment(
             counts["proposed_changes"] += 1
             states[change.status] = states.get(change.status, 0) + 1
 
-            for candidate in change.candidate_lines:
+            # Candidates come from a NEEDS_RESOLUTION (pick one of several) or a
+            # NEEDS_ASSIGNMENT (pair N rows to N lines). Both need the same rows
+            # in `change_candidates` -- that table already carries exactly the
+            # fields a human compares -- so the two cases share the write rather
+            # than growing a second table.
+            for candidate in (
+                change.candidate_lines
+                or (change.assignment or {}).get("candidate_lines")
+                or []
+            ):
                 conn.execute(change_candidates.insert(), {
                     "id": sc.new_id(), "change_id": row["id"],
                     "ns_line_id": str(candidate["line_id"]),

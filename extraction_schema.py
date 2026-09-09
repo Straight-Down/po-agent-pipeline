@@ -86,6 +86,15 @@ class ExtractedLine(BaseModel):
         "ordinary single-axis sheet. Setting this is what declares the size to "
         "be a composition, so leave it empty unless it genuinely is one."
     )
+    recap_label: str = Field(
+        default="",
+        description="When the sheet splits the shipment across several TRANSPORT "
+        "MODE recap rows, the label of the row this line came from, verbatim — "
+        "e.g. 'By Sea', 'By UPS'. Emit one line per size per recap row, never a "
+        "merged total. Empty string when the sheet has a single recap row, which "
+        "is the normal case. Do NOT put an ordered/PO-quantity row's label here: "
+        "an ordered row is not a shipment and must not be emitted at all."
+    )
     quantity: int = Field(
         description="Units shipped for this PO/style/colour/size. Use 0 only if "
         "the figure is genuinely unreadable, and set confidence to 'low'."
@@ -355,8 +364,19 @@ def aggregate_lines(
     lines: list[dict], document_label: str = ""
 ) -> tuple[list[dict], list[str]]:
     """
-    Collapse duplicate (PO, style, colour, size) rows within ONE document, summing
-    quantities, and return a deterministically ordered list.
+    Collapse duplicate (PO, style, colour, size, recap label) rows within ONE
+    document, summing quantities, and return a deterministically ordered list.
+
+    **The recap label is part of the key, and that is not a contradiction of
+    change 5.** Change 5 established that you cannot fix a key collision by
+    improving the key -- but that was about the NETSUITE side, where the
+    information genuinely does not exist: there is no per-line transport-mode
+    field, and `rate` and `leadTime` are identical on both lines in all 73
+    duplicate groups surveyed. Here the information *is* in the source, because
+    **the slip labels its own rows** `By Sea` and `By UPS`. Keying on a label the
+    document prints is reading the document; keying on a NetSuite field that does
+    not distinguish the lines would be inventing a distinction. Opposite
+    situations, opposite answers.
 
     Two reasons this is correct semantics rather than a workaround:
 
@@ -412,6 +432,12 @@ def aggregate_lines(
             canonical(line.get("style_number")),
             canonical(line.get("color")),
             canonical(size),
+            # The transport-mode recap row. Carton rows WITHIN one recap row
+            # still sum, which is this function's whole job; rows from DIFFERENT
+            # recap rows must not, because they are separate shipments against
+            # separate PO lines. Merging `By Sea 52` with `By UPS 5` into one
+            # line of 57 would destroy the split before anyone could see it.
+            canonical(line.get("recap_label")),
         )
         if key not in collapsible:
             collapsible[key] = []
@@ -451,7 +477,8 @@ def aggregate_lines(
         # record every rendering -- so the displayed value is stable across runs
         # and the discrepancy stays visible for audit instead of being erased.
         for field_name in ("po_number", "style_number", "color", "size",
-                           "size_axis_primary", "size_axis_secondary"):
+                           "size_axis_primary", "size_axis_secondary",
+                           "recap_label"):
             variants = sorted({str(g.get(field_name) or "") for g in group})
             first[field_name] = variants[0]
             if len(variants) > 1:
@@ -544,6 +571,9 @@ def line_to_dict(line: ExtractedLine) -> dict[str, Any]:
         # printed, and `enforce_size_composition` gates on exactly that.
         "size_axis_primary": line.size_axis_primary.strip(),
         "size_axis_secondary": line.size_axis_secondary.strip(),
+        # Which transport-mode recap row this line came from, verbatim. Part of
+        # the extraction-side KEY, not just provenance -- see `aggregate_lines`.
+        "recap_label": line.recap_label.strip(),
     }
 
 

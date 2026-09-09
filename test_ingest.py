@@ -572,6 +572,123 @@ def test_size_composition_persisted() -> None:
           "and NULL axes -- nothing is invented for the four vendors that compose nothing")
 
 
+def test_transport_mode_recap_rows() -> None:
+    section("two recap rows persist as two rows; one line cannot be double-written")
+    from sqlalchemy.exc import IntegrityError
+
+    engine = fresh_db()
+
+    def slip(size, qty, label):
+        row = line(po="1624", style="20138", color="PAT", size=size, qty=qty)
+        row["recap_label"] = label
+        return row
+
+    ns = [ns_line("5", style="20138", color="PAT", size="12", qty=44),
+          ns_line("43", style="20138", color="PAT", size="12", qty=3, is_open=False)]
+    with tempfile.TemporaryDirectory() as td:
+        docs = make_docs(Path(td), ("footwear.xlsx",))
+        classification = FakeClassification(
+            selected=[FakeClassification.Item(docs[0], "packing_list")])
+        parsed = ParseResult(
+            lines=[slip("12", 52, "By Sea"), slip("12", 5, "By UPS")],
+            parser="claude-assisted", vendor_name="Footwear")
+        monkey: dict = {}
+        install_stub_parse(monkey, parsed, classification)
+        try:
+            report = ing.ingest_shipment(
+                engine, docs, message=msg(), client=NetSuiteClient(mock_data={"1624": ns}),
+                now=NOW)
+        finally:
+            restore(monkey)
+
+    with engine.connect() as conn:
+        rows = [dict(r._mapping) for r in conn.execute(
+            select(proposed_changes.c.id,
+                   proposed_changes.c.key_size,
+                   proposed_changes.c.key_recap_label,
+                   proposed_changes.c.src_recap_label,
+                   proposed_changes.c.state,
+                   proposed_changes.c.ns_line_id,
+                   proposed_changes.c.proposed_quantity)
+            .order_by(proposed_changes.c.key_recap_label)).all()]
+        cands = conn.execute(select(func.count()).select_from(change_candidates)).scalar()
+
+    # THE DEFECT: the un-widened canonical-key index forbade this second row.
+    check(len(rows) == 2,
+          "TWO rows persist for one style/colour/size -- the widened canonical key",
+          f"{len(rows)} row(s)")
+    check([r["key_recap_label"] for r in rows] == ["by sea", "by ups"],
+          "keyed on the canonical recap label", str([r["key_recap_label"] for r in rows]))
+    check([r["src_recap_label"] for r in rows] == ["By Sea", "By UPS"],
+          "with the verbatim label kept alongside", str([r["src_recap_label"] for r in rows]))
+    check(sorted(float(r["proposed_quantity"]) for r in rows) == [5.0, 52.0],
+          "each with its own quantity, not summed to 57",
+          str(sorted(float(r["proposed_quantity"]) for r in rows)))
+    check(all(r["state"] == "NEEDS_ASSIGNMENT" for r in rows),
+          "both in NEEDS_ASSIGNMENT", str({r["state"] for r in rows}))
+    check(all(r["ns_line_id"] is None for r in rows), "with no target chosen")
+    check(report.states.get("NEEDS_ASSIGNMENT") == 2,
+          "and the report counts them", str(report.states))
+    check(cands == 4,
+          "both candidate lines are recorded against BOTH changes, so either can be "
+          "assigned to either", f"{cands} candidate row(s)")
+
+    # THE NEW CONSTRAINT: two changes must not select the same NetSuite line.
+    def double_write():
+        with engine.begin() as conn:
+            for r in rows:
+                conn.execute(proposed_changes.update()
+                             .where(proposed_changes.c.id == r["id"])
+                             .values(ns_line_id="5"))
+
+    try:
+        double_write()
+        check(False, "the DB refuses two changes selecting ONE line", "the update succeeded")
+    except IntegrityError as exc:
+        # SQLite reports the offending COLUMNS rather than the index name.
+        check("proposed_changes.shipment_id" in str(exc)
+              and "proposed_changes.ns_line_id" in str(exc),
+              "the DB refuses two changes selecting ONE line",
+              str(exc).splitlines()[0][-58:])
+
+    # But assigning them to DIFFERENT lines is exactly what should be allowed.
+    with engine.begin() as conn:
+        for r, target in zip(rows, ("5", "43")):
+            conn.execute(proposed_changes.update()
+                         .where(proposed_changes.c.id == r["id"])
+                         .values(ns_line_id=target))
+    with engine.connect() as conn:
+        assigned = sorted(conn.execute(select(proposed_changes.c.ns_line_id)).scalars().all())
+    check(assigned == ["43", "5"], "a valid assignment to two distinct lines is accepted",
+          str(assigned))
+
+    # And a LATER shipment may target the same line again -- the guard is per
+    # shipment, not global, because a PO line legitimately gets updated twice.
+    engine2 = fresh_db()
+    with tempfile.TemporaryDirectory() as td:
+        for n, payload in enumerate((b"first", b"second")):
+            sub = Path(td) / f"s{n}"
+            sub.mkdir()
+            docs = make_docs(sub, ("slip.xlsx",), payload=payload)
+            classification = FakeClassification(
+                selected=[FakeClassification.Item(docs[0], "packing_list")])
+            parsed = ParseResult(lines=[line(size="S")], parser="inprotex-deterministic",
+                                 vendor_name="Inprotex")
+            monkey = {}
+            install_stub_parse(monkey, parsed, classification)
+            try:
+                ing.ingest_shipment(engine2, docs, message=msg(f"AAMk-{n}"),
+                                    client=NetSuiteClient(mock_data={
+                                        "1662": [ns_line("18", size="S")]}), now=NOW)
+            finally:
+                restore(monkey)
+    with engine2.connect() as conn:
+        again = conn.execute(select(func.count()).select_from(proposed_changes)
+                             .where(proposed_changes.c.ns_line_id == "18")).scalar()
+    check(again == 2,
+          "two SHIPMENTS may both target line 18 -- the guard is per shipment", str(again))
+
+
 def test_multi_po_document() -> None:
     section("one slip, six POs: one shipment_pos row each")
     engine = fresh_db()
@@ -1063,6 +1180,7 @@ def main() -> int:
         test_double_ingest_is_a_no_op,
         test_po_key_is_canonical,
         test_size_composition_persisted,
+        test_transport_mode_recap_rows,
         test_multi_po_document,
         test_multi_candidate_line,
         test_audit_and_state_guard,

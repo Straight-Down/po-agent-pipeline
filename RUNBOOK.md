@@ -371,6 +371,40 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
     Behaviour is right as-is and is now pinned by a test: a blank size is not a size, so it is never used as a merge key, never matched, and stays flagged. Worth noting only because it is on the `REV` sheet, alongside that sheet's other data-entry errors, which is one more asymmetry consistent with item 20's conclusion that `ACT` is the packing record and `REV` the plan.
 
+23. ~~**NEW 2026-09-09 — a slip with several transport-mode recap rows lost all but one of them.**~~ **FIXED 2026-09-09 (change 8).** The footwear slip for PO 1624 splits each size across a `By Sea` row and a `By UPS` row, and NetSuite holds a separate PO line for each. The tool took `By Sea` only — **not by decision**: the extractor picked one row and nothing downstream looked for others, so the UPS portion vanished silently.
+
+    Paula's ruling: **propose both, she assigns.** Implemented as extraction emitting one line per size per recap row tagged with that row's label verbatim (`recap_label`), the label joining the extraction-side canonical key, aggregation grouping on it, and a new `NEEDS_ASSIGNMENT` state that surfaces both sides and pairs nothing.
+
+    **THE ASSIGNMENT IS PERMANENTLY MANUAL, and the reason is measured, not assumed** (73 duplicate-key groups across six POs — see item 24 for the full survey). `_assignment_payload`'s docstring carries it so it cannot be re-litigated from memory:
+    - **No per-line transport-mode column exists** — 49 line fields, none of them mode, carrier, incoterm, freight or vessel.
+    - **`rate` and `leadTime` are identical on both lines in all 73 groups.** If mode were modelled per line, those two are exactly what would differ; their agreement is the strongest available evidence that it is not.
+    - The header's `shipMethod` is per-PO, empty on 3 of 6 surveyed, and reads `BOAT` on the very PO carrying a UPS portion.
+    - **Quantity equality is not a discriminator.** It appeared to work on PO0001624 only because the receipts were already posted there, so both lines already reflected the shipment and one side matched exactly. On a PO awaiting the update — the only kind this tool acts on — both lines carry ordered quantities and match neither row.
+
+    **NEVER key the pairing on `custcol_override_expected_receipt` or `custcol_sd_updatedreceiptdate`.** They differ in 31 of 73 groups, so they look like signal. They are an **echo**: this tool writes both fields, so pairing on them would let its own past writes decide its future pairings, and the correlation would strengthen with every run whether or not it was ever right. The most convincing-looking candidate here is the most dangerous one. (`custcol_sd_fg_excluderepspark` differs in 51 of 73 — the most of any custom column — and is out of scope entirely.)
+
+    **Adding the label to the key is not a reversal of item 10's finding.** Item 10 established that a key collision on the **NetSuite** side cannot be fixed by improving the key, because the information does not exist there. Here it does: **the slip labels its own rows.** Reading a label the document prints is not the same act as inventing a distinction NetSuite does not record. Opposite situations, opposite answers.
+
+    **Migration 0004** widens `ux_proposed_changes_canonical_key` to include `key_recap_label` — un-widened it *forbade the second row*, rejecting in the database what should reach a human — and adds a guard the schema never had: **`ux_proposed_changes_one_line_per_shipment`**. That is the mirror image of `ux_change_candidates_one_selected`, which stops one change selecting two lines while nothing stopped **two changes selecting one line**, whose second write silently overwrites the first. Unreachable while every key produced one row; reachable the moment two rows share a key; so it ships with the change that creates the risk. Scoped per shipment, because a later shipment updating the same line is normal.
+
+    **Result, live 2026-09-09.** Footwear went from 28 proposals to **44** — **16 assignment groups covering 32 changes, plus 12 unambiguous singles** — and the arithmetic reconciles exactly against the sheets: 6 dual-row sizes on `20138` (size 14 has `By UPS` 0), 5 × 2 colours on `20139`, and `20140`'s 7 sizes are unlabelled singles. All four single-recap vendors are unchanged and report **zero** recap labels and **zero** assignment cases: Inprotex 6,387 units / 77 lines, Legendz 1,049 / 8, Symmetry 1,669 / 25, Tainan 1,725 / 56.
+24. **NEW 2026-09-09 — the duplicate-line survey, and what it rules out.** Kept in full because it is the evidence base for item 23's "permanently manual", and because every field in it *looks* like a discriminator until measured. 73 duplicate-key groups across PO0001624 (16), PO0001620 (4), PO0001514 (1), PO0001649 (1), PO0001555 (41) and PO0001366 (10).
+
+    **Identical on both lines in all 73 groups**, so carrying no signal whatsoever: `rate`, `leadTime`, `units`, `item`, `itemType`, `matrixType`, `isClosed`, `isBillable`, `matchBillToReceipt`, and every `custcol_ava_*`, `custcol_scm_*`, `custcol_sd_tmpl_*` and `custcol_product_*`.
+
+    | Field | Differs | Why it is not a discriminator |
+    |---|---|---|
+    | `isOpen` | 16/73 | **All 16 are PO1624.** Elsewhere 0/4, 0/1, 0/1, **0/41**, 0/10. Means closure state |
+    | `quantityBilled` | 73/73 | Tracks quantity. "Exactly one line unbilled" is 16/16 on 1624 and **0** on the other four |
+    | `expectedReceiptDate` | 30/73 | **Identical on all 41 PO1555 groups**; where it differs nothing labels which date is sea |
+    | `custcol_override_expected_receipt` | 31/73 | An echo of this tool's own writes — see item 23 |
+    | `custcol_sd_updatedreceiptdate` | 31/32 | Same |
+    | `custcol_sd_fg_excluderepspark` | 51/73 | Out of scope by standing instruction; a RepSpark flag, not a mode |
+    | `description` | 21/73 | **Identical within every PO1624 group** (it is the item description) |
+    | `line` number | 73/73 | The higher line number carries the smaller quantity on 1624/1620/1555/1366 — but that is a *quantity* observation, silent about mode, and it inverts the moment an air shipment is the larger one |
+
+    **And most duplicate-key pairs are not transport splits at all.** On PO1555 — the largest set at 41 groups — both lines share one date, both are fully received, both fully billed, neither has an override. Same on 1620, 1514 and 1366. Only PO1624 shows the asymmetric one-open/one-closed shape. So a rule of "two recap rows means update both lines" must not be generalised into "a duplicate key means a transport split"; the two are different phenomena that happen to coincide on one PO. Worth asking Paula what these pairs mean on the other POs before anything keys on them.
+
 ## 7. Design constraints discovered by testing
 
 These are not open questions — they are settled constraints that later phases must respect. Each was found by measurement, not design review.
@@ -507,6 +541,14 @@ row. A partial PO looks complete, which is what makes it worse than a failed rea
 Zero false positives on current data: the largest PO in the account is **380 lines**
 (`PO0001497`) and **no PO has 1,000 or more**, so the guard raises on nothing today
 and exists for the PO that eventually does.
+
+### Migration 0001 does not freeze its seed data, so every state-adding migration must be conditional
+
+`0001` writes `change_states` and `change_state_transitions` by importing the **live** `schema.CHANGE_STATES` and `CHANGE_STATE_TRANSITIONS`. That is unlike its view definitions, which it deliberately spells out verbatim so the migration keeps describing what it actually did. The consequence is that **`0001`'s seed changes as `schema.py` evolves**: a database built fresh today already contains a state added last week, while a database that stopped at an older revision does not.
+
+So a migration that adds a state cannot simply `INSERT` it — that succeeds on exactly one of the two paths and raises `IntegrityError` on the other. `0004` therefore uses `INSERT ... SELECT ... WHERE NOT EXISTS` for both the state and its transitions. **Every future state-adding migration has to be written the same way**, and this is worth fixing properly at some point by freezing 0001's seed the way its views are frozen.
+
+Found by running the migration, not by reading it — the failure only appears on a fresh build, which is the path a round-trip test exercises.
 
 ### Migrations: autogenerate cannot see views, and SQLite will not alter under one
 
@@ -695,7 +737,17 @@ Two working consequences:
   these vendors were all in triage, file reading, and key derivation — the parts
   already considered settled.
 
-### 10. Describe removed sensitive data by CATEGORY, never by value
+### 10. A signal the tool itself writes is an echo, not evidence
+
+The sharpest trap found so far, and it is invisible unless you ask where a field's value comes from. When the tool needed to pair two shipment rows with two PO lines (§6 item 23), `custcol_override_expected_receipt` and `custcol_sd_updatedreceiptdate` differed within 31 of 73 duplicate groups — the second-best correlation of any field, and semantically plausible: an already-updated line looks like the settled one.
+
+**But this tool writes both fields.** Pairing on them would mean the tool's own past writes decided its future pairings, and the correlation would *strengthen with every run* regardless of whether the first pairing was ever right. A validation set drawn from live data would confirm it beautifully. That is the failure mode: a self-fulfilling discriminator looks better the longer it runs.
+
+The check is one question, and it generalises to anything learned from live data: **would this field have this value if the tool had never run?** If not, it is not evidence about the world; it is a record of what the tool already did. Fields this tool writes — the four in `WRITABLE_LINE_FIELDS` — are permanently disqualified as matching or pairing inputs, and the docstring says so at the point of temptation rather than here.
+
+Corollary worth keeping: **the most convincing-looking candidate deserves the most suspicion**, because plausibility is exactly what stops anyone checking provenance.
+
+### 11. Describe removed sensitive data by CATEGORY, never by value
 
 **The hygiene commit is the likeliest place for the data to survive, because you are writing about exactly what you took out.** This is not a hypothetical: the 2026-09-02 commit that moved four third-party files out of the working tree **transcribed all four categories verbatim** into its own commit message *and* into the RUNBOOK entry recording the move — a retailer's name, a MID code, a bank account number and a SWIFT code. The tree was clean and the permanent record was not. Caught only because a later audit grepped the unpushed commits rather than trusting the earlier "moved it out" report; fixed by rewriting all seven unpushed commits before anything was pushed.
 

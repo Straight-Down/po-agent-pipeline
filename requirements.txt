@@ -19,3 +19,8 @@ xlrd>=2.0                  # legacy .xls cell grids (OLE2/BIFF). Tainan's packin
                            # 2.x reads .xls ONLY -- openpyxl keeps .xlsx; the reader is
                            # chosen by file signature, not extension.
 pdfplumber>=0.11           # PDF text layer
+
+# Microsoft Graph (Outlook intake) -- certificate client-credentials auth.
+# Used by scripts/probe_graph_auth.py; the pipeline itself runs against the
+# mock until GRAPH_CLIENT=real, so this is not yet on any hot path.
+msal>=1.38                 # Entra token acquisition with a certificate credential

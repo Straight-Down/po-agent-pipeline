@@ -371,7 +371,7 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
     Behaviour is right as-is and is now pinned by a test: a blank size is not a size, so it is never used as a merge key, never matched, and stays flagged. Worth noting only because it is on the `REV` sheet, alongside that sheet's other data-entry errors, which is one more asymmetry consistent with item 20's conclusion that `ACT` is the packing record and `REV` the plan.
 
-23. ~~**NEW 2026-09-09 — a slip with several transport-mode recap rows lost all but one of them.**~~ **FIXED 2026-09-09 (change 8).** The footwear slip for PO 1624 splits each size across a `By Sea` row and a `By UPS` row, and NetSuite holds a separate PO line for each. The tool took `By Sea` only — **not by decision**: the extractor picked one row and nothing downstream looked for others, so the UPS portion vanished silently.
+23. ~~**NEW 2026-09-09 — a slip with several transport-mode recap rows lost all but one of them.**~~ **FIXED 2026-09-09 (change 8, transport modes).** *Label collision worth knowing: item 9 also records a "change 8" — the tranId transformation of 2026-08-31. Two unrelated changes carry that number, so cite them by subject rather than by number.* The footwear slip for PO 1624 splits each size across a `By Sea` row and a `By UPS` row, and NetSuite holds a separate PO line for each. The tool took `By Sea` only — **not by decision**: the extractor picked one row and nothing downstream looked for others, so the UPS portion vanished silently.
 
     Paula's ruling: **propose both, she assigns.** Implemented as extraction emitting one line per size per recap row tagged with that row's label verbatim (`recap_label`), the label joining the extraction-side canonical key, aggregation grouping on it, and a new `NEEDS_ASSIGNMENT` state that surfaces both sides and pairs nothing.
 
@@ -387,7 +387,7 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
     **Migration 0004** widens `ux_proposed_changes_canonical_key` to include `key_recap_label` — un-widened it *forbade the second row*, rejecting in the database what should reach a human — and adds a guard the schema never had: **`ux_proposed_changes_one_line_per_shipment`**. That is the mirror image of `ux_change_candidates_one_selected`, which stops one change selecting two lines while nothing stopped **two changes selecting one line**, whose second write silently overwrites the first. Unreachable while every key produced one row; reachable the moment two rows share a key; so it ships with the change that creates the risk. Scoped per shipment, because a later shipment updating the same line is normal.
 
-    **Result, live 2026-09-09.** Footwear went from 28 proposals to **44** — **16 assignment groups covering 32 changes, plus 12 unambiguous singles** — and the arithmetic reconciles exactly against the sheets: 6 dual-row sizes on `20138` (size 14 has `By UPS` 0), 5 × 2 colours on `20139`, and `20140`'s 7 sizes are unlabelled singles. All four single-recap vendors are unchanged and report **zero** recap labels and **zero** assignment cases: Inprotex 6,387 units / 77 lines, Legendz 1,049 / 8, Symmetry 1,669 / 25, Tainan 1,725 / 56.
+    **Result, live 2026-09-09.** Footwear went from 28 proposals to **44** — **16 assignment groups covering 32 changes, plus 12 unambiguous singles** — and the arithmetic reconciles exactly against the sheets: 6 dual-row sizes on `20138` (size 14 has `By UPS` 0), 5 × 2 colours on `20139`, and `20140`'s 7 sizes are unlabelled singles. All four single-recap vendors are unchanged and report **zero** recap labels and **zero** assignment cases: **Inprotex 6,387 units / 77 lines, 77 of 77 targeted** (all six POs resolved this run, against 53 of 77 previously when two of them hit sandbox read timeouts), Legendz 1,049 / 8, Symmetry 1,669 / 25, and Tainan 1,725 / 56 with 28 targeted.
 24. **NEW 2026-09-09 — the duplicate-line survey, and what it rules out.** Kept in full because it is the evidence base for item 23's "permanently manual", and because every field in it *looks* like a discriminator until measured. 73 duplicate-key groups across PO0001624 (16), PO0001620 (4), PO0001514 (1), PO0001649 (1), PO0001555 (41) and PO0001366 (10).
 
     **Identical on both lines in all 73 groups**, so carrying no signal whatsoever: `rate`, `leadTime`, `units`, `item`, `itemType`, `matrixType`, `isClosed`, `isBillable`, `matchBillToReceipt`, and every `custcol_ava_*`, `custcol_scm_*`, `custcol_sd_tmpl_*` and `custcol_product_*`.
@@ -404,6 +404,25 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
     | `line` number | 73/73 | The higher line number carries the smaller quantity on 1624/1620/1555/1366 — but that is a *quantity* observation, silent about mode, and it inverts the moment an air shipment is the larger one |
 
     **And most duplicate-key pairs are not transport splits at all.** On PO1555 — the largest set at 41 groups — both lines share one date, both are fully received, both fully billed, neither has an override. Same on 1620, 1514 and 1366. Only PO1624 shows the asymmetric one-open/one-closed shape. So a rule of "two recap rows means update both lines" must not be generalised into "a duplicate key means a transport split"; the two are different phenomena that happen to coincide on one PO. Worth asking Paula what these pairs mean on the other POs before anything keys on them.
+
+25. **NEW 2026-09-09 — the footwear workbook's ACTUAL labelled figures, because a wrong set has been circulating in this project's briefs.** Read off the sheets cell by cell, not from any prior note:
+
+    | Row | Sheet `20138` | Sheet `20139` (twice — two colour blocks) | Total |
+    |---|---|---|---|
+    | labelled `By Sea` | 256 | 592 + 592 | **1,440** |
+    | labelled `By UPS` | 44 | 8 + 8 | **60** |
+    | **unlabelled** recap (sheet `20140` R39) | — | — | **600** |
+
+    `1,440 + 600 = 2,040`, and **2,040 is the document grand total** — printed on sheet `20140` at R41 beside `255` cartons. The extractor reproduces every one of these figures exactly.
+
+    **The previously-circulated "By Sea 2,040 / By UPS 140 / Ordered 2,180" is WRONG.** Named here so nobody re-derives it from an old note:
+    - **2,040 is the grand total, not the By Sea subtotal.** It is the three labelled `By Sea` rows *plus* sheet `20140`'s unlabelled 600.
+    - **140 appears nowhere in the workbook.** It is `2,180 − 2,040`, subtracted from a figure that was itself mis-read. The labelled `By UPS` rows sum to **60**.
+    - **2,180 appears nowhere either.** There is no document-wide `Ordered` row; sheet `20138` alone prints `Ordered Qty`, at 300.
+
+    The error was self-reinforcing, which is why it lasted: `1,440 + 600 = 2,040` makes the wrong reading arithmetically satisfying, and the subtraction then manufactures a plausible companion figure out of nothing.
+
+    **Sheet `20140`'s 600-unit recap row carries NO transport-mode label, and it stays unlabelled.** Its `recap_label` is empty, its 7 lines take the ordinary single-row path, and they account for 7 of the 12 non-assignment changes. **Do not attribute it to a mode.** The temptation is real — 1,440 + 600 reconciling to the grand total makes "so the 600 must be sea" feel obvious — but the sheet does not say so, and extraction rule 2b exists precisely to stop the tool inventing a label the document withholds. If that 600 needs attributing, Paula attributes it.
 
 ## 7. Design constraints discovered by testing
 
@@ -541,6 +560,19 @@ row. A partial PO looks complete, which is what makes it worse than a failed rea
 Zero false positives on current data: the largest PO in the account is **380 lines**
 (`PO0001497`) and **no PO has 1,000 or more**, so the guard raises on nothing today
 and exists for the PO that eventually does.
+
+### `recap_label` is in the EXTRACTION key and NOT in the NetSuite-side key
+
+Two keys, deliberately asymmetric, and the asymmetry is the design rather than an oversight:
+
+- **Extraction side** — `(PO, style, colour, size, recap_label)`. Used by `aggregate_lines`, stored as `proposed_changes.key_recap_label`, and enforced by `ux_proposed_changes_canonical_key`. Two recap rows for one size are two rows.
+- **NetSuite side** — `(PO, style, colour, size)`, unchanged. `matcher._find_matching_lines` does **not** filter candidates by recap label, and `_sibling_key` deliberately drops it so sibling rows can see each other.
+
+**Why they differ: the slip labels its rows and NetSuite does not.** A PO line carries no transport-mode field at all — 49 line fields, none of them mode, carrier, incoterm or freight, and `rate` and `leadTime` identical on both lines in all 73 duplicate groups (§6 item 24). On the extraction side the distinction is *read from the document*; on the NetSuite side there is nothing to read.
+
+**This is not a reversal of §6 item 10** ("you cannot fix this by improving the key"). That finding was about the NetSuite side specifically and still holds: adding a column there would mean inventing a distinction the record does not make. Adding a label the vendor printed to the extraction-side key is reading the source. Opposite situations, opposite answers — and the mistake to avoid is applying either conclusion to the other side.
+
+The consequence worth holding onto: **an assignment case exists precisely because the extraction key splits while the NetSuite key does not.** N rows meet N lines and neither key resolves which goes with which, which is why the outcome is `NEEDS_ASSIGNMENT` and a human — not a cleverer key.
 
 ### Migration 0001 does not freeze its seed data, so every state-adding migration must be conditional
 
@@ -737,7 +769,19 @@ Two working consequences:
   these vendors were all in triage, file reading, and key derivation — the parts
   already considered settled.
 
-### 10. A signal the tool itself writes is an echo, not evidence
+### 10. A figure is not verified by having appeared in a prior report
+
+Two of this project's most confident claims were wrong and survived several rounds of citation, because each was re-quoted from the previous write-up instead of re-read from the source.
+
+**The footwear totals.** "By Sea 2,040 / By UPS 140 / Ordered 2,180" travelled through briefs and into a change specification. The workbook actually says **By Sea 1,440, By UPS 60, and an unlabelled 600** — 2,040 is the grand total, and 140 and 2,180 appear nowhere in it (§6 item 25). Self-reinforcing, which is why it lasted: `1,440 + 600 = 2,040` makes the wrong reading arithmetically satisfying, and `2,180 − 2,040` then manufactures a plausible companion figure from nothing. Caught only because the implementation's output disagreed with the specification and the sheets were re-read to settle which was wrong.
+
+**`SuiteAnalytics Workbook`.** Five probe cycles reported "this permission is not the cause" while the permission had never been applied to the role at all (§8 lesson 1). Each cycle cited the previous one's elimination rather than re-checking the role's saved state, and the byte-identical error message that should have been the tell was read as confirmation instead.
+
+The rule: **when a number or an elimination matters, re-derive it from the source — and say in the report which of the two you did.** A figure repeated from an earlier report inherits that report's confidence without inheriting any of its evidence. The tells are cheap to watch for: a figure nobody can point at a cell for, a difference that is suspiciously round, an elimination whose only evidence is another elimination.
+
+Corollary, straight from the footwear case: **when the code and the spec disagree, check the source before assuming the code is wrong.** The implementation had reproduced the document faithfully; the specification had not.
+
+### 11. A signal the tool itself writes is an echo, not evidence
 
 The sharpest trap found so far, and it is invisible unless you ask where a field's value comes from. When the tool needed to pair two shipment rows with two PO lines (§6 item 23), `custcol_override_expected_receipt` and `custcol_sd_updatedreceiptdate` differed within 31 of 73 duplicate groups — the second-best correlation of any field, and semantically plausible: an already-updated line looks like the settled one.
 
@@ -747,7 +791,7 @@ The check is one question, and it generalises to anything learned from live data
 
 Corollary worth keeping: **the most convincing-looking candidate deserves the most suspicion**, because plausibility is exactly what stops anyone checking provenance.
 
-### 11. Describe removed sensitive data by CATEGORY, never by value
+### 12. Describe removed sensitive data by CATEGORY, never by value
 
 **The hygiene commit is the likeliest place for the data to survive, because you are writing about exactly what you took out.** This is not a hypothetical: the 2026-09-02 commit that moved four third-party files out of the working tree **transcribed all four categories verbatim** into its own commit message *and* into the RUNBOOK entry recording the move — a retailer's name, a MID code, a bank account number and a SWIFT code. The tree was clean and the permanent record was not. Caught only because a later audit grepped the unpushed commits rather than trusting the earlier "moved it out" report; fixed by rewriting all seven unpushed commits before anything was pushed.
 

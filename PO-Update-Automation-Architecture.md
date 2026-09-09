@@ -231,7 +231,20 @@ Four boundaries, settled rather than provisional. Each is asserted by a test, no
 - **The tool NEVER creates PO lines. It updates existing lines only.** A vendor line with no NetSuite counterpart is a flag, never an insert; the client exposes no create path at all. Note the deliberate consequence: **who creates the second duplicate-key line, and why, is explicitly out of scope for this tool.** Understanding that is a business question for Paula and whoever runs receiving — the tool's job is to refuse to guess, not to explain the data.
 - **The tool NEVER derives a date from a vendor document.** Dates come from Paula, who gets them from the freight forwarder and applies her own buffers. Vendor ETD/ETA are carried as reference text only; `ProposedChange` has no `proposed_*_date` field for a derived date to live in, and `to_netsuite_fields(include_dates=True)` raises `DateNotConfirmed` until a human calls `confirm_receipt_date()`.
 - **When a date IS written, all three fields go together with the same value** — `expectedReceiptDate`, `custcol_override_expected_receipt = true`, `custcol_sd_updatedreceiptdate` — per the sandbox test in §6. Writing only the override pair leaves the effective scheduling date stale.
-- **The tool NEVER reads, writes, or displays `custcol_sd_fg_excluderepspark`.** Paula manages that field manually. It is excluded even from the `NEEDS_RESOLUTION` candidate payload, where it would be the obvious thing to show — and it earned that exclusion twice over, having also failed as a discriminator at 25.5%.
+- **The tool NEVER reads, writes, or displays `custcol_sd_fg_excluderepspark`.** Paula manages that field manually. It is excluded even from the `NEEDS_RESOLUTION` candidate payload, where it would be the obvious thing to show — and it earned that exclusion twice over, having also failed as a discriminator at 25.5% (and again at 51 of 73 duplicate groups in the 2026-09-09 survey, which is the highest of any custom column and still not a reason to use it).
+- **The tool NEVER pairs shipment rows to PO lines when both sides are plural.** That is `NEEDS_ASSIGNMENT`, and the payload states `auto_assignable: False` outright rather than leaving a future reader to infer it. Not even when the counts match and exactly one pairing is arithmetically possible — "arithmetically possible" is not evidence about which line is which transport mode.
+
+**`NEEDS_RESOLUTION` and `NEEDS_ASSIGNMENT` are different states, and conflating them would lose the distinction that matters to the reviewer:**
+
+| | `NEEDS_RESOLUTION` (change 5) | `NEEDS_ASSIGNMENT` (change 8, transport modes) |
+|---|---|---|
+| Shape | **one** extracted line, **several** NetSuite lines | **several** extracted lines, **several** NetSuite lines |
+| What the tool cannot tell | which NetSuite line this single shipment row belongs to | how to pair N rows with N lines — no basis for any pairing |
+| What the human does | **selects** one candidate | **assigns** each row to a line; picking one constrains the rest |
+| Payload | `candidate_lines` | `assignment`: both sides, plus `auto_assignable: False` |
+| Trigger | `(PO, style, colour, size)` is not unique per NetSuite line | the slip split one size across transport-mode recap rows (`By Sea`, `By UPS`) and the PO holds a line per mode |
+
+The reason it is not one state with a count: a selection is independent per row, whereas an assignment is a **constraint satisfaction problem across a group** — assigning `By Sea` to line 5 removes line 5 from what `By UPS` may choose. A review screen that treats the two the same will offer the second row a choice that is already taken. Both refuse to guess; only one of them has cross-row consequences.
 
 ## 6.1 Business logic questions — Paula's answers (2026-08-10)
 

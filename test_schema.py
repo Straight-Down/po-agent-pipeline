@@ -201,6 +201,147 @@ def mk_change(conn, shipment_id, po_id, size="s", state=sc.STATE_PENDING_REVIEW,
 # ---------------------------------------------------------------------------
 
 
+def test_migration_seed_matches_schema() -> None:
+    """
+    Migrate an empty database to head, then compare CONTENT against schema.py.
+
+    This is the actual fix for migration 0001 having imported `schema.CHANGE_STATES`,
+    `CHANGE_STATE_TRANSITIONS` and `VIEWS` live -- freezing those literals stops the
+    drift that had already happened, and this stops the next one.
+
+    Three properties, each chosen because the obvious weaker version misses a real
+    failure:
+
+    - **Content, not counts.** A flipped `is_terminal` or an edited description leaves
+      the row count intact. Every column of every row is compared.
+    - **Set equality BOTH ways.** A row in the database and absent from `schema.py`
+      is the case that matters most: **removing** a transition from `schema.py`
+      without a migration leaves it live in every existing database while a fresh one
+      never gets it, and since `assert_transition` reads the table at runtime, the two
+      genuinely disagree about what is legal. A one-directional check misses a
+      deletion entirely.
+    - **Normalised view DDL.** Compared with whitespace collapsed, so reformatting a
+      view definition does not fail the test while a changed column list does.
+    """
+    section("migrating an empty database to head reproduces schema.py exactly")
+    import re
+    import tempfile as _tf
+
+    from alembic import command
+    from alembic.config import Config
+
+    def norm(sql: str) -> str:
+        return re.sub(r"\s+", " ", (sql or "").strip()).lower()
+
+    with _tf.TemporaryDirectory() as td:
+        db = Path(td) / "seed.db"
+        cfg = Config(str(HERE / "alembic.ini"))
+        cfg.set_main_option("script_location", str(HERE / "migrations"))
+        cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db.as_posix()}")
+        command.upgrade(cfg, "head")
+
+        engine = sc.connect(f"sqlite:///{db.as_posix()}")
+        with engine.connect() as conn:
+            in_db_states = {
+                (r[0], bool(r[1]), r[2])
+                for r in conn.execute(text(
+                    "SELECT state, is_terminal, description FROM change_states"))
+            }
+            in_db_trans = {
+                (r[0], r[1], r[2], r[3])
+                for r in conn.execute(text(
+                    "SELECT from_state, to_state, trigger, actor_kind "
+                    "FROM change_state_transitions"))
+            }
+            in_db_views = {
+                r[0]: norm(r[1])
+                for r in conn.execute(text(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'view'"))
+            }
+        engine.dispose()
+
+    want_states = {(s, bool(t), d) for s, t, d in sc.CHANGE_STATES}
+    want_trans = {(f, t, g, a) for f, t, g, a in sc.CHANGE_STATE_TRANSITIONS}
+    want_views = {n: norm(d) for n, d in sc.VIEWS}
+
+    # -- change_states, every column, both directions -------------------------
+    check(in_db_states == want_states,
+          "change_states matches schema.py EXACTLY -- name, is_terminal and description",
+          f"{len(in_db_states)} in db, {len(want_states)} declared")
+    missing = want_states - in_db_states
+    extra = in_db_states - want_states
+    check(not missing, "no state declared in schema.py is missing from the database",
+          str(sorted(s[0] for s in missing)) if missing else "none")
+    check(not extra, "and no state in the database is absent from schema.py (a DELETION "
+          "from schema.py with no migration would show up here)",
+          str(sorted(s[0] for s in extra)) if extra else "none")
+
+    # -- change_state_transitions, including the trigger STRING ---------------
+    check(in_db_trans == want_trans,
+          "change_state_transitions matches EXACTLY -- including trigger and actor_kind",
+          f"{len(in_db_trans)} in db, {len(want_trans)} declared")
+    t_missing = want_trans - in_db_trans
+    t_extra = in_db_trans - want_trans
+    check(not t_missing, "no declared transition is missing from the database",
+          str(sorted((t[0], t[1]) for t in t_missing)) if t_missing else "none")
+    check(not t_extra,
+          "and no transition in the database is absent from schema.py -- the case that "
+          "makes two databases at head disagree about legality",
+          str(sorted((t[0], t[1]) for t in t_extra)) if t_extra else "none")
+    # A mutated trigger keeps the (from, to) pair, so compare that dimension too.
+    db_trigs = {(t[0], t[1]): (t[2], t[3]) for t in in_db_trans}
+    want_trigs = {(t[0], t[1]): (t[2], t[3]) for t in want_trans}
+    changed = [k for k in db_trigs.keys() & want_trigs.keys() if db_trigs[k] != want_trigs[k]]
+    check(not changed, "and no trigger or actor_kind differs on a shared (from, to) pair",
+          str(changed) if changed else "none")
+
+    # -- views ----------------------------------------------------------------
+    check(set(in_db_views) == set(want_views), "both views exist and no others",
+          str(sorted(in_db_views)))
+    for name in sorted(want_views):
+        check(in_db_views.get(name) == want_views[name],
+              f"{name} DDL matches schema.py (whitespace-normalised)",
+              "differs" if in_db_views.get(name) != want_views[name] else "identical")
+
+
+def test_migrations_import_no_application_code() -> None:
+    """
+    No migration may import project code. Source-level, so it cannot be evaded.
+
+    Prevents the pattern returning rather than catching its consequences later: a
+    migration that imports `schema` writes whatever that module holds when it runs,
+    which makes the data depend on the calendar instead of the revision. Checked by
+    reading the source rather than by importing, so a migration that would fail at
+    import time is still audited.
+    """
+    section("migrations import no application code")
+    import ast
+
+    versions = sorted((HERE / "migrations" / "versions").glob("*.py"))
+    check(len(versions) >= 4, "found the migration modules", f"{len(versions)} file(s)")
+
+    # Everything importable from this project, so the check names the offender
+    # rather than just failing.
+    project_modules = {p.stem for p in HERE.glob("*.py")} - {"conftest"}
+
+    for path in versions:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported.add(node.module.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.level:
+                imported.add(f"(relative import level {node.level})")
+        offenders = sorted(
+            m for m in imported
+            if m in project_modules or m.startswith("(relative")
+        )
+        check(not offenders, f"{path.name} imports no application code",
+              f"imports {offenders}" if offenders else f"only {sorted(imported)}")
+
+
 def test_migration_round_trip() -> None:
     section("migration: upgrade -> downgrade -> upgrade, and no drift")
     from alembic import command
@@ -1059,6 +1200,8 @@ def main() -> int:
         test_colour_provenance_columns,
         test_two_workflows_are_distinguishable,
         test_state_machine_is_data,
+        test_migration_seed_matches_schema,
+        test_migrations_import_no_application_code,
         test_scope_boundaries_in_the_schema,
         test_foreign_keys_are_enforced,
     ):

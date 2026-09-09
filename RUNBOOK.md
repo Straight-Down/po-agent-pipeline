@@ -96,6 +96,16 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
    **`.gitignore` now nets the invoice-shaped members of a set** (`/*COMMERCIAL INVOICE*.xls[x]`, `/*Clearance Invoice*.xls[x]`, `/*Payment invoice*.xls[x]`, `/*HBL*.pdf`, `/*BILL OF LADING*.pdf`), verified with `git check-ignore -v` in both directions — each moved file would now be ignored, and the four files we keep are not. That is a net for the next arrival, not a remedy for these; the remedy was moving them before they were ever added.
 
+   **THE GRAPH PRIVATE KEY GETS THE SAME TREATMENT, 2026-09-09.** `C:\dev\po-agent-secrets\po-agent-graph.key` — outside git, outside OneDrive, inheritance stripped and granted to the current user only:
+
+   ```powershell
+   icacls C:\dev\po-agent-secrets /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F"
+   ```
+
+   Recorded here so both private keys in this project have **one documented standard**, rather than one being protected and the other being an exception nobody wrote down. The public certificate (`po-agent-graph.cer`) sits beside it for convenience and is **not** secret — it was uploaded to Entra, so Microsoft holds it and anyone who can read the app registration can fetch it. `*.key`, `*.cer`, `*.crt`, `*.der`, `*.pem` and `*.pfx` are all gitignored as a second line, but the first line is the key not being in the tree at all. Full detail in `GRAPH-SETUP.md`.
+
+   **Do not verify that ACL from Git Bash** — `ls -l` misreports it, see §7.
+
    **Already in history, NOT acted on:** `SD #1720, 1721 INVOICE, PACKING LIST.pdf` is committed and pushed, and it carries a MID code, consignee details and an L/C issuing bank field. It is a Symmetry customs invoice that happens also to be a packing list, which is why it came in. **A history rewrite has not been attempted** — the repo is pushed and shared, so that is Kiko's call, not a cleanup to perform quietly. The mitigation meanwhile is the one already in place: the remote is private. Flagged here so the decision is visible rather than forgotten.
 2. ~~**The matcher doesn't check whether a NetSuite PO line is already closed before proposing a change to it.**~~ **FIXED 2026-08-11.** `matcher.build_proposed_changes` now checks `line.closed`: a vendor line matching a closed NetSuite line becomes `NEEDS_ATTENTION` with reason *"PO line is closed in NetSuite; vendor data references it but no automatic change proposed"*, never a `PENDING_REVIEW` quantity change. The write path refuses independently — `ProposedChange.to_netsuite_fields()` raises `LineClosed` — so a closed line can't be written even if something upstream tried. Other lines in the same shipment are unaffected.
 3. ~~**No retry/backoff for network timeouts or NetSuite 5xx errors.**~~ **FIXED 2026-08-11.** `NetSuiteClient._request` retries up to 3 attempts with exponential backoff (0.5s, 1.0s) for connection errors, timeouts and 5xx responses, then raises `NetSuiteTransientError` carrying the attempt count and last status — so the audit log can tell "NetSuite was down" from "the request was wrong". **4xx is never retried**, deliberately: NetSuite returns permission denials as 400s, so retrying client errors would delay and risk masking exactly the failures that most need to surface immediately. SSL errors also propagate rather than retrying, being a config problem rather than a blip.
@@ -573,6 +583,26 @@ Two keys, deliberately asymmetric, and the asymmetry is the design rather than a
 **This is not a reversal of §6 item 10** ("you cannot fix this by improving the key"). That finding was about the NetSuite side specifically and still holds: adding a column there would mean inventing a distinction the record does not make. Adding a label the vendor printed to the extraction-side key is reading the source. Opposite situations, opposite answers — and the mistake to avoid is applying either conclusion to the other side.
 
 The consequence worth holding onto: **an assignment case exists precisely because the extraction key splits while the NetSuite key does not.** N rows meet N lines and neither key resolves which goes with which, which is why the outcome is `NEEDS_ASSIGNMENT` and a human — not a cleverer key.
+
+### `ls -l` lies about Windows ACLs, so never audit file permissions from Git Bash
+
+`C:\dev\po-agent-secrets\po-agent-graph.key` is locked to a single user — inheritance stripped, `icacls ... /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F"`. From this project's Git Bash shell it reports as:
+
+```
+-rw-r--r-- 1 kiko.barroso 1049089 1704 Sep 9 11:17 po-agent-graph.key
+```
+
+**World-readable, apparently.** It is not. MSYS synthesises POSIX permission bits for a security model that has no POSIX bits in it, and when it cannot express a Windows ACL it emits a plausible default rather than an error. The private key was correctly protected the entire time the `044` group and other bits were being displayed.
+
+This is not academic: **it produced a false finding in this very repo.** A permissions audit on 2026-09-09 reported the Graph key as world-readable and recommended tightening an ACL that was already correct, and it took the person who ran `icacls` to say so. The report was wrong in the *safe* direction, which is the more insidious case — a false alarm costs a cycle, but the same tool would equally happily render a genuinely open file as `-rw-r--r--` and hide a real problem.
+
+**Check Windows permissions with a Windows tool:**
+
+```powershell
+icacls C:\dev\po-agent-secrets
+```
+
+Same class of mistake as §8 lesson 11 (a figure is not verified by having appeared in a prior report): the output *looked* like evidence, so nobody asked what produced it. The general rule — **when a tool translates between two models, its output describes the translation, not the thing.** MSYS on ACLs, `git status` on case-only renames, and `stat` on a network share are all the same shape.
 
 ### Migrations freeze their data as literals and import no application code
 

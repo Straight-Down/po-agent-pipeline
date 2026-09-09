@@ -693,6 +693,19 @@ Two working consequences:
   these vendors were all in triage, file reading, and key derivation — the parts
   already considered settled.
 
+### 10. Describe removed sensitive data by CATEGORY, never by value
+
+**The hygiene commit is the likeliest place for the data to survive, because you are writing about exactly what you took out.** This is not a hypothetical: the 2026-09-02 commit that moved four third-party files out of the working tree **transcribed all four categories verbatim** into its own commit message *and* into the RUNBOOK entry recording the move — a retailer's name, a MID code, a bank account number and a SWIFT code. The tree was clean and the permanent record was not. Caught only because a later audit grepped the unpushed commits rather than trusting the earlier "moved it out" report; fixed by rewriting all seven unpushed commits before anything was pushed.
+
+The rule, and it costs nothing: write **"a US retailer as consignee"**, **"a MID code"**, **"the freight agent's bank, account number and SWIFT"**. Every operational point survives — which file, which category, which party role, why it matters — and no identifier does. The entry exists to establish a *pattern*; the digits were never the point.
+
+Two corollaries, both learned the same day:
+
+- **Grep the messages, not just the trees.** `git log --name-only` says nothing about content, and a commit message is as permanent as a blob and is not covered by `.gitignore`, a file move, or a cell-level scan of the working tree. The audit that found this ran `git log origin/main..HEAD --format=%B | grep -i` over every unpushed commit.
+- **A scan for third-party data must cover PARTY NAMES as well as ACCOUNT IDENTIFIERS.** The same audit initially reported the fixtures clean because its needles were numbers, SWIFT codes and MID codes. A second pass for company names found the freight forwarder's name sitting in a `Shipped Per` header cell on all three footwear packing sheets — `B22`, well outside the bank block anyone would think to check. An invoice hides its identifiers in an obvious place and its names in ordinary fields.
+
+The unpushed window is the whole of the cheap-fix opportunity, so **audit before pushing, not after**. Rewriting seven local commits took minutes; the same content on a shared remote is a coordination problem plus a disclosure question.
+
 ## 9. How to recover when something breaks
 
 | Symptom | Likely cause | What to do |

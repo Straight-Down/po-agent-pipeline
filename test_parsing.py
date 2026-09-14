@@ -4091,6 +4091,15 @@ def main() -> int:
             test_no_packing_sheet_becomes_manual_entry,
             test_manual_entry_path, test_matcher_handoff,
         ]
+        # A test registered twice runs twice and its checks are counted twice.
+        # That is how test_schema reported 115 for 105 distinct checks until a
+        # pytest run, which collects each function once, disagreed with the
+        # script (RUNBOOK section 8 lessons 18 and 19). Both lists are checked:
+        # `offline` here and the live group below.
+        dupes = sorted({f.__name__ for f in offline if offline.count(f) > 1})
+        check(not dupes, "no offline test is registered more than once",
+              str(dupes or "none"))
+
         for fn in offline:
             try:
                 fn(tmp)
@@ -4114,9 +4123,13 @@ def main() -> int:
             _results.append((False, "test_real_samples crashed", ""))
 
         if args.live:
-            for fn in (test_live, test_live_legendz, test_live_symmetry,
-                       test_live_tainan, test_live_footwear,
-                       test_live_attachment_triage):
+            live = (test_live, test_live_legendz, test_live_symmetry,
+                    test_live_tainan, test_live_footwear,
+                    test_live_attachment_triage)
+            dupes = sorted({f.__name__ for f in live if live.count(f) > 1})
+            check(not dupes, "no live test is registered more than once",
+                  str(dupes or "none"))
+            for fn in live:
                 try:
                     fn(tmp)
                 except Exception:  # noqa: BLE001

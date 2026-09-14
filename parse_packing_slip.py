@@ -16,10 +16,7 @@ Usage:
 import argparse
 import csv
 import re
-import sys
-from pathlib import Path
 
-import openpyxl
 
 from claude_extractor import open_pdf, open_workbook
 
@@ -51,7 +48,6 @@ def parse_packing_sheet(xlsx_path, sheet_name="PACKING"):
     r = 0
     current_po = None
     current_style = None
-    current_block_total_qty = None
 
     while r < len(grid):
         row = grid[r]
@@ -68,12 +64,10 @@ def parse_packing_sheet(xlsx_path, sheet_name="PACKING"):
         if po_match:
             current_po = po_match
             current_style = None
-            # total qty is usually the next numeric value in the row (before "PCS")
-            current_block_total_qty = None
-            for i, v in non_null:
-                if isinstance(v, (int, float)):
-                    current_block_total_qty = v
-                    break
+            # The block's total qty is the next numeric value in this row (before
+            # "PCS"). It was read here and never used -- the per-size figures are
+            # the authority and the total is only a cross-foot -- so it is no
+            # longer computed. Noted because the row DOES carry it.
             r += 1
             continue
 
@@ -133,10 +127,9 @@ def parse_packing_sheet(xlsx_path, sheet_name="PACKING"):
                 for c, v in enumerate(recap_row):
                     if isinstance(v, str) and v.strip().upper() != "TOTAL" and v.strip():
                         recap_col_to_size[c] = v.strip()
-                recap_total_col = None
-                for c, v in enumerate(recap_row):
-                    if isinstance(v, str) and v.strip().upper() == "TOTAL":
-                        recap_total_col = c
+                # The recap header also carries a "TOTAL" column. Its index was
+                # located here and never used -- per-size cells are summed
+                # instead -- so it is no longer computed.
 
                 # Now read subsequent rows: first cell = color code, then per-size qty, then total
                 cr = recap_header_row_idx + 1

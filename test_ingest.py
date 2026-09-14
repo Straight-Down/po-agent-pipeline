@@ -12,7 +12,6 @@ the persistence contract, which is the part that must not drift.
 from __future__ import annotations
 
 import datetime as dt
-import shutil
 import tempfile
 import traceback
 from pathlib import Path
@@ -1175,7 +1174,7 @@ def main() -> int:
     print("Offline: stubbed extractor, mock NetSuite. Pins the persistence contract;")
     print("the live corpus run is reported separately.")
 
-    for fn in (
+    REGISTERED = (
         test_ingest_writes_every_table,
         test_double_ingest_is_a_no_op,
         test_po_key_is_canonical,
@@ -1188,7 +1187,16 @@ def main() -> int:
         test_tranid_resolution,
         test_scope_boundaries,
         test_gaps_are_reported_not_defaulted,
-    ):
+    )
+
+    # A test registered twice runs twice and its checks are counted twice. That
+    # is how this suite reported 115 for 105 distinct checks until a pytest run,
+    # which collects each function once, disagreed with the script (RUNBOOK
+    # section 8 lessons 18 and 19). Cheap to assert, so the class cannot recur.
+    dupes = sorted({f.__name__ for f in REGISTERED if REGISTERED.count(f) > 1})
+    check(not dupes, "no test is registered more than once", str(dupes or "none"))
+
+    for fn in REGISTERED:
         try:
             fn()
         except Exception:  # noqa: BLE001

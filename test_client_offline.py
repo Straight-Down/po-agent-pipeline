@@ -876,7 +876,7 @@ def main() -> int:
     print("Proves everything except the live NetSuite round-trip. Phase 1 is NOT")
     print("complete until test_phase1_writeback.py passes with real credentials.")
 
-    for test in (
+    REGISTERED = (
         test_config_derivation,
         test_jwt_assertion,
         test_line_mapping,
@@ -887,7 +887,16 @@ def main() -> int:
         test_sublist_truncation_guard,
         test_tranid_transformation,
         test_mock_mode_unchanged,
-    ):
+    )
+
+    # A test registered twice runs twice and its checks are counted twice. That
+    # is how this suite reported 115 for 105 distinct checks until a pytest run,
+    # which collects each function once, disagreed with the script (RUNBOOK
+    # section 8 lessons 18 and 19). Cheap to assert, so the class cannot recur.
+    dupes = sorted({f.__name__ for f in REGISTERED if REGISTERED.count(f) > 1})
+    check(not dupes, "no test is registered more than once", str(dupes or "none"))
+
+    for test in REGISTERED:
         try:
             test()
         except Exception:

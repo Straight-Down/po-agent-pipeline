@@ -468,7 +468,7 @@ def main() -> int:
     print("=" * 78)
     print("CONFIGURATION TESTS")
     print("=" * 78)
-    for fn in (
+    REGISTERED = (
         test_graph_client_never_defaults,
         test_mock_needs_no_credentials,
         test_real_requires_everything,
@@ -476,7 +476,16 @@ def main() -> int:
         test_repr_leaks_nothing,
         test_one_dotenv_loader,
         test_no_credentials_in_tracked_files,
-    ):
+    )
+
+    # A test registered twice runs twice and its checks are counted twice. That
+    # is how this suite reported 115 for 105 distinct checks until a pytest run,
+    # which collects each function once, disagreed with the script (RUNBOOK
+    # section 8 lessons 18 and 19). Cheap to assert, so the class cannot recur.
+    dupes = sorted({f.__name__ for f in REGISTERED if REGISTERED.count(f) > 1})
+    check(not dupes, "no test is registered more than once", str(dupes or "none"))
+
+    for fn in REGISTERED:
         try:
             fn()
         except Exception:  # noqa: BLE001

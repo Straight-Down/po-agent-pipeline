@@ -66,24 +66,46 @@ While you're here: **Setup > Company > Company Information** → copy the
 
 - **Name:** `PO Update Automation (M2M)`
 - **Center Type:** Classic Center
-- **Web Services Only Role:** **leave UNCHECKED for now.** See Step 7 — we test
-  it deliberately rather than assuming, and starting unchecked means a first-run
-  auth failure can't be caused by this box.
+- **Web Services Only Role:** **check it.** Settled 2026-08-04 — harmless in
+  either state for M2M, and checked is the hardened choice (Step 8). Earlier
+  revisions said to leave it unchecked until tested; that test has been run.
+  **Do not copy this setting from the interactive OAuth flow, where it must be
+  UNCHECKED** — the two grants want opposite values (architecture doc §6).
 
-Then add exactly these five permissions (each on its own subtab, click **Add**
-after each):
+Then add exactly these **seven** permissions. **The subtab is part of the
+answer, not navigation** — two of these are not where their names suggest, and
+that is precisely where this went wrong the first time. Select the subtab, pick
+the permission, set the level, click **Add** to push the row into the sublist,
+and **Save**.
 
-| Subtab | Permission | Level |
-|---|---|---|
-| Transactions | Purchase Order | **Edit** |
-| Lists | Items | **View** |
-| Lists | Vendors | **View** |
-| Setup | REST Web Services | **Full** |
-| Setup | Log in using OAuth 2.0 Access Tokens | (checkbox, no level) |
+| Subtab | Permission | Level | What breaks without it |
+|---|---|---|---|
+| Transactions | Purchase Order | **Edit** | read and write the PO item sublist — the whole point |
+| Lists | Items | **View** | resolve item / style references |
+| Lists | Vendors | **View** | read the PO's vendor |
+| Setup | REST Web Services | **Full** | use the REST API at all |
+| Setup | Log in using OAuth 2.0 Access Tokens | (checkbox, no level) | the role is not even *selectable* in Step 5 |
+| **Setup** | **Custom Lists** | **View** | reading `customlist_psgss_product_size`, the size vocabulary |
+| **Reports** | **SuiteAnalytics Workbook** | **Edit** (the only level offered) | **every collection `GET`, every `?q=` filter, and all SuiteQL** |
 
-Save. Do **not** add anything beyond these five — the whole point of Phase 1
-is finding out whether this least-privilege set is sufficient for the write
-itself.
+**The two that are not where you would look for them:**
+
+- **`Custom Lists` is on the `Setup` subtab, not `Lists`** — despite governing
+  things called lists. It is also **not** `Custom Record Entries`, which governs
+  custom *records*. Custom lists carry no per-list permissions, so this is all or
+  nothing.
+- **`SuiteAnalytics Workbook` is on the `Reports` subtab**, which is the last
+  place anyone looks for something gating a REST endpoint. `Edit` is not a
+  compromise: the level dropdown offers **no `View`**, so `Edit` is the minimum
+  NetSuite permits (RUNBOOK §6 item 8).
+
+**Do not stop at the first five.** Earlier revisions of this document listed five
+and said not to add anything beyond them — correct while Phase 1 was an
+experiment asking whether the minimum set could write, and **wrong as a build
+instruction now**. A five-permission role authenticates, passes
+`test_phase1_writeback.py`, and then fails on every real vendor document, because
+a by-id write is not gated by `SuiteAnalytics Workbook` and a PO-number lookup is.
+See the `400 USER_ERROR` row in Troubleshooting for what that looks like.
 
 > **CONFIRMED FINDING (2026-08-04):** "Log in using OAuth 2.0 Access Tokens" is
 > required just for the role to be *selectable* on the OAuth 2.0 Client
@@ -93,7 +115,7 @@ itself.
 > now confirmed that it is. It's still a login permission, not a data
 > permission, so it doesn't widen what the role can read or write — it only
 > gates whether the role can authenticate via this flow at all. §6 has been
-> updated with this as the fifth required permission.
+> updated with this as a required permission.
 
 ---
 
@@ -229,11 +251,23 @@ Paste me the output either way.
 
 ---
 
-## Step 8 — The "Web Services Only Role" experiment
+## Step 8 — "Web Services Only Role" — SETTLED 2026-08-04, no experiment needed
 
-§6 reasons that checking this box is *likely* correct for M2M (a service-account
-role has no business supporting interactive UI login) but flags it as
-**empirically unverified against this account**. So verify it, in this order:
+**Check the box. It is harmless in *either* state — confirmed empirically on this
+account, for both authentication and the by-id write path — so this is a
+preference for the hardened configuration, not a requirement to verify.**
+
+Set it at Step 2 and skip the rest of this section. Its opposite reputation comes
+from the *interactive* Authorization Code grant, where checking it blocks the
+browser login outright; M2M has no browser login to block. Do not carry the
+interactive flow's setting across (architecture doc §6).
+
+<details>
+<summary>The experiment as originally written, kept for method rather than result</summary>
+
+§6 reasoned that checking this box was *likely* correct for M2M (a service-account
+role has no business supporting interactive UI login) but flagged it as
+**empirically unverified against this account**. The procedure was:
 
 1. Get a **PASS** in Step 7 with the box unchecked. Now you have a known-good
    baseline.
@@ -247,6 +281,13 @@ role has no business supporting interactive UI login) but flags it as
 
 Doing it in this order means a failure is unambiguously attributable to that one
 box. Don't skip step 1 and set both at once.
+
+**It was run, and it passed with the box checked.** The isolation discipline
+above is the part worth reusing — change one thing, keep a known-good baseline,
+attribute the failure unambiguously. It is the same discipline RUNBOOK §8 lesson
+2 arrived at from the opposite direction.
+
+</details>
 
 ---
 
@@ -262,6 +303,70 @@ box. Don't skip step 1 and set both at once.
 | Token works, write 403s | **The finding this phase is looking for.** Report it, don't widen the role |
 | Write returns 204 but a value didn't change | Field-level access restriction — also a finding. Check *Customization > Lists,Records,&Fields > Transaction Line Fields > [field] > Access* |
 | Everything breaks after a sandbox refresh | Sandbox refresh wipes Integration records and certificate mappings. Redo Steps 1–5; the keypair itself stays valid |
+| **`400` with `USER_ERROR: Your current role does not have permission to perform this action`** on a *collection* call | **Missing `Reports > SuiteAnalytics Workbook`.** See below — this is the one that looks like a bad request rather than a permission problem |
+
+### The `400 USER_ERROR` signature, in full
+
+The single most misleading failure in this setup, because **NetSuite does not use
+`403` for it.** A genuine permission refusal arrives as:
+
+```
+HTTP 400
+{"type":"...","title":"Bad Request","status":400,
+ "o:errorDetails":[{"detail":"Your current role does not have permission to perform
+                    this action. Please contact your account administrator.",
+                    "o:errorCode":"USER_ERROR"}]}
+```
+
+`400` and `Bad Request` both say *you sent something wrong*. Nothing was wrong
+with the request. Any error handling that branches on `403` to mean "permissions"
+will classify this as a malformed call and send you to debug the payload.
+
+**What makes it hard to attribute: by-id reads and writes keep working.**
+
+| Call | Without `SuiteAnalytics Workbook` |
+|---|---|
+| `GET /purchaseOrder/8489541` | **200** — works |
+| `PATCH /purchaseOrder/8489541` (the sublist write) | **204** — works |
+| `GET /purchaseOrder?limit=1` | **400 `USER_ERROR`** |
+| `GET /purchaseOrder?q=tranId IS "PO0001662"` | **400 `USER_ERROR`** |
+| `POST /query/v1/suiteql` | **400 `USER_ERROR`** |
+
+So `test_phase1_writeback.py` passes on a role missing it — that test targets an
+internal id directly. The failure surfaces later, on the first real vendor
+document, where a printed `1662` has to be resolved to internal id `8489541`.
+
+**`Edit` is the only level offered.** The role editor's level dropdown for this
+permission has no `View` entry; Oracle's own documentation says *"set the access
+to Edit"* rather than describing a range. It is the minimum, not a widening.
+
+---
+
+## Re-verification: any permission change re-runs the write-back test
+
+**Rule, and it is not optional: change the role's permission set — add, remove or
+re-level anything — and re-run `test_phase1_writeback.py`. Then date the result in
+RUNBOOK §6.**
+
+This exists because the connection was missing once and nobody noticed for six
+weeks. The role was proven on 2026-08-04 with five permissions. It gained
+`SuiteAnalytics Workbook` on 2026-08-12 and `Custom Lists` after that, and
+**nothing re-ran the test that had proven the write**. The claim "the write path
+works under this role" silently became a claim about a role that no longer
+existed. It did in fact still pass when finally re-run on 2026-09-14 — but that
+was luck confirmed after the fact, not a controlled state.
+
+Two reasons the test is the right instrument rather than re-reading the role
+screen:
+
+- **A permission can read as set and never have been saved** (RUNBOOK §8 lesson
+  1 — `SuiteAnalytics Workbook` sat at `None` through five probe cycles that all
+  believed it was on). The role editor shows intent; the test shows behaviour.
+- **NetSuite can accept a `PATCH` with `204` and silently discard a field** it
+  will not let the role write. Only a field-by-field read-back catches that, which
+  is exactly what Step 3 of the test does.
+
+Cheap to run — under a minute, reverts what it writes, and verifies the revert.
 
 ---
 

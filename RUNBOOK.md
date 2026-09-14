@@ -446,6 +446,27 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
     **The open thread: ask IT to list the thumbprints currently on the registration.** This tool cannot see them. Listing an app registration's own credentials needs `Application.Read.All`, which this app does not have and should not be given for reading mail. IT did state in the morning that ours was the only certificate — but that was *before* the upload that actually put ours there, so it describes a registration state that no longer exists. Any thumbprint other than `E05CF5DB8EBFC7CAF259FD5EA6678B966353F016` is an **unclaimed public key**: nobody here holds its private half, so it cannot serve this pipeline, and its presence means Entra would accept an assertion signed by whoever does.
 
     **The certificate took two attempts to land, and the failure mode is worth knowing.** The first probe run got `AADSTS700027` (*the key was not found*) despite that morning's confirmation that the thumbprint was correct — it was correct, and it had not been uploaded. Re-verifying the local pair immediately afterwards is what isolated the fault to the Entra side rather than leaving it ambiguous. `GRAPH-SETUP.md` carries the timeline; the general lesson is §8 lesson 11.
+27. **NEW 2026-09-14 — the write-back test re-ran under the current SEVEN-permission role and passed.** Recorded because the previous pass was a claim about a role that had stopped existing.
+
+    **What was wrong with the old evidence.** `test_phase1_writeback.py` passed on **2026-08-04** against a **five**-permission role. The role then gained `Reports > SuiteAnalytics Workbook` on 2026-08-12 and `Setup > Custom Lists` after it, and `netsuite_client.py` changed across seven commits. Nothing re-ran the test. The sentence "the write path works under the least-privilege role" stayed in the build plan and quietly changed meaning underneath itself.
+
+    **The re-run, 2026-09-14, sandbox `1321665-sb2`, PO internal id 8489541 line 18** (`M120246 : M120246-Waterman Polo-TID-3X`, style/colour/size confirmed before writing):
+
+    | Field | Before | Written | Read back | Reverted to |
+    |---|---|---|---|---|
+    | `quantity` | 2 | 99 | 99 | 2 |
+    | `expectedReceiptDate` | 2026-07-15 | 2026-06-27 | 2026-06-27 | 2026-07-15 |
+    | `custcol_override_expected_receipt` | False | True | True | False |
+    | `custcol_sd_updatedreceiptdate` | None | 2026-06-27 | 2026-06-27 | None |
+
+    All four in **one** PATCH — `HTTP 204` — then verified individually, reverted, and **each revert verified too**. Exit 0. Auth was M2M/JWT with no browser, token in ~4s.
+
+    **It also rules out the quiet failure, which is the reason the test reads back field by field.** NetSuite can accept a PATCH with `204` and **silently discard** a field the role is not permitted to write — no error, no indication, the old value simply still there. A test that checked only the status code would pass on a role that wrote nothing. Both custom fields, the two most likely to carry field-level access restrictions independent of record-level Edit, came back changed.
+
+    **The rule this produced, now written into `NETSUITE-M2M-SETUP.md` and the build plan's Phase 4 role procedure: ANY change to the role's permission set — add, remove, or re-level — re-runs this test, and the result gets dated here.** The gap existed because nothing connected a permission change to the test that had proven the write; they were related only in someone's memory. Linking them in both documents is what stops it drifting again. It costs under a minute, it reverts what it writes, and it verifies the revert.
+
+    Note what this does **not** cover: the test targets an internal id directly, so it passes on a role with no collection access at all. That is why a five-permission role would pass here and still fail on every real vendor document — see §6 item 2 and the `400 USER_ERROR` signature in the setup doc.
+
 
 ## 7. Design constraints discovered by testing
 

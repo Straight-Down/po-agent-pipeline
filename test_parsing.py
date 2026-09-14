@@ -36,9 +36,12 @@ what they contain. Tests here assert the invoice is *rejected* by the attachment
 classifier, which is the behaviour that prevents repeating the mistake.
 
 That is the generalization evidence the build plan's Risks section asked for:
-three real vendors, materially different layouts. It is still three, not thirty
-— every new vendor is a new layout, so read a green run as "works on what we've
-seen", not "works on anything".
+three real vendors validated live, materially different layouts, plus two more
+(Tainan, Footwear) committed as fixtures and covered offline only. Five, not
+thirty — every new vendor is a new layout, and the two most recent arrivals
+produced four defects between them before the matcher was reached at all
+(RUNBOOK §8 lesson 9). Read a green run as "works on what we've seen", not
+"works on anything".
 
 Group C costs API tokens and is opt-in. Without --live the Claude path is only
 checked against a mock, and the runner says so in its closing summary.
@@ -3591,7 +3594,8 @@ def main() -> int:
             _missing_coverage.append(
                 "Live Claude path not exercised (no --live flag).\n"
                 "      -> the extractor's prompt is only tested against a mock in this run.\n"
-                "         Run with --live to check it against all three real vendors."
+                "         Run with --live to check it against the three vendors the live\n"
+                "         group covers: Inprotex, Legendz and Symmetry."
             )
 
     passed = sum(1 for ok, _, _ in _results if ok)
@@ -3613,9 +3617,14 @@ def main() -> int:
         for gap in _missing_coverage:
             print(f"  - {gap}")
         print()
-        print("  The Claude-assisted extractor is the PRIMARY parsing path for this project")
-        print("  and has not been run against a single real vendor document. Getting a second")
-        print("  and third real vendor file is the highest-value next step (build plan, Risks).")
+        print("  The Claude-assisted extractor is the PRIMARY parsing path for this project.")
+        print("  It HAS been validated live against three vendors -- Inprotex, Legendz and")
+        print("  Symmetry -- which is what --live re-checks. Two more are committed as")
+        print("  fixtures and exercised OFFLINE ONLY: Tainan (legacy .xls, two-axis sizes)")
+        print("  and Footwear (transport-mode recap rows). Their live extraction figures")
+        print("  are recorded in the RUNBOOK but are asserted by nothing here, so those")
+        print("  two vendors can regress without this suite noticing. Adding them to the")
+        print("  --live group needs hand-derived ground truth committed first.")
     print("=" * 78)
     return 1 if failed else 0
 

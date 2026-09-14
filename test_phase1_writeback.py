@@ -245,7 +245,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"    {info['collection_listing_detail']}")
         print("    Not a Phase 1 blocker (this test targets an internal id directly), but it")
         print("    WILL block Phase 2: resolving a PO number like '1662' to internal id")
-        print("    '8489541' needs the collection/search endpoint. Flagged in the summary.")
+        print("    '8489541' needs the collection/search endpoint. Cause is known --")
+        print("    Reports > SuiteAnalytics Workbook, Edit. Flagged in the summary.")
 
     if not ok:
         return 1
@@ -418,10 +419,14 @@ def run(args: argparse.Namespace) -> int:
         if not info["collection_listing_ok"]:
             print("  OPEN FINDING carried forward (does NOT affect this pass):")
             print("    This role cannot list/search record collections, so it cannot yet map a")
-            print("    PO NUMBER to an internal id -- needed from Phase 2 on. Resolve with your")
-            print("    NetSuite admin before Phase 2; do not widen the role unilaterally.")
+            print("    PO NUMBER to an internal id -- needed from Phase 2 on. The cause is")
+            print("    KNOWN: add Reports > SuiteAnalytics Workbook at Edit (the only level")
+            print("    offered). Reports subtab, not Setup. See NETSUITE-M2M-SETUP.md.")
             print()
-        print("  Next: Prompt 2 in Claude-Code-Kickoff-Prompts.md (the parsing layer).")
+        print("  Re-run this test after ANY change to the role's permission set, and")
+        print("  date the result in RUNBOOK section 6. The role gained two permissions")
+        print("  in August and nothing re-ran this; the claim it had proven silently")
+        print("  became a claim about a role that no longer existed.")
         print()
     elif exit_code == 3:
         print()

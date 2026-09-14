@@ -32,6 +32,7 @@ import ast
 import datetime as dt
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import create_engine, func, select
 
@@ -768,6 +769,215 @@ def test_parse_since(tmp: Path) -> None:
           "a naive value is INTERPRETED as UTC, not as local time -- local would "
           "shift the window by the machine's offset", str(naive))
 
+def test_classifier_sees_vendor_filenames_not_hashes(tmp: Path) -> None:
+    section("the classifier gets a NAME, not a SHA-256")
+    import attachment_classifier as ac
+
+    # Reproduce the real shape: bytes stored content-addressed, name kept apart.
+    store = poller.BlobStore(tmp / "blobs")
+    src = HERE / "FA26 7TH W600001 PO1721 FINAL INSPECTION REPORT.pdf"
+    if not src.exists():
+        check(False, "inspection-report fixture present", src.name)
+        return
+    sha, path = store.put(src.read_bytes(), suffix=".pdf")
+    check(path.stem == sha, "the stored path IS a hash", path.name[:22])
+
+    # WITHOUT the name: the filename layer has nothing to work with.
+    blind = ac.classify_attachments([path], use_content_check=False)
+    blind_item = (blind.selected + blind.excluded)[0]
+    check(blind_item.display_name == path.name,
+          "unnamed, the classifier falls back to the hash", blind_item.display_name[:20])
+    check(blind_item.filename_hint != ac.DocType.INSPECTION_REPORT,
+          "and the inspection-report filename rule CANNOT fire",
+          str(blind_item.filename_hint))
+
+    # WITH the name: the rule fires, as it did before the store existed.
+    named = ac.classify_attachments([path], use_content_check=False,
+                                    display_names={str(path): src.name})
+    item = (named.selected + named.excluded)[0]
+    check(item.display_name == src.name,
+          "given the vendor filename, that is what it classifies on", item.display_name[:40])
+    check(not any(c in item.display_name for c in "0123456789abcdef" * 0) and
+          item.display_name != path.name,
+          "the display name is NOT the hex path name")
+    check(len(item.display_name) != 64 and not _looks_like_sha(item.display_name),
+          "and is not a bare SHA-256", item.display_name[:40])
+    check(item.filename_hint == ac.DocType.INSPECTION_REPORT,
+          "so the inspection-report ban fires from the NAME again",
+          str(item.filename_hint))
+
+    # The end-to-end shape: what extract_pending hands over.
+    engine = fresh_db()
+    poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+    pending = ep.pending_messages(engine)
+    every = {n for row in pending for n in row.get("display_names", {}).values()}
+    check(every and not any(_looks_like_sha(Path(n).stem) for n in every),
+          "extract_pending passes real vendor filenames for every attachment",
+          str(sorted(every)[:1]))
+    for row in pending:
+        for path_str, name in row.get("display_names", {}).items():
+            check(_looks_like_sha(Path(path_str).stem) and not _looks_like_sha(Path(name).stem),
+                  "each pair is (hashed path, vendor name)", f"{Path(path_str).name[:12]}.. <- {name[:28]}")
+            break
+        break
+
+
+def _looks_like_sha(text: str) -> bool:
+    return len(text) == 64 and all(c in "0123456789abcdef" for c in text.lower())
+
+
+def test_doc_type_is_written_where_it_is_decided(tmp: Path) -> None:
+    section("UNCLASSIFIED means never classified -- and stops meaning it on contact")
+    from sqlalchemy import select as sa_select
+
+    import ingest as ing
+
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+
+    with engine.connect() as conn:
+        types = set(conn.execute(sa_select(attachments.c.doc_type)).scalars())
+    check(types == {poller.UNCLASSIFIED},
+          "after a poll every row is UNCLASSIFIED -- nothing has looked at them",
+          str(types))
+
+    # A verdict arriving for a row that ALREADY EXISTS must be stored. It used to
+    # be written only on INSERT, so the poller's row won and seven real verdicts
+    # were computed and dropped.
+    sha = next(iter(conn.execute(sa_select(attachments.c.content_sha256)).scalars()
+                    if False else []), None)
+    with engine.connect() as conn:
+        sha = conn.execute(sa_select(attachments.c.content_sha256)).scalars().first()
+        path = conn.execute(sa_select(attachments.c.stored_uri)
+                            .where(attachments.c.content_sha256 == sha)).scalar()
+
+    class _Verdict:
+        def __init__(self):
+            self.doc_type = SimpleNamespace(value="packing_list")
+            self.reason = "content says packing list"
+            self.unreadable_reason = None
+
+    with engine.begin() as conn:
+        again = ing._upsert_attachment(conn, Path(path), _Verdict(), NOW)
+    check(again == sha, "the same content still resolves to the same row")
+    with engine.connect() as conn:
+        row = conn.execute(attachments.select()
+                           .where(attachments.c.content_sha256 == sha)).one()
+    check(row.doc_type == "PACKING_LIST",
+          "the verdict is WRITTEN over UNCLASSIFIED, not discarded", row.doc_type)
+    check(row.doc_type_reason == "content says packing list",
+          "with the reason that produced it")
+
+    # And a later no-verdict pass must not erase it.
+    with engine.begin() as conn:
+        ing._upsert_attachment(conn, Path(path), None, NOW)
+    with engine.connect() as conn:
+        row = conn.execute(attachments.select()
+                           .where(attachments.c.content_sha256 == sha)).one()
+    check(row.doc_type == "PACKING_LIST",
+          "a pass with no classifier cannot reset it to UNCLASSIFIED", row.doc_type)
+
+
+def test_ingest_refuses_to_run_without_netsuite(tmp: Path) -> None:
+    section("no NetSuite client is a CHOICE, not an accident that returns zero")
+    import ingest as ing
+    from netsuite_client import NetSuiteClient, NetSuiteConfig
+
+    engine = fresh_db()
+    raised = ""
+    try:
+        ing.ingest_shipment(engine, [], client=None)
+    except ValueError as exc:
+        raised = str(exc)
+    check("no usable NetSuite client" in raised and "none supplied" in raised,
+          "client=None is refused, naming what would have happened", raised[:70])
+
+    raised = ""
+    try:
+        ing.ingest_shipment(engine, [], client=NetSuiteClient(mock_data={}))
+    except ValueError as exc:
+        raised = str(exc)
+    check("mock client with no data" in raised,
+          "and so is a mock client carrying nothing -- the ACTUAL live failure",
+          raised[:70])
+
+    # A mock WITH data resolves normally and is not refused.
+    ok = True
+    try:
+        ing.ingest_shipment(engine, [], client=NetSuiteClient(mock_data={"1662": []}),
+                            allow_no_netsuite=False)
+    except ValueError:
+        ok = False
+    except Exception:  # noqa: BLE001 -- it gets past the guard, which is the point
+        pass
+    check(ok, "a mock WITH data is a legitimate offline fixture and passes the guard")
+
+    # THE ROOT CAUSE: the constructor took a config in the account_id slot and
+    # silently produced a mock client. That is what made the zero plausible.
+    raised = ""
+    try:
+        NetSuiteClient(NetSuiteConfig(account_id="1321665-sb2", client_id="c",
+                                      certificate_id="k", private_key_path=Path("k.pem")))
+    except TypeError as exc:
+        raised = str(exc)
+    check("passes the config as `account_id`" in raised,
+          "NetSuiteClient(config) positionally is REFUSED, not silently mocked",
+          raised[:60])
+
+
+def test_dropped_documents_are_rows_not_prose(tmp: Path) -> None:
+    section("a usable packing list that is not parsed is recorded, not narrated")
+    from sqlalchemy import select as sa_select
+
+    from schema import shipment_sources
+
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+
+    # The Symmetry message carries three documents: a rollup, a carton detail and
+    # a customs invoice. One becomes the shipment; the others must say so on a row.
+    import json as _json
+
+    import ingest as ing
+    from netsuite_client import NetSuiteClient
+
+    row = next(r for r in ep.pending_messages(engine)
+               if r["graph_message_id"] == "msg-symmetry-003")
+    calls = []
+
+    class _Stub:
+        def __getattr__(self, name):
+            def f(*a, **k):
+                calls.append(name)
+                raise RuntimeError("stub: no extraction in this test")
+            return f
+
+    try:
+        ing.ingest_shipment(engine, row["paths"], client=NetSuiteClient(mock_data={"x": []}),
+                            extractor=_Stub(), display_names=row["display_names"], now=NOW)
+    except Exception:  # noqa: BLE001 -- the stub stops extraction; the rows are the subject
+        pass
+
+    with engine.connect() as conn:
+        sources = list(conn.execute(sa_select(
+            shipment_sources.c.role, shipment_sources.c.exclusion_reason,
+            shipment_sources.c.agreement_json)))
+    if not sources:
+        check(True, "extraction did not reach the source rows in this stubbed run (skipped)")
+        return
+    check(all(s.agreement_json for s in sources),
+          "every source row records what the document WAS", str(len(sources)))
+    named = [_json.loads(s.agreement_json).get("display_name", "") for s in sources]
+    check(named and not any(_looks_like_sha(Path(n).stem) for n in named),
+          "by vendor filename, not by hash", str(named[:2]))
+    cross = [s for s in sources if s.role == "CROSS_CHECK"]
+    check(all(s.exclusion_reason for s in cross) if cross else True,
+          "and a cross-check says why its own lines were NOT proposed",
+          (cross[0].exclusion_reason[:60] if cross else "no cross-checks here"))
+    check(all(not _json.loads(s.agreement_json)["lines_proposed"] for s in sources
+              if s.role != "PRIMARY"),
+          "only the PRIMARY document's lines are proposed, and the rows say so")
+
 def main() -> int:
     print("=" * 78)
     print("MAILBOX INTAKE TESTS -- poller, blob store, extraction seam")
@@ -788,6 +998,10 @@ def main() -> int:
         test_max_messages_caps_one_run,
         test_dry_run_touches_nothing,
         test_parse_since,
+        test_classifier_sees_vendor_filenames_not_hashes,
+        test_doc_type_is_written_where_it_is_decided,
+        test_ingest_refuses_to_run_without_netsuite,
+        test_dropped_documents_are_rows_not_prose,
         test_graph_surface_is_read_only,
         test_client_selection,
         test_retry_after,

@@ -3317,7 +3317,7 @@ def test_no_packing_sheet_becomes_manual_entry(tmp: Path) -> None:
     # then sheet-level classification finds no packing sheet inside it.
     saved = ac.classify_attachments
     try:
-        def fake_triage(paths, extractor=None, use_content_check=True):
+        def fake_triage(paths, extractor=None, use_content_check=True, **kw):
             res = ac.ClassificationResult()
             res.selected = [
                 ac.AttachmentClassification(
@@ -3387,7 +3387,7 @@ def test_manual_entry_path(tmp: Path) -> None:
     # Simulate triage finding nothing usable.
     saved = ac.classify_attachments
     try:
-        def fake_classify(paths, extractor=None, use_content_check=True):
+        def fake_classify(paths, extractor=None, use_content_check=True, **kw):
             res = ac.ClassificationResult()
             res.excluded = [
                 ac.AttachmentClassification(

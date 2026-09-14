@@ -89,9 +89,12 @@ def pending_messages(engine, *, include_extracted: bool = False) -> list[dict]:
     with engine.connect() as conn:
         rows = [dict(r._mapping) for r in conn.execute(query)]
         for row in rows:
-            row["paths"] = [
-                Path(uri) for (uri,) in conn.execute(
-                    select(attachments.c.stored_uri)
+            # The stored path is a SHA-256; the vendor's filename is the other
+            # half and travels beside it. Passing only the path silently disabled
+            # every filename rule in `attachment_classifier`.
+            pairs = [
+                (Path(uri), name) for (uri, name) in conn.execute(
+                    select(attachments.c.stored_uri, message_attachments.c.filename)
                     .select_from(
                         message_attachments.join(
                             attachments,
@@ -103,6 +106,8 @@ def pending_messages(engine, *, include_extracted: bool = False) -> list[dict]:
                     .order_by(message_attachments.c.filename)
                 ) if uri
             ]
+            row["paths"] = [path for path, _ in pairs]
+            row["display_names"] = {str(path): name for path, name in pairs}
     return rows
 
 
@@ -114,8 +119,15 @@ def extract_pending(
     client=None,
     extractor=None,
     now: Optional[dt.datetime] = None,
+    allow_no_netsuite: bool = False,
 ) -> ExtractionReport:
-    """Run `ingest_shipment` over everything stored and not yet extracted."""
+    """
+    Run `ingest_shipment` over everything stored and not yet extracted.
+
+    Without a usable NetSuite client `ingest_shipment` refuses rather than
+    producing a run in which nothing resolves and everything is
+    `NEEDS_ATTENTION`. Pass `allow_no_netsuite=True` to choose that.
+    """
     now = now or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     report = ExtractionReport()
     rows = pending_messages(engine, include_extracted=include_extracted)
@@ -145,6 +157,8 @@ def extract_pending(
             result = ingest_module.ingest_shipment(
                 engine, row["paths"], message=source, client=client,
                 extractor=extractor, now=now,
+                display_names=row.get("display_names"),
+                allow_no_netsuite=allow_no_netsuite,
             )
         except Exception as exc:  # noqa: BLE001 -- one bad document, not a stopped run
             error = f"{type(exc).__name__}: {exc}"[:1000]
@@ -181,11 +195,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--all", action="store_true",
                     help="re-extract messages already extracted (after a parser change)")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--no-netsuite", action="store_true",
+                    help="run without a NetSuite client. Every PO will be "
+                         "UNRESOLVED and every line NEEDS_ATTENTION -- a choice, "
+                         "not a default, because the result looks like a finding.")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    client = None
+    if not args.no_netsuite:
+        from netsuite_client import NetSuiteClient, NetSuiteConfig
+        client = NetSuiteClient(config=NetSuiteConfig.from_env())
     report = extract_pending(
         create_engine(args.db), include_extracted=args.all, limit=args.limit,
+        client=client, allow_no_netsuite=args.no_netsuite,
     )
     print(report.summary())
     for graph_id, error in report.failed:

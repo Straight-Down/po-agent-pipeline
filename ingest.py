@@ -242,13 +242,40 @@ def _fetch_po_lines(
 
 
 def _upsert_attachment(conn, path: Path, classification, now: dt.datetime) -> str:
-    """One row per distinct CONTENT. Re-forwarded bytes reuse the existing row."""
+    """
+    One row per distinct CONTENT. Re-forwarded bytes reuse the existing row.
+
+    **The classification verdict is written even when the row already exists.**
+    It used to be set only on INSERT, which was correct while ingest created
+    every row -- and silently wrong once the poller started inserting them first
+    with `doc_type='UNCLASSIFIED'`. The verdict was computed, the row was found,
+    and the verdict was dropped on the floor: seven attachments stayed
+    `UNCLASSIFIED` through a run that demonstrably classified and excluded three
+    of them. Storing a decision where it is MADE rather than where the row
+    happens to be created is the general form.
+
+    `UNCLASSIFIED` is never written back over a real verdict, so a later re-ingest
+    that somehow lost its classifier cannot erase one.
+    """
     sha = sha256_file(path)
     existing = conn.execute(
         attachments.select().with_only_columns(attachments.c.content_sha256)
         .where(attachments.c.content_sha256 == sha)
     ).scalar()
     if existing:
+        verdict = _doc_type_value(classification)
+        if classification is not None and verdict != "UNCLASSIFIED":
+            conn.execute(
+                attachments.update()
+                .where(attachments.c.content_sha256 == sha)
+                .values(
+                    doc_type=verdict,
+                    doc_type_reason=(classification.reason or "")[:1000],
+                    open_failure_reason=classification.unreadable_reason,
+                    banned_as_data_source=bool(
+                        classification.doc_type.value == "inspection_report"),
+                )
+            )
         return sha
     conn.execute(attachments.insert(), {
         "content_sha256": sha,
@@ -435,13 +462,40 @@ def ingest_shipment(
     actor: str = "system",
     cross_check: bool = True,
     now: Optional[dt.datetime] = None,
+    display_names: Optional[dict] = None,
+    allow_no_netsuite: bool = False,
 ) -> IngestReport:
     """
     Classify, parse, match and persist one shipment. Returns what it did.
 
     Idempotent: called twice on the same documents, the second call parses nothing
     and writes nothing but returns the first shipment's id with `created=False`.
+
+    **Refuses to run without a live NetSuite client unless told to.** Without one
+    every PO is `UNRESOLVED`, every line is `NEEDS_ATTENTION`, and nothing
+    resolves -- a result that looks like a finished run and is really a run that
+    never looked. A live run produced exactly that: "resolved to a NetSuite line:
+    0 of 25", which read as a matching failure and was a missing client. Pass
+    `allow_no_netsuite=True` to choose that mode deliberately; the point is that
+    it has to be chosen.
+
+    `display_names` maps stored paths to the filenames a human would recognise,
+    for callers whose bytes are content-addressed. See `classify_attachments`.
     """
+    # Unusable means "cannot resolve anything": no client, or a mock carrying no
+    # data. A mock WITH data is a deliberate offline fixture that resolves
+    # normally, so it is not degraded and is not refused.
+    unusable = client is None or (
+        getattr(client, "is_mock", False) and not getattr(client, "_mock_data", None)
+    )
+    if unusable and not allow_no_netsuite:
+        raise ValueError(
+            "ingest_shipment has no usable NetSuite client "
+            f"({'none supplied' if client is None else 'mock client with no data'}), "
+            "so every PO would be UNRESOLVED and every line NEEDS_ATTENTION -- a "
+            "plausible-looking zero rather than a finding. Pass a live client, or "
+            "allow_no_netsuite=True to choose this mode deliberately."
+        )
     from attachment_classifier import classify_attachments
     from document_parsers import parse_shipment_email
 
@@ -449,7 +503,8 @@ def ingest_shipment(
     paths = [Path(p) for p in attachment_paths]
     report = IngestReport()
 
-    classification = classify_attachments(paths, extractor=extractor)
+    classification = classify_attachments(paths, extractor=extractor,
+                                          display_names=display_names)
     primary = classification.primary
     by_path = {c.path.resolve(): c for c in classification.selected + classification.excluded}
 
@@ -492,7 +547,8 @@ def ingest_shipment(
     # Parsing happens outside the transaction: it makes network calls to the
     # Anthropic API and can take tens of seconds, and holding a write transaction
     # open across that is a bad habit even on SQLite.
-    parsed = parse_shipment_email(paths, extractor=extractor, cross_check=cross_check)
+    parsed = parse_shipment_email(paths, extractor=extractor, cross_check=cross_check,
+                                  display_names=display_names)
     report.parse_warnings = list(parsed.warnings)
 
     # ONE canonical key per PO, however the extractor rendered it on each line.
@@ -611,13 +667,34 @@ def ingest_shipment(
             role = ("PRIMARY" if primary is not None and item.path == primary.path
                     else "CROSS_CHECK" if item in classification.selected
                     else "EXCLUDED")
+            # WHY THIS DOCUMENT DID NOT BECOME THE SHIPMENT, on the row rather
+            # than in a warning string. A usable packing list that is not parsed
+            # is a DROP -- its lines are not proposed and nobody is told -- and
+            # until now the only trace was prose in `parse_warnings_json` naming
+            # a SHA-256. One live run dropped two vendors' documents that way.
+            #
+            # This does not make an email carry several shipments; that is a
+            # design question for real vendor mail. It makes the drop queryable.
+            if role == "EXCLUDED":
+                reason = getattr(item, "excluded_reason", None)
+            elif role == "CROSS_CHECK":
+                reason = (
+                    f"usable packing list, NOT the shipment: "
+                    f"{primary.display_name if primary else '(none)'} was selected as "
+                    f"primary and this was read only to corroborate it. Its own lines "
+                    f"were NOT proposed."
+                )
+            else:
+                reason = None
             conn.execute(shipment_sources.insert(), {
                 "id": sc.new_id(), "shipment_id": shipment_id, "content_sha256": sha,
                 "role": role,
-                "exclusion_reason": (
-                    getattr(item, "excluded_reason", None) if role == "EXCLUDED" else None
-                ),
-                "agreement_json": None,  # see IngestReport.unpopulated
+                "exclusion_reason": reason,
+                "agreement_json": json.dumps({
+                    "display_name": getattr(item, "display_name", "") or item.path.name,
+                    "doc_type": _doc_type_value(item),
+                    "lines_proposed": role == "PRIMARY",
+                }),
             })
             counts["shipment_sources"] += 1
 

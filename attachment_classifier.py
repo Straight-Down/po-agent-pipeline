@@ -154,6 +154,12 @@ class AttachmentClassification:
     preview_chars: int = 0
     #: Set when the file cannot be opened at all (corrupt, truncated, encrypted).
     unreadable_reason: Optional[str] = None
+    #: The name a HUMAN would recognise, which is not always the path's own.
+    #: Once attachments are stored content-addressed (`poller.BlobStore`) the
+    #: path IS a SHA-256 and carries no signal whatever -- so the vendor's
+    #: filename has to travel separately from the bytes. Defaults to the path's
+    #: own name, which is what every caller meant before the store existed.
+    display_name: str = ""
     #: What the NAME suggested, kept even after content overrides `doc_type`.
     #: Retained for two reasons: it is the audit trail for a disagreement (the
     #: reviewer sees that the name said invoice and the content said packing
@@ -222,7 +228,7 @@ class ClassificationResult:
             key=lambda c: (
                 not c.is_rollup,
                 c.filename_hint != DocType.PACKING_LIST,
-                c.path.name,
+                c.display_name,
             ),
         )[0]
 
@@ -246,7 +252,7 @@ class ClassificationResult:
     def summary(self) -> str:
         bits = [f"{len(self.selected)} usable / {len(self.excluded)} excluded"]
         if self.primary:
-            bits.append(f"primary: {self.primary.path.name}")
+            bits.append(f"primary: {self.primary.display_name}")
         if self.needs_manual_entry:
             bits.append("NO SIZE-LEVEL SOURCE -> manual entry")
         return " | ".join(bits)
@@ -683,6 +689,7 @@ def classify_attachments(
     paths: Sequence[Union[str, Path]],
     extractor: Any = None,
     use_content_check: bool = True,
+    display_names: Optional[dict] = None,
 ) -> ClassificationResult:
     """
     Classify a shipment email's attachments and select which to parse.
@@ -693,7 +700,18 @@ def classify_attachments(
 
     `use_content_check=False` keeps it entirely free/offline, at the cost of
     trusting filenames — usable for tests, not recommended in the pipeline.
+
+    `display_names` maps a resolved path to the name a human would recognise.
+    **It exists because the bytes and the name stopped being the same object.**
+    Attachments fetched from the mailbox are stored content-addressed, so their
+    path is a SHA-256 with no extension-independent signal in it; passing that as
+    the filename silently disabled every filename rule in this module -- the
+    inspection-report ban, the payment-request rule, the rollup preference, the
+    Inprotex trap. Nothing failed; the classifier simply lost one of its two
+    inputs and said nothing, which is why it survived a live run and was visible
+    only in a warning string. Defaults to each path's own name.
     """
+    names = {Path(k).resolve(): v for k, v in (display_names or {}).items()}
     result = ClassificationResult()
     candidates: list[AttachmentClassification] = []
     needs_content: list[AttachmentClassification] = []
@@ -709,7 +727,8 @@ def classify_attachments(
         # left for it to gate. It remains part of `classify_by_filename`'s answer
         # because "the name genuinely cannot decide this" is still true and still
         # worth stating in the reason text.
-        doc_type, _ambiguous, reason = classify_by_filename(path.name)
+        shown = names.get(path.resolve(), path.name)
+        doc_type, _ambiguous, reason = classify_by_filename(shown)
         item = AttachmentClassification(
             path=path,
             doc_type=doc_type,
@@ -717,7 +736,8 @@ def classify_attachments(
             has_size_breakdown=False,
             reason=reason,
             method="filename",
-            is_rollup=looks_like_rollup(path.name),
+            display_name=shown,
+            is_rollup=looks_like_rollup(shown),
             filename_hint=doc_type,
         )
 
@@ -734,7 +754,7 @@ def classify_attachments(
             item.unreadable_reason = failure
             item.reason = f"could not open: {failure}"
             result.warnings.append(
-                f"COULD NOT OPEN {path.name}: {failure}. Excluded from this shipment; the other "
+                f"COULD NOT OPEN {shown}: {failure}. Excluded from this shipment; the other "
                 f"attachments were still processed. If this was meant to be the packing list, "
                 f"ask the vendor to resend it."
             )
@@ -777,8 +797,8 @@ def classify_attachments(
     if len(result.selected) > 1:
         result.warnings.append(
             f"{len(result.selected)} usable packing lists found; parsing "
-            f"{result.primary.path.name} as primary. Others available as cross-checks: "
-            + ", ".join(c.path.name for c in result.cross_checks)
+            f"{result.primary.display_name} as primary. Others available as cross-checks: "
+            + ", ".join(c.display_name for c in result.cross_checks)
         )
     return result
 
@@ -794,7 +814,7 @@ def _apply_content_verdicts(
         if not text.strip():
             item.reason += " (no readable preview — could not verify content)"
             warnings.append(
-                f"{item.path.name}: no extractable text to classify from; not selected as a "
+                f"{item.display_name}: no extractable text to classify from; not selected as a "
                 f"shipment-data source"
             )
 

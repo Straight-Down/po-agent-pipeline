@@ -585,6 +585,7 @@ def parse_shipment_email(
     attachment_paths: Sequence[Union[str, Path]],
     extractor: Optional[ClaudeExtractor] = None,
     cross_check: bool = False,
+    display_names: Optional[dict] = None,
 ) -> ParseResult:
     """
     Process one shipment email's attachments end to end.
@@ -606,11 +607,18 @@ def parse_shipment_email(
     from attachment_classifier import DocType, classify_attachments
 
     extractor = extractor or ClaudeExtractor()
-    classification = classify_attachments(attachment_paths, extractor=extractor)
+    # `display_names` carries the vendor's filenames when the bytes are stored
+    # content-addressed and the path is a hash -- see classify_attachments.
+    classification = classify_attachments(attachment_paths, extractor=extractor,
+                                          display_names=display_names)
+    shown = {Path(k).resolve(): v for k, v in (display_names or {}).items()}
+
+    def named(path) -> str:
+        return shown.get(Path(path).resolve(), Path(path).name)
 
     notes = [f"attachment triage: {classification.summary()}"]
     for item in classification.excluded:
-        notes.append(f"not parsed — {item.path.name}: {item.excluded_reason}")
+        notes.append(f"not parsed — {named(item.path)}: {item.excluded_reason}")
     warnings = list(classification.warnings)
 
     if classification.needs_manual_entry:
@@ -649,15 +657,15 @@ def parse_shipment_email(
             + (f"; classifier said: {v.reason}" if v.reason else "")
             for v in exc.verdicts
         ]
-        logger.warning("%s: no packing sheet found; routed to manual entry", exc.path.name)
+        logger.warning("%s: no packing sheet found; routed to manual entry", named(exc.path))
         result = ParseResult(
             lines=[],
             parser="attachment-triage-only (no packing sheet in workbook)",
-            notes=notes + [f"selected attachment: {primary.path.name}"],
+            notes=notes + [f"selected attachment: {named(primary.path)}"],
             warnings=warnings
             + [
                 "MANUAL ENTRY REQUIRED: the selected attachment "
-                f"({exc.path.name}) contains no worksheet that classifies as a packing list "
+                f"({named(exc.path)}) contains no worksheet that classifies as a packing list "
                 "with per-size quantities, so no style/colour/size lines could be produced. "
                 "This is NOT an empty shipment. Paula must enter it by hand. Do not infer "
                 "sizes from an inspection report or by splitting colour totals."
@@ -675,9 +683,9 @@ def parse_shipment_email(
             try:
                 secondary = parse_packing_slip(other.path, extractor=extractor)
             except ExtractionError as exc:
-                result.warnings.append(f"cross-check against {other.path.name} failed: {exc}")
+                result.warnings.append(f"cross-check against {named(other.path)} failed: {exc}")
                 continue
-            result.warnings.extend(_compare_line_sets(result.lines, secondary.lines, other.path.name))
+            result.warnings.extend(_compare_line_sets(result.lines, secondary.lines, named(other.path)))
 
     # Vendor dates: reference only. The diff engine never proposes a receipt date
     # from them (see matcher.py); they exist for Paula to read while she types the

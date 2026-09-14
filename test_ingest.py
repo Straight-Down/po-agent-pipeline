@@ -116,9 +116,10 @@ def install_stub_parse(monkey: dict, result: ParseResult, classification):
 
     monkey["classify"] = attachment_classifier.classify_attachments
     monkey["parse"] = document_parsers.parse_shipment_email
-    attachment_classifier.classify_attachments = lambda paths, extractor=None: classification
+    attachment_classifier.classify_attachments = (
+        lambda paths, extractor=None, **kw: classification)
     document_parsers.parse_shipment_email = (
-        lambda paths, extractor=None, cross_check=True: result
+        lambda paths, extractor=None, cross_check=True, **kw: result
     )
 
 
@@ -292,11 +293,12 @@ def test_double_ingest_is_a_no_op() -> None:
         keep = (attachment_classifier.classify_attachments,
                 document_parsers.parse_shipment_email)
 
-        def counted_parse(paths, extractor=None, cross_check=True):
+        def counted_parse(paths, extractor=None, cross_check=True, **kw):
             parse_calls["n"] += 1
             return parsed
 
-        attachment_classifier.classify_attachments = lambda paths, extractor=None: classification
+        attachment_classifier.classify_attachments = (
+        lambda paths, extractor=None, **kw: classification)
         document_parsers.parse_shipment_email = counted_parse
         try:
             first = ing.ingest_shipment(engine, docs, message=msg(), client=client, now=NOW)

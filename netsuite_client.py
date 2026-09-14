@@ -645,6 +645,17 @@ class NetSuiteClient:
         mock_data: Optional[dict] = None,
         config: Optional[NetSuiteConfig] = None,
     ):
+        # `config` is the THIRD parameter, so `NetSuiteClient(cfg)` binds a
+        # NetSuiteConfig to `account_id` and silently produces a MOCK client with
+        # no data -- which then reports every PO UNRESOLVED and every line
+        # NEEDS_ATTENTION. That is not a hypothetical: it happened on the first
+        # live extraction run and read as a matching failure for 25 rows.
+        # Refusing the shape costs one line and removes the whole class.
+        if isinstance(account_id, NetSuiteConfig):
+            raise TypeError(
+                "NetSuiteClient(config) passes the config as `account_id` and "
+                "yields a MOCK client with no data. Use NetSuiteClient(config=cfg)."
+            )
         self.config = config
         self.account_id = config.account_id if config else (account_id or "1321665-sb2")
         self._mock_data = mock_data or {}

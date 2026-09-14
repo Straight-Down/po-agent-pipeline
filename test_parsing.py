@@ -36,12 +36,11 @@ what they contain. Tests here assert the invoice is *rejected* by the attachment
 classifier, which is the behaviour that prevents repeating the mistake.
 
 That is the generalization evidence the build plan's Risks section asked for:
-three real vendors validated live, materially different layouts, plus two more
-(Tainan, Footwear) committed as fixtures and covered offline only. Five, not
-thirty — every new vendor is a new layout, and the two most recent arrivals
-produced four defects between them before the matcher was reached at all
-(RUNBOOK §8 lesson 9). Read a green run as "works on what we've seen", not
-"works on anything".
+five real vendors validated live against hand-derived line-level truth,
+materially different layouts. Five, not thirty — every new vendor is a new
+layout, and the two most recent arrivals produced four defects between them
+before the matcher was reached at all (RUNBOOK §8 lesson 9). Read a green run
+as "works on what we've seen", not "works on anything".
 
 Group C costs API tokens and is opt-in. Without --live the Claude path is only
 checked against a mock, and the runner says so in its closing summary.
@@ -122,6 +121,199 @@ LEGENDZ_EXPECTED = {
     ("1657", "M630018", "MLT", "L"): 111,
     ("1657", "M680009", "DKF", "M"): 128,
     ("1657", "M680009", "DKF", "L"): 200,
+}
+
+# ---------------------------------------------------------------------------
+# Ground truth for the two numerically-sized vendors, HAND-DERIVED FROM THE
+# SOURCE WORKBOOKS cell by cell -- not copied from a prior run's output, and not
+# from the RUNBOOK's prose. Each block names the sheet, the row and the columns
+# it came from so the derivation can be re-walked rather than re-trusted.
+#
+# PO NUMBERS ARE THE CANONICAL KEY, and this is the one place the ground truth
+# deliberately does NOT use the document's verbatim text. The documents print
+# `PO . NO : 0001725` and `PO0001624`; extraction returns those renderings, and
+# the footwear rendering is KNOWN TO VARY BETWEEN RUNS -- one extraction returned
+# `1624` for two of the three sheets and `PO0001624` for the third, and which
+# sheet got which changed run to run (`netsuite_client.po_number_key`, which
+# exists because of it). Pinning a rendering would make these tests flaky for a
+# reason that has nothing to do with whether the extractor read the document
+# correctly. So the KEY is `po_number_key(...)` -- exact, and the same value the
+# matcher groups on and `ingest` stores -- and the raw renderings are asserted
+# separately, as a SET that must all collapse to it. That keeps both facts under
+# test: the identity is exact, and the rendering is allowed to vary because a
+# named component absorbs it.
+#
+# PINNED TO THE PROMPT THAT PRODUCED THEM. If `claude_extractor.PROMPT_VERSION`
+# or its fingerprint moves, these tests FAIL LOUDLY rather than comparing new
+# output against old truth -- a prompt change has to be followed by a conscious
+# re-derivation, because the truth below is only true of the instructions that
+# were in force when it was read off.
+GROUND_TRUTH_PROMPT_VERSION = "2026-09-09.1"
+GROUND_TRUTH_PROMPT_FINGERPRINT = "4775ce9ded060fe1"
+
+# --- What is asserted STRICTLY, and what is not -----------------------------
+# The extractor is a model, so the line between the two has to be stated rather
+# than assumed -- a tolerance nobody can justify is a tolerance that hides a
+# regression.
+#
+# EXACT (==), because these are transcription, not judgement. Every one is a
+# value printed in a cell or composed from two printed cells by a rule the code
+# enforces (`enforce_size_composition`). A model that gets one wrong has misread
+# the document, and there is no reading under which the answer is a matter of
+# degree:
+#   po_number, style_number, color, size, recap_label, quantity
+#
+# SHAPE OR PRESENCE ONLY, because these are free text the model writes:
+#   note, source_hint  -- an explanation of the same fact can be worded a dozen
+#     ways, all correct. Asserting string equality here would fail on a better
+#     sentence, which trains everyone to loosen the assertion that matters.
+#   confidence -- a self-report, and measurably inert for triage (RUNBOOK
+#     section 7): it fires on 19 of 29 correct lines. Asserting a level would
+#     pin a signal we have already decided not to trust.
+#   usage/token counts -- vary run to run by construction.
+#
+# NOT asserted here at all: the 16 assignment groups and 12 singles reported in
+# RUNBOOK section 6 item 23. Those are MATCHER outcomes and need NetSuite PO
+# lines; what this file can assert from extraction alone is the precondition --
+# which (style, colour, size) keys carry two recap labels and which carry one.
+# That is asserted below, and it is what makes 16/12 reachable.
+
+#: TAINAN -- `ACT` and `REV` are two sheets describing ONE shipment, and they
+#: disagree cell by cell while agreeing on some totals. That is the whole trap:
+#: `NEW INDIGO` inseam 32 sums to 324 on BOTH sheets and differs in five of its
+#: seven waists. A test that checked totals would pass on the wrong sheet.
+#: 18 of the 28 cells differ; `REV` is `ORDER x 1.08` rounded (its own uplift row
+#: prints the fractions: 16 x 1.08 = 17.28), so picking it yields plausible
+#: numbers rather than obvious nonsense. See RUNBOOK section 6 item 20.
+TAINAN_ACT_EXPECTED = {
+    # NEW INDIGO, inseam 32 -- the ACTUAL row at H46, waists 30..42 in K..Q
+    ("1725", "50144", "NEW INDIGO", "30-32"): 17,
+    ("1725", "50144", "NEW INDIGO", "32-32"): 91,
+    ("1725", "50144", "NEW INDIGO", "34-32"): 90,
+    ("1725", "50144", "NEW INDIGO", "36-32"): 73,
+    ("1725", "50144", "NEW INDIGO", "38-32"): 27,
+    ("1725", "50144", "NEW INDIGO", "40-32"): 21,
+    ("1725", "50144", "NEW INDIGO", "42-32"): 5,
+    # NEW INDIGO, inseam 34 -- the ACTUAL row at H52, waists 30..42 in K..Q
+    ("1725", "50144", "NEW INDIGO", "30-34"): 5,
+    ("1725", "50144", "NEW INDIGO", "32-34"): 15,
+    ("1725", "50144", "NEW INDIGO", "34-34"): 23,
+    ("1725", "50144", "NEW INDIGO", "36-34"): 38,
+    ("1725", "50144", "NEW INDIGO", "38-34"): 16,
+    ("1725", "50144", "NEW INDIGO", "40-34"): 10,
+    ("1725", "50144", "NEW INDIGO", "42-34"): 3,
+    # SILVER, inseam 32 -- the ACTUAL row at H120, waists 30..42 in K..Q
+    ("1725", "50144", "SILVER", "30-32"): 15,
+    ("1725", "50144", "SILVER", "32-32"): 88,
+    ("1725", "50144", "SILVER", "34-32"): 98,
+    ("1725", "50144", "SILVER", "36-32"): 77,
+    ("1725", "50144", "SILVER", "38-32"): 22,
+    ("1725", "50144", "SILVER", "40-32"): 18,
+    ("1725", "50144", "SILVER", "42-32"): 5,
+    # SILVER, inseam 34 -- the ACTUAL row at H125, waists 30..42 in K..Q
+    ("1725", "50144", "SILVER", "30-34"): 5,
+    ("1725", "50144", "SILVER", "32-34"): 13,
+    ("1725", "50144", "SILVER", "34-34"): 27,
+    ("1725", "50144", "SILVER", "36-34"): 32,
+    ("1725", "50144", "SILVER", "38-34"): 18,
+    ("1725", "50144", "SILVER", "40-34"): 10,
+    ("1725", "50144", "SILVER", "42-34"): 3,
+}
+
+TAINAN_REV_EXPECTED = {
+    # NEW INDIGO, inseam 32 -- the ACTUAL row at H46, waists 30..42 in K..Q
+    ("1725", "50144-2", "NEW INDIGO", "30-32"): 17,
+    ("1725", "50144-2", "NEW INDIGO", "32-32"): 92,
+    ("1725", "50144-2", "NEW INDIGO", "34-32"): 91,
+    ("1725", "50144-2", "NEW INDIGO", "36-32"): 71,
+    ("1725", "50144-2", "NEW INDIGO", "38-32"): 28,
+    ("1725", "50144-2", "NEW INDIGO", "40-32"): 21,
+    ("1725", "50144-2", "NEW INDIGO", "42-32"): 4,
+    # NEW INDIGO, inseam 34 -- the ACTUAL row at H52, waists 30..42 in K..Q
+    ("1725", "50144-2", "NEW INDIGO", "30-34"): 4,
+    ("1725", "50144-2", "NEW INDIGO", "32-34"): 14,
+    ("1725", "50144-2", "NEW INDIGO", "34-34"): 23,
+    ("1725", "50144-2", "NEW INDIGO", "36-34"): 39,
+    ("1725", "50144-2", "NEW INDIGO", "38-34"): 16,
+    ("1725", "50144-2", "NEW INDIGO", "40-34"): 10,
+    ("1725", "50144-2", "NEW INDIGO", "42-34"): 2,
+    # SILVER, inseam 32 -- the ACTUAL row at H120, waists 30..42 in K..Q
+    ("1725", "50144-2", "SILVER", "30-32"): 15,
+    ("1725", "50144-2", "SILVER", "32-32"): 88,
+    ("1725", "50144-2", "SILVER", "34-32"): 99,
+    ("1725", "50144-2", "SILVER", "36-32"): 78,
+    ("1725", "50144-2", "SILVER", "38-32"): 21,
+    ("1725", "50144-2", "SILVER", "40-32"): 17,
+    ("1725", "50144-2", "SILVER", "42-32"): 4,
+    # SILVER, inseam 34 -- the ACTUAL row at H126, waists 30..42 in K..Q
+    ("1725", "50144-2", "SILVER", "30-34"): 4,
+    ("1725", "50144-2", "SILVER", "32-34"): 13,
+    ("1725", "50144-2", "SILVER", "34-34"): 28,
+    ("1725", "50144-2", "SILVER", "36-34"): 32,
+    ("1725", "50144-2", "SILVER", "38-34"): 18,
+    ("1725", "50144-2", "SILVER", "40-34"): 9,
+    ("1725", "50144-2", "SILVER", "42-34"): 2,
+}
+
+#: FOOTWEAR -- one line per size PER RECAP ROW, with the row's label verbatim.
+#: Sheet `20140` carries NO transport-mode label and its 600 units MUST stay
+#: unlabelled: attributing them to a mode is exactly the invented reconciliation
+#: that produced the wrong "By Sea 2,040 / By UPS 140 / Ordered 2,180" figures
+#: (RUNBOOK section 6 item 25). Labelled By Sea sums to 1,440 and By UPS to 60;
+#: 1,440 + 600 = 2,040, the document's own grand total at `20140!T40`.
+#: A zero cell emits no line, which is why By UPS is short of a full size run.
+FOOTWEAR_EXPECTED = {
+    # 20138/PAT, By Sea -- 20138!J38, sizes 8..14 in K..Q
+    ("1624", "20138", "PAT", "8", "By Sea"): 5,
+    ("1624", "20138", "PAT", "9", "By Sea"): 30,
+    ("1624", "20138", "PAT", "10", "By Sea"): 62,
+    ("1624", "20138", "PAT", "11", "By Sea"): 74,
+    ("1624", "20138", "PAT", "12", "By Sea"): 52,
+    ("1624", "20138", "PAT", "13", "By Sea"): 23,
+    ("1624", "20138", "PAT", "14", "By Sea"): 10,
+    # 20138/PAT, By UPS -- 20138!J40, sizes 8..14 in K..Q; ZERO at size 14 emits no line
+    ("1624", "20138", "PAT", "8", "By UPS"): 5,
+    ("1624", "20138", "PAT", "9", "By UPS"): 10,
+    ("1624", "20138", "PAT", "10", "By UPS"): 13,
+    ("1624", "20138", "PAT", "11", "By UPS"): 11,
+    ("1624", "20138", "PAT", "12", "By UPS"): 3,
+    ("1624", "20138", "PAT", "13", "By UPS"): 2,
+    # 20139/DKF, By Sea -- 20139!J38, sizes 8..14 in K..Q
+    ("1624", "20139", "DKF", "8", "By Sea"): 19,
+    ("1624", "20139", "DKF", "9", "By Sea"): 78,
+    ("1624", "20139", "DKF", "10", "By Sea"): 148,
+    ("1624", "20139", "DKF", "11", "By Sea"): 168,
+    ("1624", "20139", "DKF", "12", "By Sea"): 109,
+    ("1624", "20139", "DKF", "13", "By Sea"): 50,
+    ("1624", "20139", "DKF", "14", "By Sea"): 20,
+    # 20139/DKF, By UPS -- 20139!J40, sizes 8..14 in K..Q; ZEROES at 13 and 14 emit no lines
+    ("1624", "20139", "DKF", "8", "By UPS"): 1,
+    ("1624", "20139", "DKF", "9", "By UPS"): 2,
+    ("1624", "20139", "DKF", "10", "By UPS"): 2,
+    ("1624", "20139", "DKF", "11", "By UPS"): 2,
+    ("1624", "20139", "DKF", "12", "By UPS"): 1,
+    # 20139/MLT, By Sea -- 20139!J55, sizes 8..14 in K..Q
+    ("1624", "20139", "MLT", "8", "By Sea"): 19,
+    ("1624", "20139", "MLT", "9", "By Sea"): 78,
+    ("1624", "20139", "MLT", "10", "By Sea"): 148,
+    ("1624", "20139", "MLT", "11", "By Sea"): 168,
+    ("1624", "20139", "MLT", "12", "By Sea"): 109,
+    ("1624", "20139", "MLT", "13", "By Sea"): 50,
+    ("1624", "20139", "MLT", "14", "By Sea"): 20,
+    # 20139/MLT, By UPS -- 20139!J57, sizes 8..14 in K..Q; ZEROES at 13 and 14 emit no lines
+    ("1624", "20139", "MLT", "8", "By UPS"): 1,
+    ("1624", "20139", "MLT", "9", "By UPS"): 2,
+    ("1624", "20139", "MLT", "10", "By UPS"): 2,
+    ("1624", "20139", "MLT", "11", "By UPS"): 2,
+    ("1624", "20139", "MLT", "12", "By UPS"): 1,
+    # 20140/WHT, (unlabelled) -- 20140!K38-Q38, sizes 8..14 in K..Q
+    ("1624", "20140", "WHT", "8", ""): 20,
+    ("1624", "20140", "WHT", "9", ""): 80,
+    ("1624", "20140", "WHT", "10", ""): 150,
+    ("1624", "20140", "WHT", "11", ""): 170,
+    ("1624", "20140", "WHT", "12", ""): 110,
+    ("1624", "20140", "WHT", "13", ""): 50,
+    ("1624", "20140", "WHT", "14", ""): 20,
 }
 
 #: Read off the 'Actual Packing Covering' rollup by column position (verified
@@ -3527,6 +3719,237 @@ def test_live_attachment_triage(tmp: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _pin_prompt_version() -> bool:
+    """
+    Ground truth is only true of the prompt that produced it.
+
+    Returns False -- and records a coverage gap -- when the prompt has moved,
+    rather than comparing this run's output against truth derived under different
+    instructions. A silent pass there would be the worst outcome available: the
+    numbers would still look hand-checked.
+    """
+    if (ce.PROMPT_VERSION == GROUND_TRUTH_PROMPT_VERSION
+            and ce.prompt_fingerprint() == GROUND_TRUTH_PROMPT_FINGERPRINT):
+        return True
+    msg = (
+        f"PROMPT CHANGED since the ground truth was derived: "
+        f"{GROUND_TRUTH_PROMPT_VERSION}/{GROUND_TRUTH_PROMPT_FINGERPRINT} -> "
+        f"{ce.PROMPT_VERSION}/{ce.prompt_fingerprint()}.\n"
+        "      -> RE-DERIVE the Tainan and footwear expectations from the source\n"
+        "         workbooks by hand, then update GROUND_TRUTH_PROMPT_* to match.\n"
+        "         Do NOT paste this run's output in as the new truth."
+    )
+    _missing_coverage.append(msg)
+    check(False, "ground truth is pinned to the current prompt", msg.splitlines()[0])
+    return False
+
+
+def _live_keys(lines: list[dict], with_label: bool = False) -> dict:
+    """
+    Extraction lines as {(po_key, style, colour, size[, recap_label]): quantity}.
+
+    The PO goes through `po_number_key` because its RENDERING varies between runs
+    while its identity does not -- see the note on the ground-truth constants.
+    Everything else is verbatim.
+    """
+    from netsuite_client import po_number_key
+    out: dict[tuple, int] = {}
+    for ln in lines:
+        key = (po_number_key(ln["po_number"]), str(ln["style_number"]),
+               str(ln["color"]), str(ln["size"]))
+        if with_label:
+            key = key + (str(ln.get("recap_label") or ""),)
+        out[key] = out.get(key, 0) + int(ln["quantity"])
+    return out
+
+
+def test_live_tainan(tmp: Path) -> None:
+    section("LIVE -- Tainan (4th vendor: legacy .xls, two-axis sizes, ACT vs REV)")
+    import datetime as dt
+    import re
+    import matcher as mt
+    import size_vocabulary as sv
+    from netsuite_client import NetSuiteClient, POLine, po_number_key
+
+    if not ce.credentials_available():
+        print("  [MISSING] no Anthropic credential; skipping")
+        return
+    if not TAINAN_XLS.exists():
+        _missing_coverage.append(f"Tainan live test skipped: {TAINAN_XLS.name} absent")
+        print(f"  [MISSING] {TAINAN_XLS.name} absent")
+        return
+    if not _pin_prompt_version():
+        return
+
+    result = dp.parse_packing_slip(TAINAN_XLS)
+    check(result.parser == "claude-assisted", "routed to the Claude extractor", result.parser)
+
+    got = _live_keys(result.lines)
+    expected = {**TAINAN_ACT_EXPECTED, **TAINAN_REV_EXPECTED}
+
+    # LINE LEVEL FIRST. Totals are cross-footed at the end and only as a
+    # cross-foot: two compensating errors sum correctly, and on this document
+    # they demonstrably do (below), so a total is the weakest evidence available.
+    check(len(got) == 56, "56 lines -- 28 from ACT, 28 from REV", str(len(got)))
+    wrong = {k: (got.get(k), v) for k, v in expected.items() if got.get(k) != v}
+    extra = {k: v for k, v in got.items() if k not in expected}
+    check(not wrong and not extra,
+          "every one of the 56 (PO, style, colour, composed size) -> quantity exact",
+          f"wrong={wrong or 'none'} extra={extra or 'none'}")
+
+    # The composition RULE, not just its result.
+    sizes = {k[3] for k in got}
+    check(all(re.fullmatch(r"\d{2}-\d{2}", s) for s in sizes),
+          "every size is a composed waist-inseam pair", str(sorted(sizes))[:70])
+    unknown = sizes - sv.size_labels()
+    check(not unknown,
+          "and every one is a REAL value in customlist_psgss_product_size",
+          str(sorted(unknown) or "all present"))
+    check(len(sizes) == 14, "7 waists x 2 inseams", str(len(sizes)))
+
+    # ---- the trap: the totals agree where the cells do not -------------------
+    act_ni32 = sum(v for k, v in TAINAN_ACT_EXPECTED.items()
+                   if k[2] == "NEW INDIGO" and k[3].endswith("-32"))
+    rev_ni32 = sum(v for k, v in TAINAN_REV_EXPECTED.items()
+                   if k[2] == "NEW INDIGO" and k[3].endswith("-32"))
+    check(act_ni32 == rev_ni32 == 324,
+          "NEW INDIGO/inseam 32 sums to 324 on BOTH sheets -- a total cannot tell them apart",
+          f"ACT={act_ni32} REV={rev_ni32}")
+    differing = [k for k in TAINAN_ACT_EXPECTED
+                 if TAINAN_ACT_EXPECTED[k]
+                 != TAINAN_REV_EXPECTED[("1725", "50144-2") + k[2:]]]
+    check(len(differing) == 18,
+          "while 18 of the 28 cells DISAGREE -- which is what line-level truth catches",
+          str(len(differing)))
+
+    # ---- assert the SELECTION, not merely that the right numbers survived ----
+    # REV is ORDER x 1.08 rounded (its own uplift row prints 16 x 1.08 = 17.28),
+    # so choosing it yields plausible quantities rather than obvious nonsense.
+    # The PO carries style 50144 only, so ACT must win -- and the choice must be
+    # RECORDED, not left implicit in which rows happened to match.
+    # The mock PO carries the colours as the document prints them, so this test
+    # turns on the SHEET CHOICE alone. Colour-name-to-code resolution is change 7
+    # and has its own tests; folding it in here would mean a colour regression
+    # showed up as a sheet-selection failure.
+    def ns_line(line_id: str, colour: str, size: str) -> POLine:
+        return POLine(
+            line_id=line_id, item=f"50144 : 50144-{colour}-{size}", style_number="50144",
+            vendor_name="Tainan", color=colour, size=size, quantity=10, units="Ea",
+            expected_receipt_date=dt.date(2026, 9, 1), override_expected_receipt=False,
+            updated_receipt_date=None,
+        )
+
+    ns = [ns_line(str(i + 1), c, z)
+          for i, (c, z) in enumerate((c, z) for c in ("NEW INDIGO", "SILVER")
+                                     for z in sorted(sizes))]
+    changes = mt.build_proposed_changes(result.lines, NetSuiteClient(mock_data={"1725": ns}))
+    summary = mt.source_sheet_summary(changes, result.lines)
+    by_sheet = {e["sheet"]: e for e in summary}
+    printed = {str(ln["po_number"]) for ln in result.lines}
+    check(all(po_number_key(x) == "1725" for x in printed),
+          "every printed PO rendering collapses to the one grouping key 1725",
+          str(sorted(printed)))
+    check(set(by_sheet) == {"ACT", "REV"}, "both sheets reported", str(sorted(by_sheet)))
+    check(by_sheet["ACT"]["matched"] == 28 and by_sheet["REV"]["matched"] == 0,
+          "ACT supplied all 28 matched lines; REV supplied none",
+          f"ACT={by_sheet['ACT']['matched']} REV={by_sheet['REV']['matched']}")
+    sentence = mt.describe_sheet_selection(summary)
+    check("ACT (50144) matched PO 1725" in sentence and "REV (50144-2) did not" in sentence,
+          "and the choice is RECORDED in words, not inferred from the output",
+          sentence[:90])
+
+    # Cross-foot LAST, against each sheet's own printed ACT total.
+    check(sum(TAINAN_ACT_EXPECTED.values()) == 865, "ACT cross-foots to its printed ACT 865")
+    check(sum(TAINAN_REV_EXPECTED.values()) == 860, "REV cross-foots to its printed ACT 860")
+
+    # Free text: presence and shape only -- see the note on the constants.
+    check(all(isinstance(ln.get("note", ""), str) for ln in result.lines),
+          "every line carries a note field; its WORDING is deliberately not asserted")
+    print(f"    tokens: {result.usage}")
+
+
+def test_live_footwear(tmp: Path) -> None:
+    section("LIVE -- Footwear (5th vendor: numeric sizes, transport-mode recap rows)")
+    if not ce.credentials_available():
+        print("  [MISSING] no Anthropic credential; skipping")
+        return
+    if not FOOTWEAR_XLSX.exists():
+        _missing_coverage.append(f"Footwear live test skipped: {FOOTWEAR_XLSX.name} absent")
+        print(f"  [MISSING] {FOOTWEAR_XLSX.name} absent")
+        return
+    if not _pin_prompt_version():
+        return
+
+    result = dp.parse_packing_slip(FOOTWEAR_XLSX)
+    check(result.parser == "claude-assisted", "routed to the Claude extractor", result.parser)
+
+    got = _live_keys(result.lines, with_label=True)
+    check(len(got) == 44, "44 lines -- one per size PER RECAP ROW", str(len(got)))
+    wrong = {k: (got.get(k), v) for k, v in FOOTWEAR_EXPECTED.items() if got.get(k) != v}
+    extra = {k: v for k, v in got.items() if k not in FOOTWEAR_EXPECTED}
+    check(not wrong and not extra,
+          "every one of the 44 (PO, style, colour, size, recap label) -> quantity exact",
+          f"wrong={wrong or 'none'} extra={extra or 'none'}")
+
+    by_label: dict[str, int] = {}
+    for key, qty in got.items():
+        by_label[key[4]] = by_label.get(key[4], 0) + qty
+    check(by_label.get("By Sea") == 1440, "labelled By Sea sums to 1,440",
+          str(by_label.get("By Sea")))
+    check(by_label.get("By UPS") == 60, "labelled By UPS sums to 60",
+          str(by_label.get("By UPS")))
+
+    # ---- THE 600 STAYS UNLABELLED -------------------------------------------
+    # Sheet 20140 prints no transport mode. Attributing its 600 units to one is
+    # the specific invented reconciliation behind the wrong circulated figures
+    # ("By Sea 2,040 / By UPS 140 / Ordered 2,180"): 2,040 is the GRAND TOTAL,
+    # and 140 and 2,180 appear nowhere in the workbook. Nothing but this
+    # assertion stops a neighbouring label being carried onto those rows.
+    check(by_label.get("") == 600, "the unlabelled recap row sums to 600",
+          str(by_label.get("")))
+    check(not any(k[1] == "20140" and k[4] for k in got),
+          "NO line from sheet 20140 carries a transport mode -- none is invented "
+          "to reconcile a total",
+          str(sorted({k[4] for k in got if k[1] == "20140"})))
+    check(all(k[1] == "20140" for k in got if k[4] == ""),
+          "and every unlabelled line comes from 20140",
+          str(sorted({k[1] for k in got if k[4] == ""})))
+    check(set(by_label) == {"By Sea", "By UPS", ""},
+          "exactly three recap labels exist, the third being empty", str(sorted(by_label)))
+    check(by_label.get("By Sea", 0) + by_label.get("", 0) == 2040,
+          "1,440 + 600 = 2,040, the grand total at 20140!T40 -- which is exactly "
+          "why 2,040 is NOT the By Sea figure")
+
+    # ---- the precondition for 16 assignment groups and 12 singles ------------
+    # Those are MATCHER outcomes and need NetSuite PO lines. What extraction can
+    # prove on its own is which keys are contested; `matcher._sibling_key` groups
+    # on exactly this tuple, the canonical key WITHOUT the recap label.
+    labels_per_key: dict[tuple, set] = {}
+    for key in got:
+        labels_per_key.setdefault(key[:4], set()).add(key[4])
+    contested = {k for k, v in labels_per_key.items() if len(v) > 1}
+    singles = {k for k, v in labels_per_key.items() if len(v) == 1}
+    check(len(contested) == 16,
+          "16 keys carry BOTH transport modes -> 16 assignment groups", str(len(contested)))
+    check(len(singles) == 12,
+          "12 keys carry exactly one -> 12 unambiguous singles", str(len(singles)))
+    check(len(contested) * 2 + len(singles) == 44,
+          "32 grouped + 12 single = 44, reconciling against the line count")
+    check(all(labels_per_key[k] == {"By Sea", "By UPS"} for k in contested),
+          "a contested key is always a Sea/UPS pair, never one involving the "
+          "unlabelled row")
+
+    # The rendering is allowed to vary; the identity is not. Both are asserted.
+    from netsuite_client import po_number_key
+    printed = {str(ln["po_number"]) for ln in result.lines}
+    check(all(po_number_key(x) == "1624" for x in printed),
+          "every printed PO rendering collapses to the one grouping key 1624 -- "
+          "this workbook has produced both '1624' and 'PO0001624' across runs",
+          str(sorted(printed)))
+    check(sum(FOOTWEAR_EXPECTED.values()) == 2100, "44 lines cross-foot to 2,100 units")
+    print(f"    tokens: {result.usage}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true", help="also make a real Anthropic API call")
@@ -3583,7 +4006,9 @@ def main() -> int:
             _results.append((False, "test_real_samples crashed", ""))
 
         if args.live:
-            for fn in (test_live, test_live_legendz, test_live_symmetry, test_live_attachment_triage):
+            for fn in (test_live, test_live_legendz, test_live_symmetry,
+                       test_live_tainan, test_live_footwear,
+                       test_live_attachment_triage):
                 try:
                     fn(tmp)
                 except Exception:  # noqa: BLE001
@@ -3594,8 +4019,8 @@ def main() -> int:
             _missing_coverage.append(
                 "Live Claude path not exercised (no --live flag).\n"
                 "      -> the extractor's prompt is only tested against a mock in this run.\n"
-                "         Run with --live to check it against the three vendors the live\n"
-                "         group covers: Inprotex, Legendz and Symmetry."
+                "         Run with --live to check it against all five real vendors:\n"
+                "         Inprotex, Legendz, Symmetry, Tainan and Footwear."
             )
 
     passed = sum(1 for ok, _, _ in _results if ok)
@@ -3617,14 +4042,11 @@ def main() -> int:
         for gap in _missing_coverage:
             print(f"  - {gap}")
         print()
-        print("  The Claude-assisted extractor is the PRIMARY parsing path for this project.")
-        print("  It HAS been validated live against three vendors -- Inprotex, Legendz and")
-        print("  Symmetry -- which is what --live re-checks. Two more are committed as")
-        print("  fixtures and exercised OFFLINE ONLY: Tainan (legacy .xls, two-axis sizes)")
-        print("  and Footwear (transport-mode recap rows). Their live extraction figures")
-        print("  are recorded in the RUNBOOK but are asserted by nothing here, so those")
-        print("  two vendors can regress without this suite noticing. Adding them to the")
-        print("  --live group needs hand-derived ground truth committed first.")
+        print("  The Claude-assisted extractor is the PRIMARY parsing path for this")
+        print("  project. --live covers all FIVE real vendors against hand-derived,")
+        print("  line-level ground truth: Inprotex, Legendz, Symmetry, Tainan and")
+        print("  Footwear. Without the flag none of that runs -- the prompt is checked")
+        print("  only against a mock, and a change to it would not be noticed here.")
     print("=" * 78)
     return 1 if failed else 0
 

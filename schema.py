@@ -115,6 +115,28 @@ messages = Table(
     Column("sent_at", DateTime),
     Column("received_at", DateTime, nullable=False),
     Column("ingested_at", DateTime, nullable=False),
+    # The folder the message was found in, as Graph reports it: an opaque
+    # `parentFolderId`, NOT a display name. Resolving the name needs a fifth
+    # Graph call (`/mailFolders/{id}`) and the client interface deliberately has
+    # only four -- see `graph_client.GraphClient`. Recorded rather than filtered
+    # on: the mailbox is dedicated to this pipeline so everything in it is in
+    # scope today, and a folder rule added later can be written against stored
+    # rows instead of re-reading the mailbox.
+    Column("folder_id", String(512)),
+    # What the mailbox said it carried, before any of it was fetched. Lets a
+    # message with zero attachments be a recorded fact rather than an absence,
+    # and lets a partial fetch be detected.
+    Column("attachment_count", Integer, nullable=False, default=0),
+    # INTAKE failure, per message. One unreadable message must not stop a poll,
+    # so the failure is recorded here and the loop continues.
+    Column("poll_error", String(1000)),
+    # EXTRACTION progress, and deliberately NOT the same axis as poll_error.
+    # The poller stores bytes; a separate driver extracts them. `extracted_at`
+    # NULL means "landed, not yet parsed" -- which is exactly the work queue,
+    # and is why a parser change can be re-run over everything already stored
+    # without touching Graph.
+    Column("extracted_at", DateTime),
+    Column("extraction_error", String(1000)),
     UniqueConstraint("graph_message_id", name="uq_messages_graph_message_id"),
 )
 
@@ -142,7 +164,12 @@ attachments = Table(
     Column("first_seen_at", DateTime, nullable=False),
     CheckConstraint(
         "doc_type IN ('PACKING_LIST','COMMERCIAL_INVOICE','SHIPPING_ADVICE',"
-        "'SHIPPING_SCHEDULE','PAYMENT_REQUEST','INSPECTION_REPORT','OTHER','UNREADABLE')",
+        "'SHIPPING_SCHEDULE','PAYMENT_REQUEST','INSPECTION_REPORT','OTHER','UNREADABLE',"
+        # Written by the POLLER, which stores bytes and classifies nothing. Not
+        # the same as 'OTHER' (classified, and none of the above) or 'UNREADABLE'
+        # (opened and failed). Distinguishing them is what makes "never looked
+        # at" queryable instead of indistinguishable from "looked at, uninteresting".
+        "'UNCLASSIFIED')",
         name="doc_type",
     ),
 )
@@ -697,6 +724,36 @@ Index(
     unique=True,
     **_partial("selected = 1"),
 )
+
+#: The poll watermark: where the last successful batch got to, per mailbox.
+#:
+#: **Stored as a position, not a cursor.** Graph offers delta tokens; this uses
+#: `received_at` deliberately, because a delta token is opaque state owned by the
+#: server that cannot be reasoned about, replayed, or nudged backwards by an
+#: operator who needs to re-read a week. A timestamp can.
+#:
+#: **Read back with an OVERLAP, never a bare `>`.** Two messages delivered in the
+#: same second, or a clock a second out between Graph and here, silently lose mail
+#: on a strict comparison -- and the loss is invisible, because nothing knows the
+#: message existed. The overlap re-reads a little every time; dedup on
+#: `graph_message_id` makes that free. See `poller.POLL_OVERLAP`.
+#:
+#: **Advanced only after the batch commits**, so a crash mid-batch re-reads rather
+#: than skips.
+poll_state = Table(
+    "poll_state",
+    metadata,
+    Column("mailbox", String(320), primary_key=True),
+    #: High-water mark: the newest `received_at` that has been durably stored.
+    Column("last_received_at", DateTime, nullable=False),
+    #: When the poll ran. Distinct from the watermark: a poll that finds nothing
+    #: still advances this, which is how "the job is alive but the mailbox is
+    #: quiet" is told apart from "the job stopped running" (build plan Phase 4,
+    #: monitoring).
+    Column("last_polled_at", DateTime, nullable=False),
+    Column("messages_seen", Integer, nullable=False, default=0),
+)
+
 
 write_attempts = Table(
     "write_attempts",

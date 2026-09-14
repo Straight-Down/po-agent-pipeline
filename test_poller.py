@@ -1,0 +1,646 @@
+"""
+Mailbox intake tests: the poller, the blob store, and the extraction seam.
+
+Offline throughout. `MockGraphClient` serves the real vendor corpus in realistic
+envelopes, so these exercise the same bytes the extractor is validated against
+without a mailbox, a credential or a token.
+
+What each group pins, and why it is here rather than left to review:
+
+  - RE-POLL IDEMPOTENCY. The mailbox is immutable to this app -- `Mail.Read`
+    cannot mark a message read or move it -- so "have I seen this?" is only
+    answerable from the database. A second poll over the same window must write
+    nothing.
+  - THE OVERLAP WINDOW. A bare `>` on `receivedDateTime` loses messages
+    delivered in the same second. The test proves the window reaches BACK past
+    the watermark, and that dedup makes the re-read free.
+  - A MID-BATCH FAILURE. One unreadable message must not stop the poll, must be
+    recorded against its own row, and must NOT let the watermark advance past
+    it -- otherwise the shipment is lost and nothing ever looks again.
+  - DUPLICATE ATTACHMENT CONTENT. The same bytes under two filenames: one file
+    on disk, one `attachments` row, two `message_attachments` rows.
+  - A MESSAGE WITH NO ATTACHMENTS. Stored as a fact, not skipped, and it must
+    leave the extraction queue rather than growing a permanent backlog of one.
+  - READ-ONLY, ASSERTED. An AST scan over `graph_client.py` in the style of
+    `test_schema.test_migrations_import_no_application_code`: no HTTP verb but
+    GET, and no Graph path outside the four calls.
+"""
+
+from __future__ import annotations
+
+import ast
+import datetime as dt
+import sys
+from pathlib import Path
+
+from sqlalchemy import create_engine, func, select
+
+import extract_pending as ep
+import graph_client as gc
+import poller
+from schema import attachments, message_attachments, messages, metadata, poll_state  # noqa: F401
+
+HERE = Path(__file__).resolve().parent
+
+_results: list[tuple[bool, str, str]] = []
+
+
+def check(ok: bool, name: str, detail: str = "") -> bool:
+    _results.append((bool(ok), name, detail))
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  --  {detail}" if detail else ""))
+    return bool(ok)
+
+
+def section(title: str) -> None:
+    print(f"\n--- {title} " + "-" * max(0, 72 - len(title)))
+
+
+def fresh_db():
+    engine = create_engine("sqlite://")
+    metadata.create_all(engine)
+    return engine
+
+
+def counts(engine) -> dict:
+    with engine.connect() as conn:
+        return {
+            "messages": conn.execute(select(func.count()).select_from(messages)).scalar(),
+            "attachments": conn.execute(
+                select(func.count()).select_from(attachments)).scalar(),
+            "links": conn.execute(
+                select(func.count()).select_from(message_attachments)).scalar(),
+        }
+
+
+MAILBOX = "shipments@example.test"
+#: A frozen, NAIVE test clock -- deliberately. Every DateTime column in this
+#: schema stores naive UTC (`poller._naive` converts on the way in), so an
+#: aware value here would test a shape the database never sees.
+NOW = dt.datetime(2026, 9, 14, 12, 0, 0)  # noqa: DTZ001
+
+
+# ---------------------------------------------------------------------------
+
+
+def test_mock_envelopes(tmp: Path) -> None:
+    section("the mock serves the real corpus in realistic envelopes")
+    client = gc.MockGraphClient()
+    msgs = client.list_messages(poller.EPOCH)
+    check(len(msgs) == 7, "seven messages", str(len(msgs)))
+
+    times = [gc._parse_graph_time(m["receivedDateTime"]) for m in msgs]
+    check(times == sorted(times), "returned oldest first, which the watermark relies on")
+
+    by_id = {m["id"]: m for m in msgs}
+    two = client.list_attachments("msg-inprotex-001")
+    check(len(two) == 2, "a message with TWO attachments exists (packing list + advice)",
+          str([a["name"][:28] for a in two]))
+    none = client.list_attachments("msg-symmetry-004")
+    check(none == [] and by_id["msg-symmetry-004"]["hasAttachments"] is False,
+          "and one with NONE -- a vendor replying to a thread")
+
+    check(all(m.get("internetMessageId") for m in msgs),
+          "every envelope carries internetMessageId as well as id")
+    check(all("parentFolderId" in m for m in msgs), "and the folder it was found in")
+    check({m["parentFolderId"] for m in msgs} == {"AAMkAG-inbox", "AAMkAG-forwarded"},
+          "two folders, so folder recording is actually exercised")
+    check(not any(k.startswith("_") for m in msgs for k in m),
+          "fixture wiring keys are not leaked into the Graph shape")
+
+    types = {a["contentType"] for mid in by_id for a in client.list_attachments(mid)}
+    check(types == {gc._XLSX, gc._XLS, gc._PDF},
+          "content types match what these vendors really send", str(sorted(types)))
+
+
+def test_blob_store_is_content_addressed(tmp: Path) -> None:
+    section("the blob store: filename IS the content hash")
+    store = poller.BlobStore(tmp / "blobs")
+    sha_a, path_a = store.put(b"vendor bytes", suffix=".xlsx")
+    sha_b, path_b = store.put(b"vendor bytes", suffix=".xlsx")
+    check(sha_a == sha_b and path_a == path_b, "identical bytes -> identical path")
+    check(path_a.name.startswith(sha_a), "the name carries the hash", path_a.name[:24])
+    check(path_a.parent.name == sha_a[:2], "sharded one level to keep directories small")
+
+    sha_c, path_c = store.put(b"different bytes", suffix=".pdf")
+    check(sha_c != sha_a and path_c != path_a, "different bytes -> different path")
+    check(len(list((tmp / "blobs").rglob("*.xlsx"))) == 1,
+          "storing the same content twice leaves ONE file")
+    check(not list((tmp / "blobs").rglob("*.part")),
+          "no partial file is left behind -- writes rename into place")
+
+
+def test_poll_stores_and_is_idempotent(tmp: Path) -> None:
+    section("a poll stores what arrived; a second poll stores nothing")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    client = gc.MockGraphClient()
+
+    first = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+    after_first = counts(engine)
+    check(first.seen == 7 and first.stored == 7, "all seven stored",
+          f"seen={first.seen} stored={first.stored}")
+    check(not first.failed, "no failures", str(first.failed))
+    check(after_first["messages"] == 7, "seven message rows", str(after_first))
+
+    # Nine attachment SLOTS across the fixtures, but the forward repeats the
+    # Legendz bytes, so eight distinct contents and nine joins.
+    check(after_first["attachments"] == 8,
+          "eight distinct attachment contents", str(after_first["attachments"]))
+    check(after_first["links"] == 9,
+          "nine message->attachment joins", str(after_first["links"]))
+
+    second = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+    check(counts(engine) == after_first,
+          "a SECOND poll over the same mailbox writes nothing new", str(counts(engine)))
+    check(second.stored == 0 and second.skipped == second.seen,
+          "and reports every message as already held",
+          f"stored={second.stored} skipped={second.skipped}/{second.seen}")
+
+    with engine.connect() as conn:
+        row = conn.execute(select(messages).where(
+            messages.c.graph_message_id == "msg-legendz-006")).one()
+    check(row.folder_id == "AAMkAG-forwarded",
+          "the folder is RECORDED so a rule can be added later from stored data",
+          str(row.folder_id))
+    check(row.internet_message_id == "<fwd.PL0801.legendz@mail.example>",
+          "internetMessageId is stored alongside the Graph id, not instead of it")
+    check(row.attachment_count == 1, "and what the mailbox said it carried")
+
+    with engine.connect() as conn:
+        stored_types = set(conn.execute(select(attachments.c.doc_type)).scalars())
+    check(stored_types == {poller.UNCLASSIFIED},
+          "the poller classifies NOTHING -- every row is UNCLASSIFIED", str(stored_types))
+
+
+def test_duplicate_content_stores_once_joins_twice(tmp: Path) -> None:
+    section("the same bytes under two filenames: one row, two joins")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+
+    legendz = gc.MockGraphClient().get_attachment("msg-legendz-002", "msg-legendz-002-att-0")
+    import hashlib
+    sha = hashlib.sha256(legendz).hexdigest()
+
+    with engine.connect() as conn:
+        rows = conn.execute(select(attachments).where(
+            attachments.c.content_sha256 == sha)).all()
+        links = conn.execute(select(message_attachments).where(
+            message_attachments.c.content_sha256 == sha)).all()
+    check(len(rows) == 1, "ONE attachments row for the repeated content", str(len(rows)))
+    check(len(links) == 2, "TWO joins -- the original and the forward", str(len(links)))
+    check({link.filename for link in links}
+          == {"Legendz PL0801- 26ctns.xlsx", "PL0801 (forwarded).xlsx"},
+          "each join keeps the filename IT arrived under",
+          str(sorted(link.filename for link in links)))
+    check(len(list((tmp / "blobs").rglob(f"{sha}*"))) == 1,
+          "and one file on disk, because the store is keyed by content")
+
+
+def test_message_with_no_attachments(tmp: Path) -> None:
+    section("a message with zero attachments is a fact, not an absence")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+
+    with engine.connect() as conn:
+        row = conn.execute(select(messages).where(
+            messages.c.graph_message_id == "msg-symmetry-004")).one()
+        links = conn.execute(select(func.count()).select_from(message_attachments)
+                             .where(message_attachments.c.message_id == row.id)).scalar()
+    check(row is not None, "it is STORED, not skipped")
+    check(row.attachment_count == 0 and links == 0, "with zero declared and zero joined")
+    check(row.poll_error is None, "and it is not treated as a failure")
+
+    report = ep.extract_pending(engine, extractor=_never_called)
+    check(report.skipped_no_attachments == 1,
+          "the driver counts it as having nothing to parse",
+          str(report.skipped_no_attachments))
+    with engine.connect() as conn:
+        again = conn.execute(select(messages.c.extracted_at).where(
+            messages.c.id == row.id)).scalar()
+    check(again is not None,
+          "and MARKS it extracted, so the queue does not grow by one forever")
+
+
+def test_watermark_overlap(tmp: Path) -> None:
+    section("the watermark reads BACK, because a bare > loses mail")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    client = gc.MockGraphClient()
+    report = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+
+    newest = max(o.received_at for o in report.outcomes)
+    check(report.watermark_advanced and report.watermark_after == newest,
+          "the watermark lands on the newest message stored", str(report.watermark_after))
+
+    # The window a SECOND poll opens must start before the watermark.
+    second = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+    check(second.window_from < poller._aware(newest),
+          "the next window starts BEFORE it, by the overlap",
+          f"{second.window_from} < {newest}")
+    expected = poller._aware(newest) - poller.POLL_OVERLAP
+    check(second.window_from == expected,
+          "exactly one overlap back, not an arbitrary fudge", str(second.window_from))
+    check(second.seen > 0, "so messages already stored ARE re-read", str(second.seen))
+    check(second.stored == 0, "and cost nothing, because dedup catches them")
+
+    # The failure mode the overlap exists for: two messages in the same second.
+    twins = [
+        dict(m, id=f"twin-{i}", internetMessageId=f"<twin{i}@x>",
+             receivedDateTime="2026-09-01T10:00:00Z")
+        for i, m in enumerate(gc.MOCK_MESSAGES[1:3])
+    ]
+    engine2, store2 = fresh_db(), poller.BlobStore(tmp / "blobs2")
+    twin_client = gc.MockGraphClient(twins)
+    r1 = poller.poll_once(engine2, twin_client, MAILBOX, store2, now=NOW)
+    check(r1.stored == 2, "both same-second messages stored on the first pass", str(r1.stored))
+    r2 = poller.poll_once(engine2, twin_client, MAILBOX, store2, now=NOW)
+    check(r2.seen == 2 and r2.stored == 0,
+          "and the next poll re-reads BOTH -- a strict > would have dropped one",
+          f"seen={r2.seen} stored={r2.stored}")
+
+
+class _ExplodingClient(gc.MockGraphClient):
+    """Fails one message's attachment fetch. Everything else behaves."""
+
+    def __init__(self, bad_message_id: str) -> None:
+        super().__init__()
+        self.bad = bad_message_id
+
+    def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        if message_id == self.bad:
+            raise gc.GraphError("simulated: attachment fetch failed")
+        return super().get_attachment(message_id, attachment_id)
+
+
+def test_mid_batch_failure_holds_the_watermark(tmp: Path) -> None:
+    section("one bad message: recorded, stepped over, and the watermark waits")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    # Tainan sits in the middle of the batch by received_at.
+    client = _ExplodingClient("msg-tainan-005")
+    report = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+
+    check(report.seen == 7, "the poll saw every message", str(report.seen))
+    check(len(report.failed) == 1, "exactly one failed", str([o.graph_message_id for o in report.failed]))
+    check(report.stored == 6, "and the other six were stored -- the poll did NOT stop",
+          str(report.stored))
+
+    with engine.connect() as conn:
+        bad = conn.execute(select(messages).where(
+            messages.c.graph_message_id == "msg-tainan-005")).one()
+    check(bad.poll_error and "simulated" in bad.poll_error,
+          "the failure is recorded against ITS OWN row", (bad.poll_error or "")[:48])
+
+    failed_at = report.failed[0].received_at
+    check(report.watermark_after is None or report.watermark_after < failed_at,
+          "the watermark did NOT advance past the failure",
+          f"watermark={report.watermark_after} failure={failed_at}")
+
+    later = [o for o in report.outcomes if o.received_at > failed_at and o.stored]
+    check(later, "messages AFTER the failure were still stored", str(len(later)))
+    check(report.watermark_after != max(o.received_at for o in report.outcomes),
+          "so the watermark is behind the newest stored message, deliberately")
+
+    # The retry: a healthy client must pick the failure up and clear it.
+    retry = poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+    with engine.connect() as conn:
+        fixed = conn.execute(select(messages).where(
+            messages.c.graph_message_id == "msg-tainan-005")).one()
+    check(fixed.poll_error is None, "a later poll retries it and clears the error")
+    check(fixed.attachment_count == 1, "and finally stores its attachment")
+    check(retry.watermark_advanced, "only then does the watermark move past it")
+
+
+def test_extraction_seam(tmp: Path) -> None:
+    section("the seam: extraction runs over STORED rows, never over Graph")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+
+    pending = ep.pending_messages(engine)
+    check(len(pending) == 7, "everything polled is pending extraction", str(len(pending)))
+    check(all(p["paths"] or p["attachment_count"] == 0 for p in pending),
+          "each carries the STORED paths of its attachments")
+    inprotex = next(p for p in pending if p["graph_message_id"] == "msg-inprotex-001")
+    check(len(inprotex["paths"]) == 2,
+          "a two-attachment message hands ingest_shipment BOTH paths")
+    check(all(path.exists() for path in inprotex["paths"]),
+          "and the paths point at real files on disk")
+    check([p["received_at"] for p in pending] == sorted(p["received_at"] for p in pending),
+          "pending work is ordered oldest-first, so a backlog applies in arrival order")
+
+    # The driver marks progress; the poller is not involved.
+    calls: list = []
+
+    def fake_ingest(engine_, paths, **kwargs):
+        calls.append(list(paths))
+        return ingest_result()
+
+    original = ep.ingest_module.ingest_shipment
+    try:
+        ep.ingest_module.ingest_shipment = fake_ingest
+        report = ep.extract_pending(engine)
+    finally:
+        ep.ingest_module.ingest_shipment = original
+
+    check(report.extracted == 6 and report.skipped_no_attachments == 1,
+          "six with documents extracted, one empty message retired",
+          report.summary())
+    check(len(calls) == 6, "ingest_shipment called once per message, not per attachment",
+          str(len(calls)))
+    check(not ep.pending_messages(engine), "nothing is left pending afterwards")
+
+    again = ep.extract_pending(engine)
+    check(again.attempted == 0, "re-running extracts nothing -- extracted_at is the queue")
+
+    rerun = ep.extract_pending(engine, include_extracted=True, limit=0)
+    check(rerun.attempted == 0 and ep.pending_messages(engine, include_extracted=True),
+          "--all re-opens the whole set, which is how a parser change is re-run")
+
+
+def ingest_result():
+    from ingest import IngestReport
+
+    return IngestReport(shipment_id="ship-x", created=True)
+
+
+def _never_called(*args, **kwargs):
+    raise AssertionError("the extractor must not run for a message with no attachments")
+
+
+# ---------------------------------------------------------------------------
+# READ-ONLY, ASSERTED
+# ---------------------------------------------------------------------------
+
+#: Everything Graph could be asked to do that this project must never do.
+FORBIDDEN_VERBS = ("post", "put", "patch", "delete", "options", "head", "request")
+
+#: The four calls, as URL fragments. Any other Graph path in the module is a
+#: fifth capability arriving without a decision.
+ALLOWED_PATH_FRAGMENTS = ("/users/", "/messages", "/attachments",
+                          "login.microsoftonline.com",
+                          # The API root and the scope: no path of their own.
+                          "graph.microsoft.com/v1.0", "graph.microsoft.com/.default")
+
+#: Graph paths that would be writes, or reads this pipeline has no business
+#: making, spelled out so the failure NAMES what was attempted.
+FORBIDDEN_FRAGMENTS = (
+    "/sendMail", "/move", "/copy", "/forward", "/reply", "/replyAll",
+    "/mailFolders", "/subscriptions", "/delta", "/users/me", "/createReply",
+)
+
+
+def _docstring_nodes(tree: ast.AST) -> set:
+    """
+    The id() of every string node that is a docstring.
+
+    Excluded from the scans below, and the reason is the whole point of this
+    test: `graph_client`'s docstring SAYS "No folder listing... needs
+    `/mailFolders/{id}`" and "nothing here touches `os.environ`". A text search
+    cannot tell a prohibition from a violation, and failing on the sentence that
+    documents the rule is a check measuring a proxy instead of the thing
+    (RUNBOOK section 8 lesson 12). These scans read code.
+    """
+    out = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", None) or []
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            out.add(id(body[0].value))
+    return out
+
+
+def _code_strings(tree: ast.AST) -> list[str]:
+    """Every string literal that is NOT a docstring."""
+    skip = _docstring_nodes(tree)
+    return [n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and id(n) not in skip]
+
+
+def _reads_environ(tree: ast.AST) -> list[str]:
+    """`os.environ`, `os.getenv`, `environ[...]` -- as CODE, not as prose."""
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv"):
+            hits.append(f"line {node.lineno}: .{node.attr}")
+        elif isinstance(node, ast.Name) and node.id in ("environ", "getenv"):
+            hits.append(f"line {node.lineno}: {node.id}")
+    return hits
+
+
+def test_graph_surface_is_read_only(tmp: Path) -> None:
+    section("AST: the Graph client can only GET, and only the four calls")
+    source = (HERE / "graph_client.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    verbs: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_node = node.func
+        name = (func_node.attr if isinstance(func_node, ast.Attribute)
+                else getattr(func_node, "id", ""))
+        if name.lower() in FORBIDDEN_VERBS:
+            verbs.append(f"line {node.lineno}: {name}()")
+    check(not verbs, "no HTTP verb but GET is called anywhere in graph_client.py",
+          str(verbs or "none"))
+
+    literals = _code_strings(tree)
+    bad = sorted({lit for lit in literals
+                  for frag in FORBIDDEN_FRAGMENTS if frag.lower() in lit.lower()})
+    check(not bad, "and no write-shaped or out-of-scope Graph path appears", str(bad or "none"))
+
+    urls = [lit for lit in literals if "graph.microsoft.com" in lit or lit.startswith("/")]
+    stray = [u for u in urls
+             if not any(frag in u for frag in ALLOWED_PATH_FRAGMENTS)
+             and u not in ("/", "")]
+    check(not stray, "every Graph URL fragment belongs to one of the four calls",
+          str(stray or "none"))
+
+    # The interface itself: adding a method must be a deliberate act, so the
+    # abstract surface is pinned by count as well as by name.
+    surface = {n.name for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef)
+               and any(isinstance(d, ast.Attribute) and d.attr == "abstractmethod"
+                       for d in n.decorator_list)}
+    check(surface == {"list_messages", "get_message", "list_attachments", "get_attachment"},
+          "the abstract interface is exactly the four methods", str(sorted(surface)))
+
+    check("import requests" in source and source.count("session.get(") == 1,
+          "there is exactly ONE place an HTTP request is made")
+
+    # And the poller must not reach around the interface to Graph directly.
+    poller_src = (HERE / "poller.py").read_text(encoding="utf-8")
+    check("graph.microsoft.com" not in poller_src and "requests" not in poller_src,
+          "the poller never touches Graph or HTTP itself -- only the interface")
+    check("import config" not in poller_src.split("def main")[0],
+          "and the module body does not reach for config -- it is handed a client")
+
+    # THE SCAN MUST BE ABLE TO FAIL. A check whose failing path has never been
+    # exercised is not yet a check (RUNBOOK section 8 lesson 18), and a
+    # read-only assertion that silently stopped matching would be the worst
+    # possible thing to be wrong about. Three violations, one per rule.
+    VIOLATION = chr(10).join([
+        '"""A docstring naming /sendMail and os.environ, which is FINE."""',
+        "import requests",
+        "def send(token):",
+        "    return requests.post(GRAPH_ROOT + '/users/x/sendMail')",
+        "def folders(token):",
+        "    return requests.get('https://graph.microsoft.com/v1.0/me/mailFolders')",
+        "def leak():",
+        "    return os.environ['GRAPH_CLIENT']",
+    ])
+
+    vtree = ast.parse(VIOLATION)
+    vverbs = [n.func.attr for n in ast.walk(vtree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr.lower() in FORBIDDEN_VERBS]
+    check("post" in vverbs, "the verb scan CATCHES a requests.post()", str(vverbs))
+    vstrings = _code_strings(vtree)
+    vbad = [lit for lit in vstrings
+            for frag in FORBIDDEN_FRAGMENTS if frag.lower() in lit.lower()]
+    check(len(vbad) >= 2, "the path scan CATCHES /sendMail and /mailFolders in code",
+          str(sorted(set(vbad))))
+    check(_reads_environ(vtree), "the environment scan CATCHES os.environ in code",
+          str(_reads_environ(vtree)))
+    check(not [lit for lit in _code_strings(vtree) if "FINE" in lit],
+          "while the docstring naming those same terms is correctly IGNORED")
+    for module in ("graph_client.py", "extract_pending.py", "poller.py"):
+        hits = _reads_environ(ast.parse((HERE / module).read_text(encoding="utf-8")))
+        # `poller` calls os.path.expandvars for the store root, which is a
+        # filesystem path and not configuration -- `.environ` / `getenv` are
+        # what this forbids, and GraphConfig owns every GRAPH_* value.
+        check(not hits, f"{module} reads no environment variable directly",
+              str(hits or "none"))
+
+
+def test_client_selection(tmp: Path) -> None:
+    section("GRAPH_CLIENT selects the implementation; no code change to switch")
+    from types import SimpleNamespace
+
+    mock_cfg = SimpleNamespace(is_mock=True, client_kind="mock")
+    real_cfg = SimpleNamespace(
+        is_mock=False, client_kind="real", mailbox="m@x", tenant_id="t",
+        client_id="c", cert_path=Path("k"), cert_public_path=Path("c"),
+        cert_thumbprint="T",
+    )
+    check(isinstance(gc.build_graph_client(mock_cfg), gc.MockGraphClient),
+          "mock config builds the mock client")
+    check(isinstance(gc.build_graph_client(real_cfg), gc.RealGraphClient),
+          "real config builds the real client")
+    check(gc.MockGraphClient.kind == "mock" and gc.RealGraphClient.kind == "real",
+          "each reports which it is, so a row can record what wrote it")
+    check(issubclass(gc.MockGraphClient, gc.GraphClient)
+          and issubclass(gc.RealGraphClient, gc.GraphClient),
+          "both implement the same narrow interface")
+
+
+def test_retry_after(tmp: Path) -> None:
+    section("429/503 honour Retry-After, bounded, then give up")
+    check(gc._retry_after_seconds({"Retry-After": "7"}, 1) == 7.0,
+          "a server-supplied Retry-After is honoured", "7s")
+    check(gc._retry_after_seconds({"Retry-After": "9999"}, 1) == gc.MAX_RETRY_AFTER_SECONDS,
+          "but capped -- a poller that waits an hour looks identical to a hung one",
+          f"{gc.MAX_RETRY_AFTER_SECONDS}s")
+    check(gc._retry_after_seconds({}, 3) == 8.0,
+          "with exponential backoff when the header is absent", "2^3")
+    check(gc._retry_after_seconds({"Retry-After": "not-a-number"}, 2) == 4.0,
+          "and a malformed header falls back rather than raising")
+
+    class _Resp:
+        def __init__(self, status, headers=None):
+            self.status_code, self.headers = status, (headers or {})
+            self.text = "throttled"
+
+        def json(self):
+            return {"value": []}
+
+    class _Session:
+        def __init__(self, statuses):
+            self.statuses, self.calls = list(statuses), 0
+
+        def get(self, *a, **k):
+            self.calls += 1
+            return _Resp(self.statuses.pop(0) if self.statuses else 200)
+
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(mailbox="m@x", tenant_id="t", client_id="c",
+                          cert_path=Path("k"), cert_public_path=Path("c"),
+                          cert_thumbprint="T")
+
+    session = _Session([429, 503, 200])
+    client = gc.RealGraphClient(cfg, session=session)
+    client._token = "tok"  # skip MSAL; this test is about the retry loop
+    original_sleep = gc.time.sleep
+    gc.time.sleep = lambda _s: None
+    try:
+        payload = client._get_json("https://graph.microsoft.com/v1.0/users/m@x/messages")
+    finally:
+        gc.time.sleep = original_sleep
+    check(payload == {"value": []} and session.calls == 3,
+          "it retries through 429 then 503 and succeeds", f"{session.calls} calls")
+
+    session = _Session([429] * 10)
+    client = gc.RealGraphClient(cfg, session=session)
+    client._token = "tok"
+    gc.time.sleep = lambda _s: None
+    try:
+        raised = ""
+        try:
+            client._get_json("https://graph.microsoft.com/v1.0/users/m@x/messages")
+        except gc.GraphError as exc:
+            raised = str(exc)
+    finally:
+        gc.time.sleep = original_sleep
+    check(raised and session.calls == gc.MAX_RETRIES,
+          "and gives up after a BOUNDED number of attempts rather than forever",
+          f"{session.calls} calls, then: {raised[:40]}")
+
+
+def main() -> int:
+    print("=" * 78)
+    print("MAILBOX INTAKE TESTS -- poller, blob store, extraction seam")
+    print("=" * 78)
+    print()
+    print("Offline: the mock serves the real vendor corpus. No mailbox, no token.")
+
+    REGISTERED = (
+        test_mock_envelopes,
+        test_blob_store_is_content_addressed,
+        test_poll_stores_and_is_idempotent,
+        test_duplicate_content_stores_once_joins_twice,
+        test_message_with_no_attachments,
+        test_watermark_overlap,
+        test_mid_batch_failure_holds_the_watermark,
+        test_extraction_seam,
+        test_graph_surface_is_read_only,
+        test_client_selection,
+        test_retry_after,
+    )
+
+    # A test registered twice runs twice and its checks are counted twice. That
+    # is how test_schema reported 115 for 105 distinct checks until a pytest run,
+    # which collects each function once, disagreed with the script (RUNBOOK
+    # section 8 lessons 18 and 19). Cheap to assert, so the class cannot recur.
+    dupes = sorted({f.__name__ for f in REGISTERED if REGISTERED.count(f) > 1})
+    check(not dupes, "no test is registered more than once", str(dupes or "none"))
+
+    import tempfile
+
+    for fn in REGISTERED:
+        with tempfile.TemporaryDirectory() as td:
+            fn(Path(td))
+
+    failed = [name for ok, name, _ in _results if not ok]
+    print()
+    print("=" * 78)
+    print(f"{len(_results) - len(failed)}/{len(_results)} checks passed")
+    for name in failed:
+        print(f"  FAILED: {name}")
+    print("=" * 78)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

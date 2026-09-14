@@ -297,6 +297,28 @@ def _upsert_attachment(conn, path: Path, classification, now: dt.datetime) -> st
     return sha
 
 
+def _doc_usage(parsed, role: str) -> dict:
+    """
+    Per-document token spend, keyed by role.
+
+    The PRIMARY carries the parse's own figure. A CROSS_CHECK was parsed too --
+    fully, and its lines discarded -- but `ParseResult` only carries the primary's
+    delta, so its own cost is recorded as unknown (NULL) rather than invented as
+    zero. Zero would assert it was free, and the 2026-09-14 run showed cross-check
+    parsing is exactly where unaccounted spend hides.
+
+    An EXCLUDED document was never opened for data at all, so zero is the truth
+    there and NULL would understate what is known.
+    """
+    if role == "PRIMARY":
+        usage = parsed.usage or {}
+        return {"input_tokens": int(usage.get("input_tokens", 0) or 0),
+                "output_tokens": int(usage.get("output_tokens", 0) or 0)}
+    if role == "EXCLUDED":
+        return {"input_tokens": 0, "output_tokens": 0}
+    return {"input_tokens": None, "output_tokens": None}
+
+
 def _doc_type_value(classification) -> str:
     """Map the classifier's DocType onto the schema's CHECK-constrained set."""
     if classification is None:
@@ -655,6 +677,11 @@ def ingest_shipment(
             "parse_notes_json": json.dumps(parsed.notes) if parsed.notes else None,
             "line_count": len(parsed.lines),
             "unit_total": sum(ln.get("quantity") or 0 for ln in parsed.lines),
+            # What this shipment cost, primary plus every cross-check. Written
+            # here because here is where the parse happened -- storing a figure
+            # anywhere else means recomputing or guessing it later.
+            "extractor_input_tokens": int((parsed.usage or {}).get("input_tokens", 0) or 0),
+            "extractor_output_tokens": int((parsed.usage or {}).get("output_tokens", 0) or 0),
             "created_by": actor,
             "created_at": now,
         })
@@ -695,6 +722,10 @@ def ingest_shipment(
                     "doc_type": _doc_type_value(item),
                     "lines_proposed": role == "PRIMARY",
                 }),
+                # Per document. NULL for one nothing read -- an EXCLUDED file was
+                # never opened for data, which is different from opening it and
+                # spending nothing. See migration 0006.
+                **(_doc_usage(parsed, role)),
             })
             counts["shipment_sources"] += 1
 

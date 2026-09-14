@@ -153,6 +153,29 @@ def validate_deterministic_lines(raw_lines: list[dict]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+#: Token accounting that is free and never confused with "not measured".
+FREE_USAGE = {"input_tokens": 0, "output_tokens": 0}
+
+
+def usage_delta(before: dict, after: dict) -> dict:
+    """
+    Tokens spent BY ONE PARSE, not by the extractor's whole lifetime.
+
+    `ClaudeExtractor.last_usage` is a misnomer: it ACCUMULATES across every call
+    the instance ever makes and is never reset. Both call sites here used to copy
+    it wholesale into `ParseResult.usage`, so a document parsed late in a run
+    reported the running total of everything before it. That is why per-document
+    cost could not be recovered from a completed run and had to be guessed from
+    character counts.
+
+    Subtracting a snapshot taken immediately before the parse gives the real
+    figure. Keys present only in `after` count in full.
+    """
+    return {k: after.get(k, 0) - before.get(k, 0)
+            for k in set(after) | set(before)
+            if after.get(k, 0) - before.get(k, 0) != 0} or dict(FREE_USAGE)
+
+
 def parse_packing_slip(
     xlsx_path: Union[str, Path],
     extractor: Optional[ClaudeExtractor] = None,
@@ -177,6 +200,9 @@ def parse_packing_slip(
     # `notes` is informational routing detail; `warnings` means a human must look.
     notes: list[str] = []
     warnings: list[str] = []
+    # Snapshot BEFORE any model call, so `usage` below is this document's spend
+    # rather than the extractor's lifetime running total. See `usage_delta`.
+    usage_before = dict(getattr(extractor, "last_usage", {}) or {}) if extractor else {}
     # By signature, not by suffix -- see claude_extractor.sniff_format.
     fmt = sniff_format(path)
     is_pdf = fmt == FORMAT_PDF
@@ -228,7 +254,7 @@ def parse_packing_slip(
         unparsed_regions=meaningful(extraction.unparsed_regions),
         warnings=warnings + meaningful(extraction.warnings) + comp_warnings + agg_warnings,
         notes=notes,
-        usage=dict(extractor.last_usage),
+        usage=usage_delta(usage_before, extractor.last_usage),
     )
 
 
@@ -285,6 +311,11 @@ def _try_deterministic_packing_slip(
         ),
         warnings=warnings,
         notes=notes,
+        # EXPLICIT zero, not an empty dict. Free and unmeasured must not look
+        # alike: `{}` reads as "nobody recorded this", and the deterministic
+        # parser genuinely spent nothing. The distinction is the whole reason
+        # the column exists.
+        usage=dict(FREE_USAGE),
     )
 
 
@@ -531,6 +562,7 @@ def parse_shipment_documents(
         )
 
     extractor = extractor or ClaudeExtractor()
+    usage_before = dict(getattr(extractor, "last_usage", {}) or {})
     extraction = extractor.extract_documents(sources, focus=focus)
 
     # Same hard constraint as the single-document path. NOT followed by
@@ -548,7 +580,7 @@ def parse_shipment_documents(
         warnings=warnings + meaningful(extraction.warnings) + comp_warnings,
         notes=[f"combined {len(sources)} rendered source(s): " + "; ".join(s.label for s in sources)]
         + ([f"scope limited to: {focus}"] if focus else []),
-        usage=dict(extractor.last_usage),
+        usage=usage_delta(usage_before, extractor.last_usage),
     )
 
 

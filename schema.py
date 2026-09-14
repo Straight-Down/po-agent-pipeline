@@ -227,6 +227,14 @@ shipments = Table(
     Column("parse_notes_json", Text),
     Column("line_count", Integer),
     Column("unit_total", Numeric(12, 3)),
+    # WHAT THIS SHIPMENT COST, totalled across its primary and every cross-check.
+    # NULL means "not recorded" -- a row written before this column existed, or by
+    # a path that does not account. ZERO means measured and free, which the
+    # deterministic Inprotex parser genuinely is. Keeping those distinct is the
+    # point: without it, "which document cost the most" is unanswerable after a
+    # run and has to be guessed from character counts (section 8 lesson 21).
+    Column("extractor_input_tokens", Integer),
+    Column("extractor_output_tokens", Integer),
     Column("created_by", String(320), nullable=False),
     Column("created_at", DateTime, nullable=False),
     CheckConstraint("origin IN ('VENDOR_EMAIL','PAULA_DIRECTED')", name="origin"),
@@ -264,6 +272,11 @@ shipment_sources = Table(
     Column("role", String(16), nullable=False),
     Column("exclusion_reason", String(500)),
     Column("agreement_json", Text),
+    # PER DOCUMENT, which is the grain the question is actually asked at: a
+    # cross-check that costs a full extraction and is then discarded is invisible
+    # in a per-shipment total. Same NULL/zero distinction as `shipments`.
+    Column("input_tokens", Integer),
+    Column("output_tokens", Integer),
     UniqueConstraint("shipment_id", "content_sha256", name="uq_shipment_sources_pair"),
     CheckConstraint("role IN ('PRIMARY','CROSS_CHECK','EXCLUDED')", name="role"),
 )

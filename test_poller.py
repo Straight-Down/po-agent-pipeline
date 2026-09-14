@@ -57,8 +57,29 @@ def section(title: str) -> None:
 
 
 def fresh_db():
+    """
+    An empty database with the state machine SEEDED.
+
+    `create_all` builds the tables and seeds nothing, so a test that reaches a
+    state write hits `IllegalTransition` -- `assert_transition` reads
+    `change_state_transitions` at runtime, and an unseeded table makes every
+    transition illegal. Migration 0001 seeds it in production; this mirrors that,
+    the same way `test_ingest.fresh_db` does.
+    """
+    import schema as sc
+    from sqlalchemy import text as sa_text
+
     engine = create_engine("sqlite://")
     metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(sc.change_states.insert(), [
+            {"state": st, "is_terminal": t, "description": d}
+            for st, t, d in sc.CHANGE_STATES])
+        conn.execute(sc.change_state_transitions.insert(), [
+            {"from_state": f, "to_state": t, "trigger": g, "actor_kind": a}
+            for f, t, g, a in sc.CHANGE_STATE_TRANSITIONS])
+        for _name, ddl in sc.VIEWS:
+            conn.execute(sa_text(ddl))
     return engine
 
 
@@ -1211,6 +1232,99 @@ def test_reforward_does_not_create_a_second_shipment(tmp: Path) -> None:
           str(list(forward["display_names"].values()))[:46])
 
 
+def test_usage_round_trips(tmp: Path) -> None:
+    section("token spend is stored where the parse happens, and reads back")
+    from sqlalchemy import select as sa_select
+
+    import attachment_classifier as ac
+    import document_parsers as dp
+    import ingest as ing
+    from extraction_schema import ParseResult
+    from netsuite_client import NetSuiteClient
+    from schema import shipment_sources, shipments
+
+    # --- the delta, first: `last_usage` ACCUMULATES and is never reset -------
+    class _Acc:
+        def __init__(self):
+            self.last_usage = {}
+
+        def spend(self, i, o):
+            self.last_usage["input_tokens"] = self.last_usage.get("input_tokens", 0) + i
+            self.last_usage["output_tokens"] = self.last_usage.get("output_tokens", 0) + o
+
+    ex = _Acc()
+    ex.spend(1000, 500)
+    before = dict(ex.last_usage)
+    ex.spend(300, 200)
+    delta = dp.usage_delta(before, ex.last_usage)
+    check(delta == {"input_tokens": 300, "output_tokens": 200},
+          "usage_delta reports THIS parse, not the extractor's running total",
+          str(delta))
+    check(dp.usage_delta(before, before) == dp.FREE_USAGE,
+          "no spend between snapshots reads as an explicit zero, not as empty",
+          str(dp.usage_delta(before, before)))
+    check(dp.FREE_USAGE == {"input_tokens": 0, "output_tokens": 0},
+          "and FREE_USAGE is zero, so free and unmeasured never look alike")
+
+    # --- and the round trip through the database ----------------------------
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+    row = next(r for r in ep.pending_messages(engine)
+               if r["graph_message_id"] == "msg-symmetry-003")
+
+    primary = ac.AttachmentClassification(
+        path=row["paths"][0], doc_type=ac.DocType.PACKING_LIST, has_size_breakdown=True,
+        reason="stub", method="stub", display_name="primary.pdf")
+    cross = ac.AttachmentClassification(
+        path=row["paths"][1], doc_type=ac.DocType.PACKING_LIST, has_size_breakdown=True,
+        reason="stub", method="stub", display_name="cross.pdf")
+    excluded = ac.AttachmentClassification(
+        path=row["paths"][2], doc_type=ac.DocType.COMMERCIAL_INVOICE, has_size_breakdown=False,
+        reason="stub", method="stub", display_name="invoice.pdf")
+    canned = ac.ClassificationResult(selected=[primary, cross], excluded=[excluded])
+
+    parsed = ParseResult(
+        lines=[{"po_number": "1720", "style_number": "M650022", "color": "NEW INDIGO",
+                "size": "S", "quantity": 22, "confidence": "high", "note": "",
+                "source_hint": "", "recap_label": "", "size_axis_primary": "",
+                "size_axis_secondary": ""}],
+        parser="claude-assisted",
+        usage={"input_tokens": 12345, "output_tokens": 6789},
+    )
+
+    orig_c, orig_p = ac.classify_attachments, dp.parse_shipment_email
+    try:
+        ac.classify_attachments = lambda paths, **kw: canned
+        dp.parse_shipment_email = lambda paths, **kw: parsed
+        ing.ingest_shipment(engine, row["paths"],
+                            client=NetSuiteClient(mock_data={"1720": []}),
+                            display_names=row["display_names"], now=NOW)
+    finally:
+        ac.classify_attachments, dp.parse_shipment_email = orig_c, orig_p
+
+    with engine.connect() as conn:
+        ship = conn.execute(sa_select(shipments.c.extractor_input_tokens,
+                                      shipments.c.extractor_output_tokens)).one()
+    check((ship.extractor_input_tokens, ship.extractor_output_tokens) == (12345, 6789),
+          "the shipment's spend round-trips exactly",
+          f"{ship.extractor_input_tokens}/{ship.extractor_output_tokens}")
+
+    with engine.connect() as conn:
+        by_role = {r.role: (r.input_tokens, r.output_tokens) for r in conn.execute(
+            sa_select(shipment_sources.c.role, shipment_sources.c.input_tokens,
+                      shipment_sources.c.output_tokens))}
+    check(by_role.get("PRIMARY") == (12345, 6789),
+          "the PRIMARY document carries the parse's own figure", str(by_role.get("PRIMARY")))
+    check(by_role.get("EXCLUDED") == (0, 0),
+          "an EXCLUDED document is ZERO -- it was never opened for data, and that "
+          "is known rather than unrecorded", str(by_role.get("EXCLUDED")))
+    check(by_role.get("CROSS_CHECK") == (None, None),
+          "a CROSS_CHECK is NULL -- it WAS parsed in full, but ParseResult carries "
+          "only the primary's delta, so its cost is unknown rather than invented",
+          str(by_role.get("CROSS_CHECK")))
+    check(None not in by_role.get("EXCLUDED", (None,)),
+          "so NULL and zero mean different things and both survive the round trip")
+
 def main() -> int:
     print("=" * 78)
     print("MAILBOX INTAKE TESTS -- poller, blob store, extraction seam")
@@ -1239,6 +1353,7 @@ def main() -> int:
         test_since_overrides_on_every_path,
         test_max_messages_cannot_drag_the_watermark_backwards,
         test_reforward_does_not_create_a_second_shipment,
+        test_usage_round_trips,
         test_graph_surface_is_read_only,
         test_client_selection,
         test_retry_after,

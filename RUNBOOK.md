@@ -638,6 +638,22 @@ icacls C:\dev\po-agent-secrets
 
 Same class of mistake as §8 lessons 11 and 12 (a confirmation is only as good as the question it answered; do not gate a verdict on evidence you cannot read): the output *looked* like evidence, so nobody asked what produced it. The general rule — **when a tool translates between two models, its output describes the translation, not the thing.** MSYS on ACLs, `git status` on case-only renames, and `stat` on a network share are all the same shape.
 
+### The layout renderer can double a space INSIDE a value, and that is not a bug to fix
+
+`render_pdf_page_layout` places every word at a character column derived from its x-position, which is what preserves column alignment on a numeric table (see the size-column reasoning in its docstring). A consequence: when one logical cell holds two words, the x-gap between them maps to **two** character columns. The Symmetry packing list prints `NEW INDIGO` with a single space; the model is shown:
+
+```
+   1720       1      M650022     NEW  INDIGO            22
+```
+
+**The model resolves this one way per document, self-consistently, and both readings are defensible** — the doubled space is either part of the value or a layout artefact, and nothing in the rendered text settles it. Measured over 10 runs of the Symmetry pair: 9 returned `NEW INDIGO`, 1 returned `NEW  INDIGO`, and in that run **all six** of that colour's lines carried it while the other document in the same run carried none.
+
+**`canonical()` absorbs it completely, so nothing downstream can distinguish the runs.** `extraction_schema.aggregate_lines` keys on `canonical(color)` and merges the two spellings into one line; `matcher._sibling_key` and `_find_matching_lines` canonicalise both operands; `proposed_changes.key_color` stores the canonical form with the verbatim text preserved beside it in `src_color_text`. Change 4 exists for exactly this class of input — its worked example is literally `NEW  INDIGO` against NetSuite's `NEW INDIGO`. The two runs produce byte-identical database rows and byte-identical NetSuite proposals.
+
+**The renderer was deliberately NOT changed, and the reason is that the gap IS the signal.** Collapsing runs of spaces would require distinguishing an intra-cell gap from an inter-cell one, and the renderer does no column detection — it has no notion of where a cell starts or ends, only where words are. A blanket collapse would flatten the column structure this function exists to preserve, misfiring across every vendor to solve a problem one vendor has and the pipeline already handles. Same shape as the rule in §8 lesson 12 about proxies: fix the thing that actually decides identity, not the thing that happens to be easy to edit.
+
+**What this cost, and where it surfaced:** only the *tests*, which keyed on raw strings — see §8 lesson 17. The pipeline was never affected.
+
 ### Migrations freeze their data as literals and import no application code
 
 **The rule, now enforced by a test rather than by discipline:** a migration writes only literals spelled out in the migration itself. `schema.py` is the *runtime* declaration and the thing tests compare against; it is never a source a migration reads. Any edit to it that changes seeded data requires a paired migration carrying its own frozen literal.
@@ -944,6 +960,22 @@ Three facts in this pipeline were learned from sandbox, baked into matching, and
 **Recognising the fourth is the point of naming the shape.** Three separate warnings read as three pieces of trivia; one named shape is something a reader can apply to a fact discovered next month. The pipeline learns something new about this account's data every time a vendor arrives, and each new thing learned from sandbox joins this list by default until someone checks it against production.
 
 Related: this is the same failure geometry as §8 lesson 12, approached from the other end. There, a check was red on a healthy system and so got ignored. Here, the system is green while silently doing less work. **Both are cases where the absence of an error was read as evidence, and in neither case was it.**
+
+### 17. A test that compares raw strings where production compares canonical forms is testing a different system
+
+It is not a stricter test or a looser one. **It is an assertion about a system that merely shares code with the one shipping**, and it will disagree with reality in both directions: failing on differences the pipeline erases, and — the half nobody notices — passing on differences it would not.
+
+**How it presented.** `test_live_symmetry` asserted `detail == rollup` on a dict keyed by raw `(po, style, colour, size)`. It failed about once in ten runs, reporting **twelve quantity disagreements**. Every quantity was identical. Both documents totalled 1,669 in all ten runs, 25 keys each. The entire difference was `NEW INDIGO` versus `NEW  INDIGO` — a dict comparison renders one respelled colour as six missing keys and six extra ones, and the failure output looks exactly like a numeric catastrophe (§7 has the whitespace mechanism).
+
+**Nine passing runs made it look like noise**, which is the dangerous part. A flake that fires 1-in-10 gets re-run rather than read; the second run is green and everyone moves on. It was on a direct path to §8 lesson 12 — a check that fails on a healthy system gets ignored, and then gets trusted on the day it matters. The only reason it was caught is that ten deliberate runs were cheaper than the uncertainty.
+
+**The fix is to key on what production keys on**, and it is *stricter*, not looser: `po_number_key` for the PO and `canonical` for style, colour, size and recap label — the key in `extraction_schema.aggregate_lines`. The raw renderings stay under test **separately**, as a set that must all collapse to the expected canonical forms, so a genuine colour change, truncation or dropped word still fails while whitespace does not. Same split the PO number already used for the same reason: its printed form varies between runs (`1624` / `PO0001624`) while its identity does not.
+
+**Deliberately not `matcher._size_key`.** That resolves `SIZE_ALIASES` first, which is a vendor-to-NetSuite mapping rather than an identity function — an extractor emitting `XXL` where the sheet prints `2XL` would key alike and pass. An extraction test mirrors the extraction side of the pipeline; a matcher test mirrors the matcher's. **Pick the layer you are testing and use that layer's identity, not the most forgiving one available.**
+
+**The latent exposure is the real lesson.** Three other fixtures were keyed the same way and escaped only by accident: Legendz's and footwear's colours (`DFK`, `MLT`, `PAT`, `WHT`) are single tokens with no internal gap, and Tainan's `NEW INDIGO` arrives from `.xls` **cell values**, which never pass through the PDF layout renderer. Not one of them was safe by design. Any future PDF vendor with a two-word colour walks straight into it — so all four were converted, including the three that could not currently fail.
+
+The general question, worth asking of any equality assertion: **what does the system consider these two things to be?** If the answer is "the same", and the test says otherwise, the test is wrong even while it is red.
 
 ## 9. How to recover when something breaks
 

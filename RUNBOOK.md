@@ -468,6 +468,23 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
     Note what this does **not** cover: the test targets an internal id directly, so it passes on a role with no collection access at all. That is why a five-permission role would pass here and still fail on every real vendor document — see §6 item 2 and the `400 USER_ERROR` signature in the setup doc.
 
 
+28. **NEW 2026-09-14 — the first live extraction found four defects, and not one was visible in its output.** Kept in full because the shape repeats: every one produced a plausible result, and all four were found only by instrumenting the run rather than by reading `proposed_changes`.
+
+    | # | Defect | What it looked like |
+    |---|---|---|
+    | 1 | the content-addressed store passed a SHA-256 as the filename, so every filename rule in `attachment_classifier` silently stopped working | nothing — one warning string naming a hash |
+    | 2 | `doc_type` was computed and discarded; `_upsert_attachment` wrote it only on INSERT and the poller inserts first | seven attachments `UNCLASSIFIED` after a run that excluded three of them |
+    | 3 | a usable packing list that is not parsed had its lines dropped with only prose to say so | a warning naming two SHA-256s |
+    | 4 | no usable NetSuite client, so nothing resolved | *"resolved to a NetSuite line: 0 of 25"* — reads as a matching failure |
+
+    **Defect 1 is the one to remember, because the store was right and the wiring was wrong.** Content-addressing is correct: the filename IS the hash, which is what makes the store agree with the database by construction. But the classifier takes **two** inputs — a display name and a byte source — and they had been the same object for so long that nothing noticed when they stopped being. The inspection-report ban, the payment-request rule, the rollup preference and the Inprotex trap were all inert against stored attachments. **A signal does not announce its own absence.**
+
+    **Defect 4's root cause was one line further down**, and it is why the zero was believable: `NetSuiteClient` takes `account_id` first and `config` third, so `NetSuiteClient(cfg)` binds a `NetSuiteConfig` to `account_id` and yields a **mock client with no data**. It now raises. A constructor that accepts the wrong thing in the right position is a defect generator, not a convenience.
+
+    **What the run got right, and it is worth recording as the control:** `SYMMETRY_EXPECTED` reproduced **exactly** — 25 keys, 1,669 units, zero differences against committed ground truth. Both inspection reports and the payment request were excluded on **content**, with **zero** extractor calls, verified by counting invocations rather than by observing absence — which is the only way to tell *"excluded before the call"* from *"called, returned nothing"*, and for a document carrying real bank details that difference is the whole point.
+
+    **The backfill cost five cents.** Re-classification is 2 calls over previews; re-extraction would have been dollars. Separating the two stages is what made fixing defect 2 cheap.
+
 ## 7. Design constraints discovered by testing
 
 These are not open questions — they are settled constraints that later phases must respect. Each was found by measurement, not design review.

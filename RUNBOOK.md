@@ -977,6 +977,53 @@ It is not a stricter test or a looser one. **It is an assertion about a system t
 
 The general question, worth asking of any equality assertion: **what does the system consider these two things to be?** If the answer is "the same", and the test says otherwise, the test is wrong even while it is red.
 
+### 18. A check that cannot fail is worse than no check, and this project has now produced three kinds
+
+**No check withholds confidence. A check that cannot fail manufactures it.** That is the whole difference, and it is why this keeps earning entries: the failure mode is not a gap in coverage, it is a green light attached to nothing. Three instances now, each a different way of arriving there:
+
+| | The check | Why it could not do its job |
+|---|---|---|
+| §8 lesson 12 | the auth probe's `roles` claim | **Red on a healthy system.** Graph tokens are opaque to the client, so the claim is absent by design; the verdict could never be clean |
+| §8 lesson 17 | the live tests' raw-string keys | **Measuring something production does not.** It compared byte-for-byte where the pipeline compares canonical forms, so it disagreed in both directions |
+| **this one** | the whole pytest suite | **No failing path at all.** `check()` records and never raises, `main()` reads the results, and under pytest `main()` never runs — so 1,179 assertions could not fail a run |
+
+**The third is the purest form.** `pytest -q` reported `87 passed` for weeks. What it actually established was that 93 functions ran without raising an exception. Every individual assertion — 687 in the parsing suite alone — was recorded to a list that nothing then inspected. The number was not wrong; it was answering a question nobody was asking.
+
+**And it had just been wired into a Stop hook**, so it ran automatically after every session and gated the work. A gate that cannot fail is the most expensive kind of nothing: it costs a test run every time, it is believed, and it reports success in the one circumstance where you most need to hear otherwise.
+
+**All three were written in good faith by someone competent.** None is a careless mistake, and that is the point — each is a reasonable-looking check whose *failing path* was never exercised. Inspecting a token claim, comparing two dicts, running a test suite: all three read as obviously sound.
+
+> **The test that catches the family: for any automated check, ask what would have to be true for this to fail — then make it happen and confirm it does.**
+
+Not "is this check correct" — all three were, in the sense their authors meant. The question is narrower and answerable: *name the input that turns this red, and produce it.* A check whose failing input you cannot name is not yet a check. One whose failing input you can name but have never run is a hypothesis.
+
+Applied here, it took four lines of throwaway code: a module recording two deliberately-false checks, run under pytest. It reported `1 passed`. That settled it in under a minute, after weeks of the suite reporting green.
+
+**And the fix has to be verified the same way, because a gate can be mis-wired as easily as it can be missing.** The first version of the enforcing fixture failed in teardown, which pytest reports as `4 passed, 1 error` — non-zero exit, but the failing test still counted in the `passed` tally. Re-introducing a misleading green while removing one. Judging at the end of the call phase instead gives an honest `1 failed`. **Then confirm the gate is attached to what you think it is**: an instrumented run showed it inspecting 1,179 checks across all five modules rather than silently skipping them, which is the difference between "nothing broke" and "nothing was looked at".
+
+**What the enforcement must NOT do**, both rejected here for reasons that generalise:
+
+- **Make `check()` raise.** That destroys the property that makes these scripts worth running — they collect *every* failure and report them together. Seeing fifty failures at once is the feature; stopping at the first is a downgrade dressed as rigour.
+- **Add an assertion to the end of each test function.** Ninety-three chances to forget, and the ninety-fourth test written next month would not have one. **A gate you have to remember to attach is a gate that is eventually not attached.** An autouse fixture covers tests that do not exist yet, which is the only version that stays true.
+
+**Postscript, found by the fix.** With the gate attached, `test_schema` inspected **105** distinct checks where the script reported **115**: `test_colour_provenance_columns` was listed twice in the script's own registration tuple, so it ran twice and its ten checks were counted twice. **Fixed 2026-09-14** — the duplicate registration is gone and every suite now asserts its own registration list holds no duplicates. Any "115/115" earlier in this RUNBOOK is inflated by ten; the schema suite is **106** (105 distinct plus the new guard). See §8 lesson 19 for what the divergence itself taught.
+
+### 19. Two runners over one codebase disagreed, and the disagreement was the finding
+
+The scripts said `test_schema` ran **115** checks. Pytest, once its gate worked, counted **105**. **Neither was wrong about itself.** The script faithfully reported what it ran; pytest faithfully reported what it collected. The gap was the answer: `test_colour_provenance_columns` appeared twice in the script's registration tuple, so it ran twice and its ten checks were counted twice, while pytest collects each function once.
+
+Nothing failed. Both runs were green, both numbers were internally consistent, and the suite was correct throughout — the only casualty was a figure being quoted in briefs and commit messages. It surfaced **only** because two independent views of the same code were put side by side and the totals did not match.
+
+**A second implementation is a cross-check you get for free.** Not a second test — a second *execution model* over the tests already written. It shares none of the first's assumptions about what to run, so anything it disagrees about is either a bug in one of them or a fact neither was stating clearly. Here it was the third thing: a true statement about a duplicated registration that no single runner had any reason to mention.
+
+**Chase a divergence even when both sides look healthy**, and especially then. A disagreement between two green runs has no error message, no stack trace and no urgency — which is exactly why it gets rationalised. *"Different runners count differently"* is the plausible dismissal available in this case, and it happens to be true in general and false here; the only way to know which is to find the ten.
+
+The cheap version of this is worth doing deliberately: when two things should agree — a script and a test runner, a total and the sum of its parts, a document's own printed subtotal and the figures above it — **compare them and look at any difference, rather than only at whether each is internally sound.** The Tainan `ACT`/`REV` sheets were caught the same way (§6 item 20), as were the footwear totals (§6 item 25). Three findings from the same move.
+
+Guarded now rather than left to vigilance: every suite asserts its own registration list contains no duplicate entries, and the guard was verified by injecting a duplicate into a throwaway copy and watching the run go red — per §8 lesson 18, a check whose failing path has never been exercised is not yet a check.
+
+**The two runners now agree on 1,179 per-test checks** — 687 parsing / 166 ingest / 151 client / 105 schema / 70 config, identical on both sides. The scripts report **1,184** because the five registration guards live in each `main()`, which pytest never runs. That difference is real, intended and explained here rather than left to be rediscovered: **a divergence you have accounted for is documentation; an unaccounted one is a finding waiting to happen**, and the two are indistinguishable to whoever meets them next.
+
 ## 9. How to recover when something breaks
 
 | Symptom | Likely cause | What to do |

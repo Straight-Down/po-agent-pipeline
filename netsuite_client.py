@@ -643,6 +643,7 @@ class NetSuiteClient:
         self,
         account_id: Optional[str] = None,
         mock_data: Optional[dict] = None,
+        *,
         config: Optional[NetSuiteConfig] = None,
     ):
         # `config` is the THIRD parameter, so `NetSuiteClient(cfg)` binds a

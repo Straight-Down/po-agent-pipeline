@@ -806,6 +806,20 @@ def test_classifier_sees_vendor_filenames_not_hashes(tmp: Path) -> None:
           "so the inspection-report ban fires from the NAME again",
           str(item.filename_hint))
 
+    # AND THE LABEL THE MODEL SEES. This is the half the first fix missed: the
+    # filename rules were repaired while the content call still labelled each
+    # attachment with `path.name`, so the one call allowed to weigh a filename
+    # was shown a SHA-256. It flipped Symmetry's rollup from PACKING_LIST to
+    # SHIPPING_ADVICE -- excluding it from packing-list duty AND from the rollup
+    # preference, which can only rank documents that were selected.
+    source = (HERE / "attachment_classifier.py").read_text(encoding="utf-8")
+    call = source[source.index("def _classify_by_content"):] if         "def _classify_by_content" in source else source
+    block = call[call.index("attachment(s) to classify"):
+                 call.index("attachment(s) to classify") + 1200]
+    check("item.display_name" in block and "item.path.name" not in block,
+          "the content call labels attachments by display_name, never by path.name",
+          "path.name absent" if "item.path.name" not in block else "STILL USES path.name")
+
     # The end-to-end shape: what extract_pending hands over.
     engine = fresh_db()
     poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)

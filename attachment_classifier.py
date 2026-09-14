@@ -830,14 +830,20 @@ def _apply_content_verdicts(
         {
             "type": "text",
             "text": f"{len(usable)} attachment(s) to classify, in order:\n"
-            + "\n".join(f"  {i}. {item.path.name}" for i, (item, _) in enumerate(usable, 1)),
+            # The LABEL the model sees. `display_name`, not `path.name`: once
+            # attachments are stored content-addressed the path is a SHA-256, and
+            # labelling the evidence with a hash strips the filename out of the
+            # one call that is allowed to weigh it. Not cosmetic -- it flipped
+            # Symmetry's rollup from PACKING_LIST to SHIPPING_ADVICE, which
+            # excluded it from packing-list duty and from the rollup preference.
+            + "\n".join(f"  {i}. {item.display_name}" for i, (item, _) in enumerate(usable, 1)),
         }
     ]
     for i, (item, text) in enumerate(usable, 1):
         content.append(
             {
                 "type": "text",
-                "text": f"\n===== ATTACHMENT {i}: {item.path.name} =====\n{text}",
+                "text": f"\n===== ATTACHMENT {i}: {item.display_name} =====\n{text}",
             }
         )
 

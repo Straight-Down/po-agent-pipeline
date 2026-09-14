@@ -914,6 +914,37 @@ Two corollaries, both learned the same day:
 
 The unpushed window is the whole of the cheap-fix opportunity, so **audit before pushing, not after**. Rewriting seven local commits took minutes; the same content on a shared remote is a coordination problem plus a disclosure question.
 
+### 15. Provenance stays true; a prediction goes stale
+
+A sweep for outdated cross-references found ~35 mentions of "Phase N" across the tracked Python. **Five needed changing. The other ~30 were correct and had to be left alone.** The distinction is not how old the line is or how confident it sounds — it is what kind of claim it makes:
+
+- **Provenance** — *which phase built this, and why it exists.* `"Persist a parsed shipment into the database (Phase 2, item 4)"`; `"There is no Graph client yet (Phase 2 item 2)"`; `"For Phase 1 this is the specific finding we're hunting"`. These stay true as the project moves, because they describe a fact about the past that later work does not alter. They are also the useful ones: they tell a reader *why* a thing is shaped as it is.
+- **Prediction** — *what happens next.* `"Next: Prompt 2 in Claude-Code-Kickoff-Prompts.md (the parsing layer)"` — printed on every pass of the write-back test, pointing at a parsing layer built a month earlier. `"Resolve with your NetSuite admin before Phase 2; do not widen the role unilaterally"` — advice for a problem solved in August, which would send a reader to re-derive a known answer. `"has not been run against a single real vendor document"` — false since the day it was written into a green run.
+
+**A prediction has an expiry date it does not carry.** Nothing in the line says when it stops being true, and nothing fails when it does — the write-back test kept passing while printing a stale next step, and the parsing suite printed its false warning on a green run for weeks.
+
+**This is what makes the sweep possible without being mechanical.** A blanket find-and-replace on "Phase" would have touched all 35 and damaged the 30 that were right; reading all 35 closely is affordable exactly once. The grammatical tell does the filtering: *past tense about why this exists* → keep; *imperative or future tense about what to do next* → check it, and delete it if the thing it points at has happened. A line that names a phase as the **reason for a decision** is documentation. A line that names a phase as a **destination** is a to-do that nobody scheduled.
+
+Corollary, and the reason this is a lesson rather than a tidy-up: **the stale ones concentrate in output**, not in comments. Banners, closing lines, and "next step" hints are written once at the end of a task, when the next step is vividly in mind and least likely to stay true. Comments explaining a design decision get re-read whenever the code is touched; a print statement at the bottom of a passing test is read by nobody who is in a position to notice it is wrong. Same shape as §8 lesson 12 — a check that cannot pass on a healthy system — and the two were found in the same sweep.
+
+### 16. Ask of every sandbox-derived fact: if production disagreed, would anything say so?
+
+Three facts in this pipeline were learned from sandbox, baked into matching, and are re-checked nowhere at runtime:
+
+| Fact | Learned from | Where it decides something |
+|---|---|---|
+| tranId is `'PO' + zfill(7)` | 1,659 sandbox POs, 100% conforming | every PO-number-to-internal-id lookup |
+| Colour resolves via `custitem_psgss_product_color_desc` | 2,390 of 2,393 sandbox items populated | every colour match |
+| The size vocabulary | `netsuite_size_list.json`, 46 sandbox values, one day in September | what counts as a size header at all, and whether a composed `30-32` is accepted |
+
+**All three fail the same way, and it is the worst available way: silently, as a non-match rather than an error.** That is not a coincidence — it follows from where they sit. Each is an input to *matching*, and matching's failure mode is producing **fewer rows**, never raising. A size absent from the vocabulary is indistinguishable from a cell that was never a size. A colour that does not resolve looks exactly like a line the vendor did not ship. Nothing in the output says "I could not read this"; the tool simply proposes less and reports success.
+
+**The test is one question: *if production disagreed with this, would anything say so?*** If the answer is no, the fact belongs on the Phase 4 re-verification list. It is deliberately not "is this fact likely to be wrong" — likelihood is exactly what nobody can assess about an account they have not read, and the colour list has already been shown to differ between the two accounts in **both** directions.
+
+**Recognising the fourth is the point of naming the shape.** Three separate warnings read as three pieces of trivia; one named shape is something a reader can apply to a fact discovered next month. The pipeline learns something new about this account's data every time a vendor arrives, and each new thing learned from sandbox joins this list by default until someone checks it against production.
+
+Related: this is the same failure geometry as §8 lesson 12, approached from the other end. There, a check was red on a healthy system and so got ignored. Here, the system is green while silently doing less work. **Both are cases where the absence of an error was read as evidence, and in neither case was it.**
+
 ## 9. How to recover when something breaks
 
 | Symptom | Likely cause | What to do |

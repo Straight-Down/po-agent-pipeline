@@ -72,8 +72,15 @@ logger = logging.getLogger(__name__)
 #: of missing a shipment is neither.
 POLL_OVERLAP = dt.timedelta(minutes=5)
 
-#: Where the first poll starts when no watermark exists. Not "now": a first run
-#: against a mailbox with history should read it, not skip it.
+#: Where a poll starts when no watermark exists AND no explicit `since` is given.
+#:
+#: Effectively "the whole mailbox". That is the right library default -- a first
+#: run against a mailbox with history should read it rather than silently skip
+#: everything older than today -- but it is a poor thing to discover by running
+#: it. **The CLI therefore refuses a cold start without an explicit choice**: see
+#: `main`, which requires `--since` or `--from-beginning` when no watermark
+#: exists. The refusal is only on the first run; every later poll has a watermark
+#: and needs no flag.
 EPOCH = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
 
 #: Bytes live outside the OneDrive-synced project folder, beside the keys.
@@ -125,6 +132,11 @@ class MessageOutcome:
 
     graph_message_id: str
     received_at: dt.datetime
+    #: Envelope detail, populated for every outcome so a dry run can show what
+    #: WOULD be stored without fetching a single byte.
+    subject: str = ""
+    from_address: str = ""
+    attachment_preview: list = field(default_factory=list)
     stored: bool = False
     skipped_existing: bool = False
     attachments_new: int = 0
@@ -142,6 +154,11 @@ class PollReport:
     watermark_before: Optional[dt.datetime] = None
     watermark_after: Optional[dt.datetime] = None
     watermark_advanced: bool = False
+    dry_run: bool = False
+    #: True when `max_messages` cut the batch short. Distinct from "that was all
+    #: there was" -- without it, a capped run and an empty mailbox look alike.
+    truncated: bool = False
+    available: int = 0
     outcomes: list = field(default_factory=list)
 
     @property
@@ -161,8 +178,14 @@ class PollReport:
         return [o for o in self.outcomes if o.error]
 
     def summary(self) -> str:
+        if self.dry_run:
+            atts = sum(len(o.attachment_preview) for o in self.outcomes)
+            return (f"DRY RUN: {self.seen} message(s) would be considered, "
+                    f"{atts} attachment(s), NOTHING stored, watermark untouched "
+                    f"at {self.watermark_before}")
+        cut = f" (capped at {self.seen} of {self.available})" if self.truncated else ""
         return (f"{self.seen} seen, {self.stored} stored, {self.skipped} already had, "
-                f"{len(self.failed)} failed | watermark "
+                f"{len(self.failed)} failed{cut} | watermark "
                 f"{'->' if self.watermark_advanced else 'held at'} {self.watermark_after}")
 
 
@@ -195,6 +218,9 @@ def poll_once(
     *,
     overlap: dt.timedelta = POLL_OVERLAP,
     now: Optional[dt.datetime] = None,
+    since: Optional[dt.datetime] = None,
+    max_messages: Optional[int] = None,
+    dry_run: bool = False,
 ) -> PollReport:
     """
     One pass. Reads from the watermark minus the overlap, stores, then advances.
@@ -202,23 +228,88 @@ def poll_once(
     Every message is handled in its OWN transaction, so one bad message cannot
     roll back the ones that worked, and its failure is recorded against its own
     row rather than raised.
+
+    `since` OVERRIDES the computed window entirely, watermark included -- it is
+    how a first run is made small and chosen, and how an operator re-reads a
+    known period. Overriding is safe because dedup makes a re-read free; that is
+    the same property the overlap relies on.
+
+    `max_messages` caps ONE run. The list arrives oldest-first, so a cap takes
+    the oldest N and the watermark advances only across them; the next run
+    continues from there. A capped run is flagged `truncated` in the report,
+    because "I stopped early" and "that was everything" must not look alike.
+
+    `dry_run` reads and reports and writes NOTHING -- no rows, no bytes, no
+    watermark. It fetches attachment METADATA only, never content, so it is
+    cheap in exactly the way the auth probe is cheap: find out what is true
+    before acting on it.
     """
     store = store or BlobStore()
     now = now or _utcnow()
-    report = PollReport(mailbox=mailbox, client_kind=getattr(client, "kind", "?"))
+    report = PollReport(mailbox=mailbox, client_kind=getattr(client, "kind", "?"),
+                        dry_run=dry_run)
 
     watermark = read_watermark(engine, mailbox)
     report.watermark_before = watermark
-    window_from = (_aware(watermark) - overlap) if watermark else EPOCH
+    if since is not None:
+        window_from = _aware(since)
+    elif watermark is not None:
+        window_from = _aware(watermark) - overlap
+    else:
+        window_from = EPOCH
     report.window_from = window_from
 
-    for envelope in client.list_messages(window_from):
+    envelopes = list(client.list_messages(window_from))
+    report.available = len(envelopes)
+    if max_messages is not None and len(envelopes) > max_messages:
+        envelopes = envelopes[:max_messages]
+        report.truncated = True
+
+    for envelope in envelopes:
+        if dry_run:
+            report.outcomes.append(_preview_message(client, envelope))
+            continue
         outcome = _handle_message(engine, client, store, mailbox, envelope, now)
         report.outcomes.append(outcome)
+
+    if dry_run:
+        # Nothing is written, and that INCLUDES `last_polled_at`. A dry run must
+        # not be able to masquerade as a poll in the monitoring signal.
+        report.watermark_after = watermark
+        logger.info("poll: %s", report.summary())
+        return report
 
     _advance_watermark(engine, mailbox, report, now)
     logger.info("poll: %s", report.summary())
     return report
+
+
+def _preview_message(client: gc.GraphClient, envelope: dict) -> MessageOutcome:
+    """
+    What WOULD be stored, from metadata alone.
+
+    `list_attachments` returns name, contentType and size without transferring
+    content, so a preview of a hundred messages costs a hundred metadata calls
+    and zero bytes of attachment traffic. A failure here is recorded like any
+    other -- a dry run that raised on one bad message would be useless for
+    exactly the mailbox you most want to look at before touching.
+    """
+    sender = (envelope.get("from") or {}).get("emailAddress") or {}
+    outcome = MessageOutcome(
+        graph_message_id=str(envelope.get("id") or ""),
+        received_at=_naive(gc._parse_graph_time(envelope["receivedDateTime"])),
+        subject=(envelope.get("subject") or "")[:200],
+        from_address=(sender.get("address") or ""),
+    )
+    try:
+        outcome.attachment_preview = [
+            {"name": str(a.get("name") or ""), "size": int(a.get("size") or 0),
+             "content_type": str(a.get("contentType") or "")}
+            for a in client.list_attachments(outcome.graph_message_id)
+        ]
+    except Exception as exc:  # noqa: BLE001
+        outcome.error = f"{type(exc).__name__}: {exc}"[:1000]
+    return outcome
 
 
 def _handle_message(engine, client, store, mailbox, envelope, now) -> MessageOutcome:
@@ -418,6 +509,42 @@ def _touch_poll_state(engine, mailbox, watermark, now, seen) -> None:
             })
 
 
+def parse_since(value: str) -> dt.datetime:
+    """`--since` as a date or an ISO timestamp, always interpreted as UTC."""
+    text = value.strip().replace("Z", "+00:00")
+    parsed = dt.datetime.fromisoformat(text)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def _print_preview(report: PollReport) -> None:
+    """The cheap look: what is there, from metadata only."""
+    print()
+    print("=" * 78)
+    print(f"DRY RUN -- {report.mailbox} [{report.client_kind}]")
+    print("=" * 78)
+    print(f"  window from : {report.window_from}")
+    print(f"  watermark   : {report.watermark_before} (UNCHANGED)")
+    if report.truncated:
+        print(f"  capped      : showing {report.seen} of {report.available} available")
+    print()
+    total_bytes = 0
+    for outcome in report.outcomes:
+        print(f"  {outcome.received_at}  {outcome.from_address or '(no sender)'}")
+        print(f"      {outcome.subject or '(no subject)'}")
+        if outcome.error:
+            print(f"      !! {outcome.error}")
+        for att in outcome.attachment_preview:
+            total_bytes += att["size"]
+            print(f"      - {att['name'][:64]:66} {att['size']:>9,} B  {att['content_type']}")
+        if not outcome.attachment_preview and not outcome.error:
+            print("      (no attachments)")
+    attachment_count = sum(len(o.attachment_preview) for o in report.outcomes)
+    print()
+    print(f"  {report.seen} message(s), {attachment_count} attachment(s), "
+          f"{total_bytes:,} bytes would be fetched")
+    print("  NOTHING was stored and the watermark was not advanced.")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Poll once. Extraction is a SEPARATE command -- see extract_pending.py."""
     import argparse
@@ -428,19 +555,63 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--db", default="sqlite:///po_agent.db")
     ap.add_argument("--store", default=None, help="attachment store root")
-    ap.add_argument("--overlap-minutes", type=int, default=int(POLL_OVERLAP.total_seconds() // 60))
+    ap.add_argument("--overlap-minutes", type=int,
+                    default=int(POLL_OVERLAP.total_seconds() // 60))
+    ap.add_argument("--since", type=parse_since, default=None,
+                    help="start here instead of the watermark: a date (2026-09-01) "
+                         "or an ISO timestamp. Overrides the watermark; safe, because "
+                         "re-reading is deduped.")
+    ap.add_argument("--from-beginning", action="store_true",
+                    help="cold start over the ENTIRE mailbox history. Required "
+                         "explicitly, so a first run is never an accident.")
+    ap.add_argument("--max-messages", type=int, default=None,
+                    help="process at most N messages this run, oldest first. The "
+                         "next run continues from where this one stopped.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="list what WOULD be stored and store nothing. Fetches "
+                         "attachment metadata only, never content.")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     cfg = config_module.GraphConfig.from_env()
     client = gc.build_graph_client(cfg)
+    mailbox = cfg.mailbox or "mock@local"
+    engine = create_engine(args.db)
+
+    # THE COLD START IS A CHOICE, NOT A DEFAULT.
+    #
+    # With no watermark and no `--since`, the window opens at EPOCH and the run
+    # pulls the entire mailbox. That is the correct library behaviour -- skipping
+    # history silently would be worse -- but it is a poor thing to find out by
+    # doing it, and this mailbox is being seeded with forwarded historical slips.
+    # So the first run has to say which it wants. Every later run has a watermark
+    # and needs no flag.
+    if (read_watermark(engine, mailbox) is None
+            and args.since is None and not args.from_beginning):
+        print("No watermark for this mailbox: this would be a COLD START and would "
+              "read the entire mailbox history.")
+        print("Choose one, deliberately:")
+        print("  --since 2026-09-01     start from a date you pick")
+        print("  --from-beginning       read everything")
+        print("  --dry-run              see what is there first, storing nothing")
+        print("\nAdd --max-messages N to cap the first run whichever you choose.")
+        return 2
+
     report = poll_once(
-        create_engine(args.db), client, cfg.mailbox or "mock@local",
-        BlobStore(args.store), overlap=dt.timedelta(minutes=args.overlap_minutes),
+        engine, client, mailbox, BlobStore(args.store),
+        overlap=dt.timedelta(minutes=args.overlap_minutes),
+        since=args.since, max_messages=args.max_messages, dry_run=args.dry_run,
     )
+
+    if args.dry_run:
+        _print_preview(report)
+        return 0
+
     print(f"[{report.client_kind}] {report.summary()}")
     for outcome in report.failed:
         print(f"  FAILED {outcome.graph_message_id}: {outcome.error}")
+    if report.truncated:
+        print(f"  {report.available - report.seen} message(s) left for the next run.")
     print("\nNothing has been extracted. Run extract_pending.py to parse what landed.")
     return 1 if report.failed else 0
 

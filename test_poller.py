@@ -598,6 +598,176 @@ def test_retry_after(tmp: Path) -> None:
           f"{session.calls} calls, then: {raised[:40]}")
 
 
+class _CountingClient(gc.MockGraphClient):
+    """Counts calls, so a dry run can be PROVEN not to fetch content."""
+
+    def __init__(self):
+        super().__init__()
+        self.listed = 0
+        self.fetched = 0
+
+    def list_attachments(self, message_id):
+        self.listed += 1
+        return super().list_attachments(message_id)
+
+    def get_attachment(self, message_id, attachment_id):
+        self.fetched += 1
+        return super().get_attachment(message_id, attachment_id)
+
+
+class _ExplodingListClient(gc.MockGraphClient):
+    """Fails list_attachments for one message."""
+
+    def __init__(self, bad_message_id: str) -> None:
+        super().__init__()
+        self.bad = bad_message_id
+
+    def list_attachments(self, message_id):
+        if message_id == self.bad:
+            raise gc.GraphError("simulated: cannot list attachments")
+        return super().list_attachments(message_id)
+
+
+def test_cold_start_is_a_choice(tmp: Path) -> None:
+    section("cold start: the first poll is chosen, not whatever is in there")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    client = gc.MockGraphClient()
+
+    check(poller.read_watermark(engine, MAILBOX) is None,
+          "a fresh database has no watermark")
+
+    # The LIBRARY default is still the whole mailbox: skipping history silently
+    # would be the worse error. The CLI is what refuses to do it unasked.
+    everything = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+    check(everything.window_from == poller.EPOCH,
+          "with no watermark and no since, the window opens at EPOCH",
+          str(everything.window_from))
+    check(everything.seen == 7, "which is the entire mailbox", str(everything.seen))
+
+    # `since` overrides, and that is how a first run is made small and chosen.
+    engine2 = fresh_db()
+    since = dt.datetime(2026, 8, 5, tzinfo=dt.timezone.utc)
+    picked = poller.poll_once(engine2, client, MAILBOX, poller.BlobStore(tmp / "b2"),
+                              now=NOW, since=since)
+    check(picked.window_from == since, "since sets the window exactly",
+          str(picked.window_from))
+    check(picked.seen == 3 and picked.stored == 3,
+          "and only messages at or after it are considered", f"seen={picked.seen}")
+    check(all(o.received_at >= since.replace(tzinfo=None) for o in picked.outcomes),
+          "nothing older leaks in")
+
+    # `since` also overrides an EXISTING watermark, which is how an operator
+    # re-reads a known period. Safe, because re-reading is deduped.
+    back = poller.poll_once(engine2, client, MAILBOX, poller.BlobStore(tmp / "b2"),
+                            now=NOW, since=poller.EPOCH)
+    check(back.window_from == poller.EPOCH,
+          "since wins over the watermark, not the other way round")
+    check(back.stored == 4 and back.skipped == 3,
+          "so older messages are picked up and known ones skipped",
+          f"stored={back.stored} skipped={back.skipped}")
+
+
+def test_max_messages_caps_one_run(tmp: Path) -> None:
+    section("max_messages: a ceiling for one run, and the rest next time")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    client = gc.MockGraphClient()
+
+    first = poller.poll_once(engine, client, MAILBOX, store, now=NOW, max_messages=3)
+    check(first.seen == 3 and first.stored == 3, "exactly three processed", str(first.seen))
+    check(first.truncated and first.available == 7,
+          "the run is FLAGGED truncated -- a cap and an empty mailbox must not look alike",
+          f"truncated={first.truncated} available={first.available}")
+
+    order = [o.received_at for o in first.outcomes]
+    check(order == sorted(order), "oldest first, so the cap takes the oldest three")
+    check(first.watermark_after == max(order),
+          "the watermark advances only across what was processed",
+          str(first.watermark_after))
+
+    # THE CAP AND THE OVERLAP INTERACT, and the test says how rather than
+    # asserting a number that hides it. The cap counts messages CONSIDERED, not
+    # messages stored; the next window opens at the watermark minus the overlap,
+    # so it re-reads its own boundary message and stores one fewer than the cap.
+    # That is the overlap doing its job -- a capped run that skipped its boundary
+    # would have exactly the same gap a bare `>` produces.
+    second = poller.poll_once(engine, client, MAILBOX, store, now=NOW, max_messages=3)
+    check(second.seen == 3, "the next run considers three again", str(second.seen))
+    check(second.stored == 2 and second.skipped == 1,
+          "storing two, because the overlap re-read the boundary message",
+          f"stored={second.stored} skipped={second.skipped}")
+    check(second.outcomes[0].received_at == first.watermark_after,
+          "and the re-read one is exactly the message the watermark landed on",
+          str(second.outcomes[0].received_at))
+
+    third = poller.poll_once(engine, client, MAILBOX, store, now=NOW, max_messages=3)
+    check(not third.truncated, "and the final run is not truncated")
+    check(counts(engine)["messages"] == 7,
+          "three capped runs land the same seven messages as one uncapped run",
+          str(counts(engine)))
+
+
+def test_dry_run_touches_nothing(tmp: Path) -> None:
+    section("dry run: the cheap look before any bytes move")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    client = _CountingClient()
+
+    report = poller.poll_once(engine, client, MAILBOX, store, now=NOW, dry_run=True)
+    check(report.dry_run, "the report says it was a dry run")
+    check(report.seen == 7, "it reports every message it would consider", str(report.seen))
+
+    check(counts(engine) == {"messages": 0, "attachments": 0, "links": 0},
+          "NOTHING was written to the database", str(counts(engine)))
+    check(not (tmp / "blobs").exists() or not list((tmp / "blobs").rglob("*")),
+          "no bytes were written to the store")
+    check(poller.read_watermark(engine, MAILBOX) is None,
+          "and the watermark was NOT created -- a dry run cannot masquerade as a poll")
+
+    check(client.fetched == 0,
+          "get_attachment was never called: metadata only", str(client.fetched))
+    check(client.listed == 7, "list_attachments was, once per message", str(client.listed))
+
+    preview = {o.graph_message_id: o for o in report.outcomes}
+    inprotex = preview["msg-inprotex-001"]
+    check(inprotex.from_address == "shipping@inprotex.example",
+          "the preview carries the sender", inprotex.from_address)
+    check("PO#1662" in inprotex.subject, "and the subject", inprotex.subject[:40])
+    check(len(inprotex.attachment_preview) == 2, "and every attachment")
+    check(all(a["size"] > 0 for a in inprotex.attachment_preview),
+          "with real sizes, so the transfer cost is known before paying it",
+          str([a["size"] for a in inprotex.attachment_preview]))
+    check(all(a["content_type"] for a in inprotex.attachment_preview),
+          "and content types")
+    check(preview["msg-symmetry-004"].attachment_preview == [],
+          "a message with no attachments previews as empty, not as an error")
+
+    # A dry run must survive a broken message: the mailbox you most want to look
+    # at before touching is the one you already suspect.
+    bad = poller.poll_once(fresh_db(), _ExplodingListClient("msg-tainan-005"), MAILBOX,
+                           store, now=NOW, dry_run=True)
+    check(bad.seen == 7 and len(bad.failed) == 1,
+          "one unreadable message is reported, the rest still listed",
+          f"seen={bad.seen} failed={len(bad.failed)}")
+
+    real = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+    check(real.stored == 7, "a real poll afterwards stores everything the dry run showed",
+          str(real.stored))
+
+
+def test_parse_since(tmp: Path) -> None:
+    section("since accepts a date or a timestamp, always UTC")
+    check(poller.parse_since("2026-09-01")
+          == dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc),
+          "a bare date is midnight UTC")
+    check(poller.parse_since("2026-09-01T12:30:00Z")
+          == dt.datetime(2026, 9, 1, 12, 30, tzinfo=dt.timezone.utc),
+          "a Z-suffixed timestamp parses")
+    check(poller.parse_since("2026-09-01T12:30:00+00:00").tzinfo is not None,
+          "and an explicit offset stays aware")
+    naive = poller.parse_since("2026-09-01T12:30:00")
+    check(naive.tzinfo == dt.timezone.utc,
+          "a naive value is INTERPRETED as UTC, not as local time -- local would "
+          "shift the window by the machine's offset", str(naive))
+
 def main() -> int:
     print("=" * 78)
     print("MAILBOX INTAKE TESTS -- poller, blob store, extraction seam")
@@ -614,6 +784,10 @@ def main() -> int:
         test_watermark_overlap,
         test_mid_batch_failure_holds_the_watermark,
         test_extraction_seam,
+        test_cold_start_is_a_choice,
+        test_max_messages_caps_one_run,
+        test_dry_run_touches_nothing,
+        test_parse_since,
         test_graph_surface_is_read_only,
         test_client_selection,
         test_retry_after,

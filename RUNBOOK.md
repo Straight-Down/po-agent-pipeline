@@ -1047,4 +1047,9 @@ Guarded now rather than left to vigilance: every suite asserts its own registrat
 
 ## 11. What's left to build
 
-See `PO-Update-Automation-Build-Plan.md` for full phase detail. Short version: Phase 1 (NetSuite proof-of-concept) is done. The parsing/matching layer under Phase 1's extended scope is done and validated against 3 real vendors. Phase 2 (email intake, database, Azure infrastructure) has not started. Phase 3 (review/approval UI, write-back wiring) has not started. Phase 4 (production cutover, monitoring) has not started.
+See `PO-Update-Automation-Build-Plan.md` for full phase detail. **Corrected 2026-09-14** — this section had said Phase 2 had not started, which stopped being true on 2026-08-26.
+
+- **Phase 1 — done**, and the write-back test re-run under the current seven-permission role (§6 item 27). The parsing/matching layer is validated live against **five** real vendors.
+- **Phase 2 — done against the mock.** Schema and migrations, `ingest.py`, and now the mailbox intake job: a four-method Graph interface with a mock and a real client, a content-addressed attachment store, watermark with overlap, per-message failure isolation, and a separate extraction driver. `GRAPH_CLIENT` is still `mock`; pointing it at the live mailbox is the next step and should be watched, not scheduled.
+- **Phase 3 — not started.** No review UI exists. Its requirements are unusually complete but scattered across three documents; §7 and the build plan's Phase 3 carry them.
+- **Phase 4 — not started.** Three production re-verification items (tranId, colour resolution, the size vocabulary) share one shape: §8 lesson 16. Phase 3 (review/approval UI, write-back wiring) has not started. Phase 4 (production cutover, monitoring) has not started.

@@ -62,6 +62,7 @@ from typing import Any, Optional
 
 import claude_extractor as ce
 import document_parsers as dp
+from canonical import canonical
 from extraction_schema import (
     ExtractedLine,
     PackingSlipExtraction,
@@ -1641,7 +1642,7 @@ def test_size_composition(tmp: Path) -> None:
         missing = [s for s in composed if s not in vocabulary]
         check(not missing,
               f"every waist paired with INS {inseam} is a real size in the account",
-              f"missing: {missing}" if missing else f"all 7 present")
+              f"missing: {missing}" if missing else "all 7 present")
     # 16 pairs in the account (waists 30-44 x inseams 32/34); PO 1725 uses 14 of
     # them, having no 44. So the list is a superset, which is the right shape --
     # the constraint checks membership, it does not expect an exact match.
@@ -2026,7 +2027,7 @@ def test_canonical_form(tmp: Path) -> None:
         ("non-breaking space", "NEW INDIGO", "NEW INDIGO"),
         ("narrow no-break space", "NEW INDIGO", "NEW INDIGO"),
         ("ideographic space", "TID　BLK", "TID BLK"),
-        ("zero-width space", "NEW​INDIGO", "NEW INDIGO"),
+        ("zero-width space", "NEW\u200bINDIGO", "NEW INDIGO"),
         ("full-width comma", "PO#1657，M630018", "PO#1657,M630018"),
         ("full-width digits+letter", "２Ｘ", "2X"),
         ("full-width alpha", "ＢＬＫ", "BLK"),
@@ -3576,12 +3577,15 @@ def test_live_legendz(tmp: Path) -> None:
     result = dp.parse_packing_slip(LEGENDZ_XLSX)
     check(result.parser == "claude-assisted", "routed to the Claude extractor", result.parser)
 
-    got = {
-        (l["po_number"], l["style_number"], l["color"], l["size"]): l["quantity"] for l in result.lines
-    }
-    check(len(result.lines) == len(LEGENDZ_EXPECTED), f"{len(LEGENDZ_EXPECTED)} lines", str(len(result.lines)))
-    check(got == LEGENDZ_EXPECTED, "every PO/style/colour/size/quantity correct",
-          f"wrong: { {k: (got.get(k), v) for k, v in LEGENDZ_EXPECTED.items() if got.get(k) != v} or 'none' }")
+    # Keyed canonically like every other live test -- these colour codes are
+    # single tokens and cannot pick up the renderer's doubled space, but keying
+    # them raw here would leave the same category error in place for the next
+    # vendor whose colour has a space in it.
+    got = _live_keys(result.lines)
+    leg_exp = _canon_expected(LEGENDZ_EXPECTED)
+    check(len(result.lines) == len(leg_exp), f"{len(leg_exp)} lines", str(len(result.lines)))
+    check(got == leg_exp, "every PO/style/colour/size/quantity correct",
+          f"wrong: { {k: (got.get(k), v) for k, v in leg_exp.items() if got.get(k) != v} or 'none' }")
 
     # The subtotal trap: rows 11/14/18 and the grand total must not become lines.
     total = sum(got.values())
@@ -3591,12 +3595,19 @@ def test_live_legendz(tmp: Path) -> None:
         "no line carries a printed subtotal or grand-total figure",
     )
     check(
-        all(k[0] == "1657" for k in got) and {k[1] for k in got} == {"M630018", "M680009"},
+        all(k[0] == "1657" for k in got) and {k[1] for k in got} == {canonical("M630018"), canonical("M680009")},
         "PO/style split correctly on the full-width comma in 'PO#1657，M630018'",
         str({k[1] for k in got}),
     )
-    check({k[2] for k in got} == {"DFK", "MLT", "DKF"}, "colour codes verbatim, incl. the DFK/DKF pair", str({k[2] for k in got}))
-    check("2XL" in {k[3] for k in got}, "2XL kept verbatim, not converted")
+    check({k[2] for k in got} == {canonical(c) for c in ("DFK", "MLT", "DKF")},
+          "colour codes distinct, incl. the DFK/DKF pair", str({k[2] for k in got}))
+    # Verbatim, from the raw lines -- the key is canonical, so the "kept as
+    # printed, not converted to NetSuite's 2X" claim has to be read off the
+    # source text rather than off the key.
+    check("2XL" in {str(l["size"]) for l in result.lines},
+          "2XL kept verbatim, not converted -- matcher.SIZE_ALIASES owns that")
+    check({canonical(l["color"]) for l in result.lines} == {canonical(c) for c in ("DFK", "MLT", "DKF")},
+          "and the three colour codes survive as three distinct values")
 
     ship, _ = dp.parse_shipping_info_from_documents([LEGENDZ_XLSX])
     check(ship.get("etd") == "2026/8/5", "ETD from the free-text cell", str(ship.get("etd")))
@@ -3605,11 +3616,43 @@ def test_live_legendz(tmp: Path) -> None:
 
 
 def _aggregate(lines: list[dict]) -> dict:
+    """Thin wrapper kept for the Symmetry test; see `_live_keys` for the key."""
+    return _live_keys(lines)
+
+
+def _canon_expected(expected: dict) -> dict:
+    """
+    Put a hand-written expectations dict through the SAME key function as
+    `_live_keys`, so the two are comparable.
+
+    The literals stay in document form -- `("1725", "50144", "NEW INDIGO",
+    "30-32")` -- because they are hand-derived truth and have to stay legible
+    against the source workbook. Canonicalising them here rather than writing
+    them canonicalised keeps that readability without letting the comparison
+    drift from the pipeline's notion of identity.
+    """
+    from netsuite_client import po_number_key
     out: dict[tuple, int] = {}
-    for ln in lines:
-        key = (ln["po_number"], ln["style_number"], ln["color"], ln["size"])
-        out[key] = out.get(key, 0) + ln["quantity"]
+    for key, qty in expected.items():
+        ck = (po_number_key(key[0]),) + tuple(canonical(part) for part in key[1:])
+        out[ck] = out.get(ck, 0) + qty
     return out
+
+
+def _spelling_report(lines: list[dict], field: str) -> dict:
+    """
+    {canonical form: sorted list of the verbatim spellings seen for it}.
+
+    The companion to keying on `canonical`: the key stops whitespace and case
+    from splitting one value into two, and this keeps the raw renderings under
+    test so a GENUINE change -- a different colour, a truncation, a dropped
+    word -- still shows up. Same split as the PO number, which keys on
+    `po_number_key` while its printed forms are asserted separately.
+    """
+    out: dict[str, set] = {}
+    for ln in lines:
+        out.setdefault(canonical(ln.get(field)), set()).add(str(ln.get(field) or ""))
+    return {k: sorted(v) for k, v in sorted(out.items())}
 
 
 def test_live_symmetry(tmp: Path) -> None:
@@ -3626,19 +3669,23 @@ def test_live_symmetry(tmp: Path) -> None:
     covering = dp.parse_packing_slip(SYMMETRY_COVERING)
     cov = _aggregate(covering.lines)
     check(covering.parser == "claude-assisted", "PDF packing list routed to the Claude path", covering.parser)
-    check(len(cov) == len(SYMMETRY_EXPECTED), f"{len(SYMMETRY_EXPECTED)} size-level keys", str(len(cov)))
-    check(cov == SYMMETRY_EXPECTED, "every PO/style/colour/size/quantity correct",
-          f"wrong: { {k: (cov.get(k), v) for k, v in SYMMETRY_EXPECTED.items() if cov.get(k) != v} or 'none' }")
+    sym_exp = _canon_expected(SYMMETRY_EXPECTED)
+    check(len(cov) == len(sym_exp), f"{len(sym_exp)} size-level keys", str(len(cov)))
+    check(cov == sym_exp, "every PO/style/colour/size/quantity correct",
+          f"wrong: { {k: (cov.get(k), v) for k, v in sym_exp.items() if cov.get(k) != v} or 'none' }")
     check(sum(cov.values()) == SYMMETRY_GRAND_TOTAL, "sum equals the printed G.TOTAL", str(sum(cov.values())))
 
     # Sparse size columns — the alignment trap on this document.
-    check(("1720", "M650022", "NEW INDIGO", "XS") not in cov, "M650022 correctly has NO XS")
-    check(cov.get(("1720", "M650022", "NEW INDIGO", "S")) == 22, "its first figure is S=22, not XS=22")
+    def ck(po: str, style: str, colour: str, size: str) -> tuple:
+        return _canon_expected({(po, style, colour, size): 0}).popitem()[0]
+
+    check(ck("1720", "M650022", "NEW INDIGO", "XS") not in cov, "M650022 correctly has NO XS")
+    check(cov.get(ck("1720", "M650022", "NEW INDIGO", "S")) == 22, "its first figure is S=22, not XS=22")
     check(
-        all(("1721", "W520005", "COCONUT", s) not in cov for s in ("XL", "2XL", "3XL")),
+        all(ck("1721", "W520005", "COCONUT", s) not in cov for s in ("XL", "2XL", "3XL")),
         "W520005 COCONUT correctly stops at L",
     )
-    check(cov.get(("1720", "M650022", "NEW INDIGO", "3XL")) == 4, "3XL=4 read from the last column")
+    check(cov.get(ck("1720", "M650022", "NEW INDIGO", "3XL")) == 4, "3XL=4 read from the last column")
 
     # CROSS-CHECK: the carton-by-carton file must agree with the rollup. It spans
     # two pages with headers only on page 1, which is why all pages go in one call.
@@ -3646,15 +3693,32 @@ def test_live_symmetry(tmp: Path) -> None:
     det = _aggregate(detail.lines)
     check(det == cov, "carton detail agrees exactly with the rollup",
           f"diffs: { {k: (cov.get(k), det.get(k)) for k in set(cov) | set(det) if cov.get(k) != det.get(k)} or 'none' }")
+
+    # The raw spellings, kept under test separately now that the KEY is
+    # canonical. `NEW  INDIGO` (two spaces) is an accepted rendering of this
+    # document -- the layout renderer widens the one space the PDF prints,
+    # because the x-gap between two words of one cell maps to two character
+    # columns (RUNBOOK section 7). What must NOT happen is a spelling that
+    # canonicalises to something ELSE: a different colour, a truncation, a
+    # dropped word. That is what this asserts, and a whitespace variant does
+    # not trip it.
+    spellings = _spelling_report(covering.lines + detail.lines, "color")
+    check(set(spellings) == {"new indigo", "coconut", "black"},
+          "three colours, whatever whitespace each run chose", str(sorted(spellings)))
+    check(all(canonical(v) == k for k, vs in spellings.items() for v in vs),
+          "every observed spelling collapses to its own canonical form", str(spellings))
+    variants = {k: v for k, v in spellings.items() if len(v) > 1}
+    if variants:
+        print(f"    note: benign whitespace/case variants this run -- {variants}")
     check(sum(det.values()) == SYMMETRY_GRAND_TOTAL, "detail also sums to the G.TOTAL", str(sum(det.values())))
 
     # Sanity only. Inspection reports are NOT a data source (Paula's ruling); this
     # just confirms the packing lists are internally consistent with numbers we
     # independently validated earlier.
-    insp = {
+    insp = _canon_expected({
         ("1721", "W600001", "BLACK", s): q
         for s, q in (("XS", 19), ("S", 71), ("M", 110), ("L", 82), ("XL", 39))
-    }
+    })
     check(all(cov.get(k) == v for k, v in insp.items()),
           "W600001 BLACK consistent with previously validated figures (sanity check only)")
     print(f"    tokens: covering={covering.usage} detail={detail.usage}")
@@ -3746,19 +3810,43 @@ def _pin_prompt_version() -> bool:
 
 def _live_keys(lines: list[dict], with_label: bool = False) -> dict:
     """
-    Extraction lines as {(po_key, style, colour, size[, recap_label]): quantity}.
+    Extraction lines keyed the way THE PIPELINE keys them, not byte-for-byte.
 
-    The PO goes through `po_number_key` because its RENDERING varies between runs
-    while its identity does not -- see the note on the ground-truth constants.
-    Everything else is verbatim.
+    {(po_key, style, colour, size[, recap_label]): quantity}, where every key
+    component goes through the same function production uses:
+    `netsuite_client.po_number_key` for the PO and `canonical.canonical` for the
+    rest -- exactly the key in `extraction_schema.aggregate_lines`.
+
+    **This is stricter about identity, not looser.** Comparing raw strings here
+    was measuring a different system that happens to share code: two rows whose
+    colour differs only by internal whitespace ARE the same line everywhere
+    downstream -- `aggregate_lines` merges them, the matcher keys on
+    `canonical(color)`, and `proposed_changes.key_color` stores the canonical
+    form with the verbatim text alongside in `src_color_text`. A test that split
+    them reported a difference nothing in the system could act on.
+
+    It cost a 1-in-10 flake to learn: `render_pdf_page_layout` places each word
+    at a character column from its x-position, so the one space the Symmetry PDF
+    prints between `NEW` and `INDIGO` renders as two. The model resolves that one
+    way per document, self-consistently, and both readings are defensible. The
+    failure surfaced as twelve apparent quantity disagreements -- every figure
+    identical, both totals 1,669 -- because a dict comparison shows one respelled
+    colour as six missing keys and six extra ones. RUNBOOK section 7 and section
+    8 lesson 17.
+
+    NOT `matcher._size_key`, deliberately: that resolves SIZE_ALIASES first,
+    which is a vendor-to-NetSuite mapping and would mask a real extraction
+    regression -- an extractor emitting `XXL` where the sheet prints `2XL` would
+    key alike and pass. This is an extraction test, so it mirrors the extraction
+    side of the pipeline.
     """
     from netsuite_client import po_number_key
     out: dict[tuple, int] = {}
     for ln in lines:
-        key = (po_number_key(ln["po_number"]), str(ln["style_number"]),
-               str(ln["color"]), str(ln["size"]))
+        key = (po_number_key(ln["po_number"]), canonical(ln["style_number"]),
+               canonical(ln["color"]), canonical(ln["size"]))
         if with_label:
-            key = key + (str(ln.get("recap_label") or ""),)
+            key = key + (canonical(ln.get("recap_label")),)
         out[key] = out.get(key, 0) + int(ln["quantity"])
     return out
 
@@ -3785,7 +3873,7 @@ def test_live_tainan(tmp: Path) -> None:
     check(result.parser == "claude-assisted", "routed to the Claude extractor", result.parser)
 
     got = _live_keys(result.lines)
-    expected = {**TAINAN_ACT_EXPECTED, **TAINAN_REV_EXPECTED}
+    expected = _canon_expected({**TAINAN_ACT_EXPECTED, **TAINAN_REV_EXPECTED})
 
     # LINE LEVEL FIRST. Totals are cross-footed at the end and only as a
     # cross-foot: two compensating errors sum correctly, and on this document
@@ -3801,7 +3889,7 @@ def test_live_tainan(tmp: Path) -> None:
     sizes = {k[3] for k in got}
     check(all(re.fullmatch(r"\d{2}-\d{2}", s) for s in sizes),
           "every size is a composed waist-inseam pair", str(sorted(sizes))[:70])
-    unknown = sizes - sv.size_labels()
+    unknown = sizes - sv.size_labels_canon()
     check(not unknown,
           "and every one is a REAL value in customlist_psgss_product_size",
           str(sorted(unknown) or "all present"))
@@ -3862,6 +3950,16 @@ def test_live_tainan(tmp: Path) -> None:
     check(sum(TAINAN_ACT_EXPECTED.values()) == 865, "ACT cross-foots to its printed ACT 865")
     check(sum(TAINAN_REV_EXPECTED.values()) == 860, "REV cross-foots to its printed ACT 860")
 
+    # Raw spellings under test separately from the canonical key. Tainan reads
+    # from .xls CELLS rather than the PDF layout renderer, so it has never shown
+    # the doubled-space variant -- but `NEW INDIGO` is exactly the shape that
+    # would, and asserting the set here means a real colour change still fails.
+    spellings = _spelling_report(result.lines, "color")
+    check(set(spellings) == {"new indigo", "silver"},
+          "two colours, whatever whitespace each run chose", str(sorted(spellings)))
+    check(all(canonical(v) == k for k, vs in spellings.items() for v in vs),
+          "every observed spelling collapses to its own canonical form", str(spellings))
+
     # Free text: presence and shape only -- see the note on the constants.
     check(all(isinstance(ln.get("note", ""), str) for ln in result.lines),
           "every line carries a note field; its WORDING is deliberately not asserted")
@@ -3885,8 +3983,9 @@ def test_live_footwear(tmp: Path) -> None:
 
     got = _live_keys(result.lines, with_label=True)
     check(len(got) == 44, "44 lines -- one per size PER RECAP ROW", str(len(got)))
-    wrong = {k: (got.get(k), v) for k, v in FOOTWEAR_EXPECTED.items() if got.get(k) != v}
-    extra = {k: v for k, v in got.items() if k not in FOOTWEAR_EXPECTED}
+    fw_exp = _canon_expected(FOOTWEAR_EXPECTED)
+    wrong = {k: (got.get(k), v) for k, v in fw_exp.items() if got.get(k) != v}
+    extra = {k: v for k, v in got.items() if k not in fw_exp}
     check(not wrong and not extra,
           "every one of the 44 (PO, style, colour, size, recap label) -> quantity exact",
           f"wrong={wrong or 'none'} extra={extra or 'none'}")
@@ -3894,10 +3993,9 @@ def test_live_footwear(tmp: Path) -> None:
     by_label: dict[str, int] = {}
     for key, qty in got.items():
         by_label[key[4]] = by_label.get(key[4], 0) + qty
-    check(by_label.get("By Sea") == 1440, "labelled By Sea sums to 1,440",
-          str(by_label.get("By Sea")))
-    check(by_label.get("By UPS") == 60, "labelled By UPS sums to 60",
-          str(by_label.get("By UPS")))
+    SEA, UPS = canonical("By Sea"), canonical("By UPS")
+    check(by_label.get(SEA) == 1440, "labelled By Sea sums to 1,440", str(by_label.get(SEA)))
+    check(by_label.get(UPS) == 60, "labelled By UPS sums to 60", str(by_label.get(UPS)))
 
     # ---- THE 600 STAYS UNLABELLED -------------------------------------------
     # Sheet 20140 prints no transport mode. Attributing its 600 units to one is
@@ -3914,9 +4012,9 @@ def test_live_footwear(tmp: Path) -> None:
     check(all(k[1] == "20140" for k in got if k[4] == ""),
           "and every unlabelled line comes from 20140",
           str(sorted({k[1] for k in got if k[4] == ""})))
-    check(set(by_label) == {"By Sea", "By UPS", ""},
+    check(set(by_label) == {SEA, UPS, ""},
           "exactly three recap labels exist, the third being empty", str(sorted(by_label)))
-    check(by_label.get("By Sea", 0) + by_label.get("", 0) == 2040,
+    check(by_label.get(SEA, 0) + by_label.get("", 0) == 2040,
           "1,440 + 600 = 2,040, the grand total at 20140!T40 -- which is exactly "
           "why 2,040 is NOT the By Sea figure")
 
@@ -3935,7 +4033,7 @@ def test_live_footwear(tmp: Path) -> None:
           "12 keys carry exactly one -> 12 unambiguous singles", str(len(singles)))
     check(len(contested) * 2 + len(singles) == 44,
           "32 grouped + 12 single = 44, reconciling against the line count")
-    check(all(labels_per_key[k] == {"By Sea", "By UPS"} for k in contested),
+    check(all(labels_per_key[k] == {SEA, UPS} for k in contested),
           "a contested key is always a Sea/UPS pair, never one involving the "
           "unlabelled row")
 
@@ -3946,6 +4044,16 @@ def test_live_footwear(tmp: Path) -> None:
           "every printed PO rendering collapses to the one grouping key 1624 -- "
           "this workbook has produced both '1624' and 'PO0001624' across runs",
           str(sorted(printed)))
+    # Raw spellings, as above. These four are single tokens with no internal
+    # gap, so they cannot pick up the renderer's doubled space -- and that is
+    # luck, not design, which is why the assertion is here rather than assumed.
+    spellings = _spelling_report(result.lines, "color")
+    check(set(spellings) == {"pat", "dkf", "mlt", "wht"},
+          "four colour codes, whatever whitespace each run chose", str(sorted(spellings)))
+    labels = _spelling_report(result.lines, "recap_label")
+    check(set(labels) == {"by sea", "by ups", ""},
+          "and three recap labels, the third empty", str(sorted(labels)))
+
     check(sum(FOOTWEAR_EXPECTED.values()) == 2100, "44 lines cross-foot to 2,100 units")
     print(f"    tokens: {result.usage}")
 

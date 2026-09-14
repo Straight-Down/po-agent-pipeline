@@ -485,6 +485,35 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
     **The backfill cost five cents.** Re-classification is 2 calls over previews; re-extraction would have been dollars. Separating the two stages is what made fixing defect 2 cheap.
 
+29. **NEW 2026-09-14 — the first clean end-to-end run against the live mailbox, with numbers.** Recorded in full because it is the first time every stage ran in sequence on real mail, and because two of its figures answer questions that had been open on assumption.
+
+    **7 messages in → 4 shipments.** Two were duplicate forwards of one Symmetry notice (21:41 and 21:43) and were **short-circuited on `shipments.primary_attachment_sha` before any model call** — `INGEST_SKIPPED_DUPLICATE` in `audit_log`, both pointing at the rollup's hash. One message carried no attachments and retired from the queue. The re-forward dedup was previously proven only in a test; this is it firing on real mail and saving two full extractions.
+
+    | | |
+    |---|---|
+    | Messages polled | 7, zero `poll_error` |
+    | Attachments | 30 joins over **18 distinct contents** — 12 deduped by hash |
+    | Bytes fetched / stored | 10.1 MB / 4.9 MB |
+    | Shipments | 4 |
+    | `proposed_changes` | **118** |
+    | `PENDING_REVIEW` with a NetSuite line id | **10** |
+    | `NEEDS_ATTENTION` | 108 |
+    | `NEEDS_RESOLUTION` / `NEEDS_ASSIGNMENT` | 0 / 0 |
+    | Resolved to a real NetSuite line | **53 of 118** |
+    | Cost | **$14.45** (849K in / 408K out) |
+
+    **PO resolution ran end to end for the first time and got 5 of 5:** `1720`→`PO0001720`, `1721`→`PO0001721`, `511`→`PO0000511`, `533`→`PO0000533`, and **`0001725`→`PO0001725`** — a zero-padded printed form, which is `po_tranid` doing the work it was built for (§6 item 9).
+
+    **Both documents with committed ground truth reproduced EXACTLY:** Symmetry 25 keys / 1,669 units against `SYMMETRY_EXPECTED`, Tainan ACT 28 keys / 865 units against `TAINAN_ACT_EXPECTED`. Zero differences.
+
+    **The 108 `NEEDS_ATTENTION` are not matching failures**, which matters because the raw number reads like one: ~40 matched a PO line that is **closed** (`isClosed` ≠ `not isOpen`, §6), 28 are Tainan's **REV** sheet whose style `50144-2` is not on PO 1725 — the ACT/REV design working as intended — and ~24 are `extraction confidence medium`, the signal §7 already records as inert for triage.
+
+    **The rollup preference fired**, for the first time since the store was introduced: `SD Actual Packing Covering` became PRIMARY rather than the carton detail. It could not before, because the classifier was being handed a SHA-256 as the filename (§8 lesson 20).
+
+    **MULTI-VENDOR-PER-EMAIL WAS AN ARTEFACT OF THE TEST DATA, and the design question is therefore still deferred rather than demonstrated.** The one message mixing Inprotex, Legendz and Symmetry is `2026-09-14 20:31:08`, subject **"Shipment updates"** — the seeded test message, the only one with no `Fw:` prefix and the only one present before Paula's historical forwards arrived. **Paula's five real forwards each carry exactly one vendor**: Symmetry (twice, the duplicates), CMG footwear, the PL0730 vendor, Tainan. One shipment per email is what real vendor mail looks like, which is what `ingest_shipment` already assumes.
+
+    The cost of that artefact was real, though: three cross-checks were parsed in full and none of their lines proposed — Inprotex's 77 (free, deterministic parser), the Symmetry detail's 25 (a genuine corroboration, agreed exactly), and Legendz's 8 (paid and discarded). **110 lines extracted and thrown away against 118 kept**, almost all of it caused by the seeded email rather than by the design.
+
 ## 7. Design constraints discovered by testing
 
 These are not open questions — they are settled constraints that later phases must respect. Each was found by measurement, not design review.
@@ -670,6 +699,24 @@ Same class of mistake as §8 lessons 11 and 12 (a confirmation is only as good a
 **The renderer was deliberately NOT changed, and the reason is that the gap IS the signal.** Collapsing runs of spaces would require distinguishing an intra-cell gap from an inter-cell one, and the renderer does no column detection — it has no notion of where a cell starts or ends, only where words are. A blanket collapse would flatten the column structure this function exists to preserve, misfiring across every vendor to solve a problem one vendor has and the pipeline already handles. Same shape as the rule in §8 lesson 12 about proxies: fix the thing that actually decides identity, not the thing that happens to be easy to edit.
 
 **What this cost, and where it surfaced:** only the *tests*, which keyed on raw strings — see §8 lesson 17. The pipeline was never affected.
+
+### Cross-check disagreement only means something between documents describing the SAME shipment
+
+Nothing enforces that precondition, and the live run of 2026-09-14 logged this against a shipment built from Symmetry's rollup:
+
+```
+cross-check against Invoice_Packing.xlsx        : DISAGREES on 102 key(s)
+cross-check against Legendz PL0801- 26ctns.xlsx : DISAGREES on 33 key(s)
+cross-check against SD Actual Packing ...pdf    : agrees exactly (25 keys)
+```
+
+**Every one of those statements is true and only the third is meaningful.** Inprotex's packing list and Legendz's are different vendors, different POs, different shipments — they were in the same email, which is the only thing they had in common. Of course they disagree on every key; they describe different goods. The comparison is arithmetically sound and semantically empty.
+
+`_compare_line_sets` takes two line sets and reports key-by-key differences. It has no notion of whether the two documents are about the same consignment, and **the count scales with how UNRELATED they are** — 102 differing keys is not a big conflict, it is two documents with almost nothing in common. The signal is inverted from how it reads.
+
+**Before treating a disagreement as a conflict, check the two documents share a PO.** A cross-check between documents covering the same PO and style set is real evidence — Symmetry's rollup and its carton detail agreeing exactly on 25 keys is precisely the corroboration the mechanism exists for, and it is worth having. Between unrelated documents it is noise wearing the costume of a finding, and a large number makes it look like an important one.
+
+Not fixed here, deliberately: the shape that produced it — several vendors' documents in one email — was an artefact of a seeded test message, and Paula's real forwards each carry one vendor (§6 item 29). Constraining the comparison is worth doing when multi-shipment emails are designed for, not before. **Recorded now so nobody reads `DISAGREES on 102 key(s)` as a conflict in the meantime.**
 
 ### Migrations freeze their data as literals and import no application code
 
@@ -1063,6 +1110,31 @@ It was caught only by asking a question the outputs could not answer: *does this
 **A fresh instance, found the same week.** `--from-beginning` satisfied the poller's cold-start guard and never set the window, so with a watermark present it read from the watermark and the flag did nothing. It hid a message on a live dry run and reported six where there were seven. Same shape: a control that is believed, does nothing under a condition nobody enumerated, and has no failing path to observe. The check that now guards it is one line — with a watermark present, `--from-beginning` must choose the same window as `--since <epoch>` — and it was verified by reverting the fix and watching it go red (§8 lesson 18).
 
 Related: §8 lesson 12 (a check that cannot pass), §8 lesson 18 (a check that cannot fail). This is the third face — **a fix whose completeness cannot be observed**. All three are cases where the absence of a signal was read as the absence of a problem.
+
+### 21. Estimate extraction cost from expected OUTPUT, not from file size
+
+Twice, and ~2x low both times in the same direction:
+
+| Estimate | Basis | Actual |
+|---|---|---|
+| $1–2 for ten `--live` Symmetry runs | input size | **$3.71** |
+| $4–8 for the first full live extraction | input size | **$14.45** |
+
+Same direction twice is a bias, not noise.
+
+**Why file size predicts almost nothing here.** The work is output-dominated: the run that cost $14.45 billed 849K input and **408K output**, and output bills at 5x input, so output was 60% of the money on a third of the tokens. Worse, the input figure is not the documents — the six parsed documents render to about **24,000 characters** in total, against 849K input tokens billed. The overwhelming majority of billed input is the **prompt and system blocks re-sent on every call**. A document's size barely moves it.
+
+**What does predict it:** lines expected out, and number of model calls. Tainan emits 56 lines from a 7,528-character workbook; the Symmetry rollup emits 25 from 1,722. A cross-check is a whole extra call. An email with four packing lists is four extractions whether the files are 10 KB or 1 MB.
+
+> **The check: multiply expected lines by a measured cost-per-line from a comparable past run, times the number of model calls. Never scale from bytes.**
+
+**This is the same error as classifying on the filename rather than the content** (§7, and the defect that hid in `b83a6fd`): reaching for the property that is easy to see instead of the one that determines the answer. A filename is visible and a document's type is not; a file size is visible and its token cost is not. In both cases the visible proxy is *correlated enough to feel reasonable* and wrong exactly when it matters.
+
+**And the lesson was unmeasurable when first written, which is the §18 shape.** Nothing recorded per-document cost: `ParseResult.usage` was computed and discarded by `ingest`, so "which document cost the most of the $14.45" could only be reconstructed from character counts — a guess dressed as an answer. A lesson about estimating badly, with no way to check the next estimate against reality, is a lesson that cannot fail.
+
+So it is paired with the fix. Migration 0006 adds `shipments.extractor_input_tokens` / `extractor_output_tokens` and `shipment_sources.input_tokens` / `output_tokens`, written where the parse happens. **NULL means unrecorded, zero means measured and free** — the deterministic Inprotex parser genuinely spends nothing, and collapsing those two would repeat the mistake `UNCLASSIFIED` exists to avoid (§6 item 28).
+
+A second defect surfaced while wiring it, and it explains why the number was never recoverable: **`ClaudeExtractor.last_usage` is a misnomer — it ACCUMULATES for the life of the instance and is never reset.** Both call sites copied it wholesale into `ParseResult.usage`, so a document parsed late in a run reported the running total of everything before it. The figure was not merely unstored; where it was stored it was wrong. Now a delta across the parse boundary (`document_parsers.usage_delta`).
 
 ## 9. How to recover when something breaks
 

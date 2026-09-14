@@ -586,6 +586,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # doing it, and this mailbox is being seeded with forwarded historical slips.
     # So the first run has to say which it wants. Every later run has a watermark
     # and needs no flag.
+    # `--from-beginning` SETS THE WINDOW. It used to only satisfy the guard
+    # below, so with a watermark present it read from the watermark and the flag
+    # was a silent no-op -- it hid a message on a live dry run. A flag that does
+    # nothing under some conditions is worse than one that does not exist,
+    # because it is believed (RUNBOOK section 8 lesson 20).
+    #
+    # `--since` wins if both are given: it is the more specific instruction, and
+    # refusing the combination would fail a command whose intent is unambiguous.
+    if args.from_beginning and args.since is None:
+        args.since = EPOCH
+
     if (read_watermark(engine, mailbox) is None
             and args.since is None and not args.from_beginning):
         print("No watermark for this mailbox: this would be a COLD START and would "

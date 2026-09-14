@@ -992,6 +992,225 @@ def test_dropped_documents_are_rows_not_prose(tmp: Path) -> None:
               if s.role != "PRIMARY"),
           "only the PRIMARY document's lines are proposed, and the rows say so")
 
+def _cli_window(engine, store, argv, monkey_client):
+    """Run poller.main with a stubbed poll_once and capture the window it chose."""
+    seen = {}
+    original = poller.poll_once
+
+    def spy(engine_, client, mailbox, store_, **kw):
+        seen.update(kw)
+        seen["mailbox"] = mailbox
+        return original(engine_, client, mailbox, store_, **kw)
+
+    import config as config_module
+    orig_from_env = config_module.GraphConfig.from_env
+    orig_build = gc.build_graph_client
+    try:
+        poller.poll_once = spy
+        config_module.GraphConfig.from_env = staticmethod(
+            lambda *a, **k: SimpleNamespace(is_mock=True, client_kind="mock",
+                                            mailbox=MAILBOX))
+        gc.build_graph_client = lambda cfg=None: monkey_client
+        import sqlalchemy
+        real_create = sqlalchemy.create_engine
+        sqlalchemy.create_engine = lambda *a, **k: engine
+        try:
+            poller.main(argv + ["--store", str(store.root)])
+        finally:
+            sqlalchemy.create_engine = real_create
+    finally:
+        poller.poll_once = original
+        config_module.GraphConfig.from_env = orig_from_env
+        gc.build_graph_client = orig_build
+    return seen
+
+
+def test_from_beginning_sets_the_window(tmp: Path) -> None:
+    section("--from-beginning SETS the window; it used to only satisfy the guard")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    client = gc.MockGraphClient()
+
+    # Establish a watermark, which is the condition under which the flag broke.
+    poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+    mark = poller.read_watermark(engine, MAILBOX)
+    check(mark is not None, "a watermark exists", str(mark))
+
+    beginning = _cli_window(engine, store, ["--dry-run", "--from-beginning"], client)
+    explicit = _cli_window(engine, store, ["--dry-run", "--since", "2000-01-01"], client)
+
+    # THE CHECK THAT WOULD HAVE CAUGHT IT. With a watermark present the two must
+    # agree; before the fix `--from-beginning` left `since=None` and the window
+    # came from the watermark, so it silently read a narrower range and hid a
+    # message on a live dry run.
+    check(beginning["since"] == explicit["since"] == poller.EPOCH,
+          "--from-beginning and --since <epoch> choose the SAME window",
+          f"{beginning['since']} vs {explicit['since']}")
+    check(beginning["since"] is not None,
+          "and it is not None -- None is what made it fall back to the watermark")
+    check(poller._aware(mark) > beginning["since"],
+          "the window really is older than the watermark it would otherwise use",
+          f"{beginning['since']} < {mark}")
+
+    # --since wins when both are given: the more specific instruction.
+    both = _cli_window(engine, store,
+                       ["--dry-run", "--from-beginning", "--since", "2026-08-05"], client)
+    check(both["since"] == dt.datetime(2026, 8, 5, tzinfo=dt.timezone.utc),
+          "--since wins over --from-beginning rather than the command failing",
+          str(both["since"]))
+
+
+def test_since_overrides_on_every_path(tmp: Path) -> None:
+    section("--since overrides, watermark or not")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    client = gc.MockGraphClient()
+    since = dt.datetime(2026, 8, 5, tzinfo=dt.timezone.utc)
+
+    cold = poller.poll_once(engine, client, MAILBOX, store, now=NOW, since=since)
+    check(cold.window_from == since, "with NO watermark, since sets the window",
+          str(cold.window_from))
+
+    warm = poller.poll_once(engine, client, MAILBOX, store, now=NOW, since=since)
+    check(warm.window_from == since,
+          "with a watermark, since STILL sets the window -- it is not a floor",
+          str(warm.window_from))
+
+    back = poller.poll_once(engine, client, MAILBOX, store, now=NOW, since=poller.EPOCH)
+    check(back.window_from == poller.EPOCH,
+          "and it can reach back BEHIND the watermark, which is the point")
+    check(back.seen > warm.seen,
+          "seeing strictly more than the watermark window would",
+          f"{back.seen} > {warm.seen}")
+
+
+def test_max_messages_cannot_drag_the_watermark_backwards(tmp: Path) -> None:
+    section("--max-messages with an explicit window: the interaction, stated")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    client = gc.MockGraphClient()
+
+    poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+    ahead = poller.read_watermark(engine, MAILBOX)
+
+    # Re-read from the beginning, capped. The oldest three are re-processed, and
+    # the newest of THEM is far behind the current watermark.
+    capped = poller.poll_once(engine, client, MAILBOX, store, now=NOW,
+                              since=poller.EPOCH, max_messages=3)
+    check(capped.seen == 3 and capped.truncated, "three processed, flagged truncated",
+          f"seen={capped.seen} truncated={capped.truncated}")
+    after = poller.read_watermark(engine, MAILBOX)
+    check(after == ahead,
+          "the watermark did NOT move backwards to the capped batch's newest",
+          f"{ahead} -> {after}")
+    check(not capped.watermark_advanced, "and the report says it did not advance")
+
+    # THE CONSEQUENCE, asserted rather than left to be discovered: a capped
+    # backfill behind the watermark makes no forward progress. Capping is for
+    # sizing a FIRST run; re-reading history is `--since` without a cap.
+    second = poller.poll_once(engine, client, MAILBOX, store, now=NOW,
+                              since=poller.EPOCH, max_messages=3)
+    check([o.graph_message_id for o in second.outcomes]
+          == [o.graph_message_id for o in capped.outcomes],
+          "a repeat of the same capped command re-reads the SAME three, forever",
+          str(len(second.outcomes)))
+    check(second.stored == 0, "storing nothing, because dedup catches them")
+
+def test_reforward_does_not_create_a_second_shipment(tmp: Path) -> None:
+    section("three forwards of one shipment: does it cost 1x or 3x?")
+    from sqlalchemy import func as sa_func
+    from sqlalchemy import select as sa_select
+
+    import attachment_classifier as ac
+    import document_parsers as dp
+    import ingest as ing
+    from netsuite_client import NetSuiteClient
+    from schema import shipments
+
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+
+    # The mock's re-forward: msg-legendz-006 carries the SAME bytes as
+    # msg-legendz-002 under a different filename, which is how Paula forwards.
+    rows = {r["graph_message_id"]: r for r in ep.pending_messages(engine)}
+    first, forward = rows["msg-legendz-002"], rows["msg-legendz-006"]
+    check(len(first["paths"]) == 1 and len(forward["paths"]) == 1,
+          "both messages carry one attachment")
+    check(first["paths"][0] == forward["paths"][0],
+          "and it is the SAME stored file, because the store is content-addressed",
+          first["paths"][0].name[:20])
+
+    sha = ing.sha256_file(first["paths"][0])
+    check(sha == ing.sha256_file(forward["paths"][0]),
+          "identical bytes -- which is the CONDITION the dedup depends on", sha[:16])
+
+    # Canned classification and a counted parser, so this stays offline. The
+    # subject is the ORDER of operations in ingest_shipment, not the classifier.
+    verdict = ac.AttachmentClassification(
+        path=first["paths"][0], doc_type=ac.DocType.PACKING_LIST,
+        has_size_breakdown=True, reason="stub", method="stub",
+        display_name="Legendz PL0801- 26ctns.xlsx",
+    )
+    canned = ac.ClassificationResult(selected=[verdict])
+    parses = []
+    orig_classify = ac.classify_attachments
+    orig_parse = dp.parse_shipment_email
+    try:
+        ac.classify_attachments = lambda paths, **kw: canned
+        def counted(paths, **kw):
+            parses.append(list(paths))
+            raise AssertionError("parse_shipment_email must NOT run for a re-forward")
+        dp.parse_shipment_email = counted
+
+        with engine.begin() as conn:
+            # A VENDOR_EMAIL shipment needs its message_id: the schema's
+            # provenance constraint refuses a primary_attachment_sha without one.
+            conn.execute(shipments.insert(), {
+                "id": "ship-1", "origin": "VENDOR_EMAIL", "message_id": first["id"],
+                "primary_attachment_sha": sha, "parser": "stub",
+                "doc_needs_review": False, "needs_manual_entry": False,
+                "line_count": 0, "unit_total": 0, "created_by": "test",
+                "created_at": NOW,
+            })
+
+        report = ing.ingest_shipment(
+            engine, forward["paths"], client=NetSuiteClient(mock_data={"1657": []}),
+            display_names=forward["display_names"], now=NOW)
+    finally:
+        ac.classify_attachments = orig_classify
+        dp.parse_shipment_email = orig_parse
+
+    check(not parses,
+          "the forward NEVER reached the parser -- it costs 1x, not 2x", str(len(parses)))
+    check(not report.created and report.shipment_id == "ship-1",
+          "it resolved to the EXISTING shipment", str(report.shipment_id))
+    check("already ingested" in report.reason,
+          "and says so, naming the content", report.reason[:52])
+
+    with engine.connect() as conn:
+        n = conn.execute(sa_select(sa_func.count()).select_from(shipments)).scalar()
+    check(n == 1, "exactly ONE shipment exists for the two messages", str(n))
+
+    # THE CONDITION, asserted rather than assumed: the short-circuit keys on the
+    # PRIMARY document's content hash, and on nothing else. A forward whose bytes
+    # were re-encoded in transit hashes differently, finds no match, and becomes
+    # its OWN shipment and its own extraction -- so "three forwards cost 1x"
+    # holds only while the bytes are identical.
+    with engine.connect() as conn:
+        found = conn.execute(
+            sa_select(shipments.c.id)
+            .where(shipments.c.primary_attachment_sha == sha)
+            .where(shipments.c.superseded_by_shipment_id.is_(None))).scalar()
+        missed = conn.execute(
+            sa_select(shipments.c.id)
+            .where(shipments.c.primary_attachment_sha == "0" * 64)
+            .where(shipments.c.superseded_by_shipment_id.is_(None))).scalar()
+    check(found == "ship-1", "the identical hash finds the existing shipment", str(found))
+    check(missed is None,
+          "a different hash finds NOTHING -- so re-encoded bytes would re-ingest",
+          str(missed))
+    check(forward["display_names"] != first["display_names"],
+          "and the filenames DIFFER, proving the dedup is content, not name",
+          str(list(forward["display_names"].values()))[:46])
+
+
 def main() -> int:
     print("=" * 78)
     print("MAILBOX INTAKE TESTS -- poller, blob store, extraction seam")
@@ -1016,6 +1235,10 @@ def main() -> int:
         test_doc_type_is_written_where_it_is_decided,
         test_ingest_refuses_to_run_without_netsuite,
         test_dropped_documents_are_rows_not_prose,
+        test_from_beginning_sets_the_window,
+        test_since_overrides_on_every_path,
+        test_max_messages_cannot_drag_the_watermark_backwards,
+        test_reforward_does_not_create_a_second_shipment,
         test_graph_surface_is_read_only,
         test_client_selection,
         test_retry_after,

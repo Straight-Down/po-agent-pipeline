@@ -1041,6 +1041,29 @@ Guarded now rather than left to vigilance: every suite asserts its own registrat
 
 **The two runners now agree on 1,179 per-test checks** — 687 parsing / 166 ingest / 151 client / 105 schema / 70 config, identical on both sides. The scripts report **1,184** because the five registration guards live in each `main()`, which pytest never runs. That difference is real, intended and explained here rather than left to be rediscovered: **a divergence you have accounted for is documentation; an unaccounted one is a finding waiting to happen**, and the two are indistinguishable to whoever meets them next.
 
+### 20. A partial fix verified by reading outputs will always look complete
+
+Because **the part you can read is the part you fixed.** Every surface that prints is a surface you checked while fixing it; the consumer that prints nothing is the one that stays broken, and nothing about the review distinguishes them.
+
+**The instance.** Commit `b83a6fd` repaired the filename signal the content-addressed store had destroyed. It fixed `classify_by_filename`, the warning strings, the result `repr`, the exclusion reasons — every human-readable surface — and the classifier's own tests passed. It missed **two lines**:
+
+```python
++ "\n".join(f"  {i}. {item.path.name}" for i, (item, _) in enumerate(usable, 1)),
+"text": f"\n===== ATTACHMENT {i}: {item.path.name} =====\n{text}",
+```
+
+Those build the prompt. **The one consumer that weighs a filename for a living was still being handed a SHA-256**, while every part a person would look at had the real name. The fix reviewed as complete because the evidence available to review it was exactly the evidence that had been repaired.
+
+It was caught only by asking a question the outputs could not answer: *does this document classify the same way through both paths?* Identical bytes, two routes, two verdicts — `PACKING_LIST` over the corpus copy, `SHIPPING_ADVICE` over the stored one. Nothing failed in either.
+
+> **The check, and it is cheap: after fixing a signal, enumerate every CONSUMER of it and confirm each one — including the silent ones.** Not every *producer*, which is where the instinct goes. A grep for the old expression is usually the whole audit; here `path.name` still appeared four times and two of them mattered.
+
+**Why this one was worse than a wrong label.** `ClassificationResult.primary` sorts over `self.selected`, so the rollup preference — prefer the style/colour/size rollup over carton-by-carton detail, cheaper and already in the target shape — can only rank documents that were **selected**. Misclassify the rollup and it never enters `selected`, so the preference cannot fire. **A rule that cannot run cannot fail**, and therefore cannot report. The pipeline produced correct figures from the more expensive document and said nothing.
+
+**A fresh instance, found the same week.** `--from-beginning` satisfied the poller's cold-start guard and never set the window, so with a watermark present it read from the watermark and the flag did nothing. It hid a message on a live dry run and reported six where there were seven. Same shape: a control that is believed, does nothing under a condition nobody enumerated, and has no failing path to observe. The check that now guards it is one line — with a watermark present, `--from-beginning` must choose the same window as `--since <epoch>` — and it was verified by reverting the fix and watching it go red (§8 lesson 18).
+
+Related: §8 lesson 12 (a check that cannot pass), §8 lesson 18 (a check that cannot fail). This is the third face — **a fix whose completeness cannot be observed**. All three are cases where the absence of a signal was read as the absence of a problem.
+
 ## 9. How to recover when something breaks
 
 | Symptom | Likely cause | What to do |

@@ -1178,6 +1178,36 @@ So it is paired with the fix. Migration 0006 adds `shipments.extractor_input_tok
 
 A second defect surfaced while wiring it, and it explains why the number was never recoverable: **`ClaudeExtractor.last_usage` is a misnomer — it ACCUMULATES for the life of the instance and is never reset.** Both call sites copied it wholesale into `ParseResult.usage`, so a document parsed late in a run reported the running total of everything before it. The figure was not merely unstored; where it was stored it was wrong. Now a delta across the parse boundary (`document_parsers.usage_delta`).
 
+### 22. An API that accepts unknown keys without complaint will accept a typo the same way
+
+SQLAlchemy lets you attach dialect-specific options as prefixed keyword arguments, and **silently ignores every one that does not match the dialect being compiled for**. That is the documented, intended design: it is what lets one `Index(...)` carry options for four engines at once.
+
+It is also why four filtered unique indexes in `schema.py` — written as `sqlite_where` and `mssql_where` — compiled against PostgreSQL as **full unique indexes**, with no error, no warning, and nothing failing. Measured, not feared:
+
+| | sqlite | mssql | postgresql |
+|---|---|---|---|
+| `ux_change_candidates_one_selected` | `WHERE selected = 1` | `WHERE selected = 1` | **predicate gone** |
+| `ux_proposed_changes_canonical_key` | `WHERE key_size <> ''` | `WHERE key_size <> ''` | **predicate gone** |
+| `ux_proposed_changes_one_line_per_shipment` | `WHERE ns_line_id IS NOT NULL` | same | **predicate gone** |
+| `ux_shipments_primary_attachment` | two-clause predicate | same | **predicate gone** |
+
+A full unique index is not a degraded partial one; it is a **stricter, different constraint**. Without its predicate `ux_change_candidates_one_selected` becomes `UNIQUE(change_id)` and permits **one** candidate row per change — while the entire purpose of `change_candidates` is to hold several for a human to choose between. `NEEDS_RESOLUTION` would stop working. And `ux_proposed_changes_canonical_key` without `WHERE key_size <> ''` starts rejecting the second sizeless row on a PO, which is real vendor data.
+
+**The generalisation is not about SQLAlchemy.** Any configuration API that accepts unknown keys without complaining has this property, and the failure is never the key you thought about:
+
+- a dialect kwarg for an engine you do not use — ignored, correctly
+- a dialect kwarg for an engine you **do** use, misspelled — ignored, identically
+- `sqlite_where` vs `sqllite_where`, `mssql_where` vs `mssql_wehre` — ignored, identically
+
+The mechanism that makes the feature work is the mechanism that swallows the typo. You cannot keep one and refuse the other by being careful, because both arrive as "a key I do not recognise". **Where a permissive API meets a value that must not be silently dropped, the caller has to add the strictness the API declines to.**
+
+**Cross-references, because this sits between two lessons already here.** §19 is two runners over one codebase disagreeing, and the disagreement being the finding; this is the same shape with two *engines* instead of two runners, except that nothing disagreed out loud — the second engine's answer was simply never checked. And §6 item 30 records that a signal is worth exactly as much as the cases it does *not* fire on. **This is the version where the signal was never emitted at all:** not a flag that fires too often to mean anything, but a flag with no code path that could ever raise it. There was no test to be wrong, because the condition was unrepresentable as an error.
+
+**The fix is not `postgresql_where`.** Adding it would have fixed this instance and left the shape exactly intact — the next dialect, or the next dialect-prefixed kwarg anywhere in the file, fails identically and just as quietly. Instead `_partial()` now tags each index with `info["partial_predicate"]`, and a `CreateIndex` compiler hook **refuses to emit a filtered index on any dialect it has no predicate spelled for**, naming the index, the dialect and the predicate that would have been lost. Registered for every dialect rather than the ones we could think of, so an engine nobody anticipated is refused rather than assumed harmless. `test_partial_indexes_refuse_unsupported_dialects` asserts both halves: that sqlite and mssql still emit their `WHERE`, and that postgresql, mysql and oracle all raise — because a guard that refuses everything everywhere would also pass a one-sided test.
+
+**And the deeper reason this went unnoticed for four migrations:** the test suite runs on SQLite, which is the one dialect where the predicates work. A schema change that has never been run against the dialect it will deploy on is untested against the thing it will run on, however green the suite is. Hence `dialect_target.py` and the opt-in `--mssql` run — and the standing rule in CLAUDE.md's definition of done: **any migration touching an index, a constraint or a view is run both ways before it lands.**
+
+
 ## 9. How to recover when something breaks
 
 | Symptom | Likely cause | What to do |

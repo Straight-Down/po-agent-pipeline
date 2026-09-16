@@ -228,9 +228,35 @@ then.
    findings are resolved.
 4. Any statement in `CLAUDE.md`, `RUNBOOK.md` or the architecture doc that
    this change made untrue has been corrected.
+5. **If the change touches an INDEX, a CONSTRAINT or a VIEW, it has been run
+   against BOTH dialects** - SQLite and SQL Server - not just the one the
+   suite defaults to. See "Dual-dialect runs" below.
 
 The PostToolUse and Stop hooks in `.claude/settings.json` enforce 1 and 2
-automatically. 3 and 4 you invoke.
+automatically. 3, 4 and 5 you invoke.
+
+### Dual-dialect runs
+
+SQLite is the fast loop and stays the default. Azure SQL is what this deploys
+on, and **a schema change that has never run against the deployment dialect is
+untested against the thing it will run on**, however green the suite is. That is
+not hypothetical: four filtered unique indexes compiled to FULL unique indexes on
+a non-SQLite dialect for four migrations, silently, because SQLAlchemy ignores
+dialect kwargs it does not recognise (RUNBOOK section 8 lesson 22).
+
+```
+# one-off: a real SQL Server, no Azure and no IT involved
+set MSSQL_SA_PASSWORD=<something long>
+docker compose -f docker-compose.test.yml up -d --wait
+
+set PO_AGENT_TEST_DB_URL=mssql+pyodbc://sa:%MSSQL_SA_PASSWORD%@localhost:11433/po_agent_test?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes
+.venv\Scripts\python -m pytest -q --mssql
+```
+
+`--mssql` does not arrange the run; it *asserts* one. Without
+`PO_AGENT_TEST_DB_URL` set it fails rather than quietly running on SQLite,
+because the silent version reports the same green as a real run. Unset the
+variable to go back to SQLite.
 
 ## Test suite status
 

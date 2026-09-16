@@ -200,6 +200,26 @@ class ParseResult:
     notes: list[str] = field(default_factory=list)
 
     usage: dict = field(default_factory=dict)  # token/cost accounting, empty for free paths
+    #: Per-SOURCE-DOCUMENT spend, keyed by resolved path string.
+    #:
+    #: `usage` above is this parse's own figure. When `parse_shipment_email` also
+    #: parses cross-checks, each one costs a full extraction whose result is then
+    #: discarded -- and folding that into `usage` made the most interesting number
+    #: in the run invisible. Keyed by path because that is what the caller has;
+    #: `ingest` maps it onto `shipment_sources` rows.
+    #:
+    #: A document present here with zeroes was parsed and cost nothing (the
+    #: deterministic route). A document ABSENT was not parsed at all, which is a
+    #: third state and must not be read as zero.
+    source_usage: dict = field(default_factory=dict)
+    #: EVERYTHING one `parse_shipment_email` call spent, attributable or not.
+    #:
+    #: Deliberately not the sum of `source_usage`, and normally larger than it.
+    #: The classification pass and the shipping-info extraction are real calls
+    #: that belong to no single document, so a per-document sum is ATTRIBUTABLE
+    #: spend and this is TOTAL spend. Reporting the sum as "what the shipment
+    #: cost" understates it plausibly, which is worse than not reporting it.
+    total_usage: dict = field(default_factory=dict)
 
     #: True when no attachment could supply per-size quantities, so the shipment
     #: must be keyed in by hand. Per Paula's ruling (2026-08-11) the size gap is

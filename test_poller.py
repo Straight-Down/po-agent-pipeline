@@ -1319,11 +1319,196 @@ def test_usage_round_trips(tmp: Path) -> None:
           "an EXCLUDED document is ZERO -- it was never opened for data, and that "
           "is known rather than unrecorded", str(by_role.get("EXCLUDED")))
     check(by_role.get("CROSS_CHECK") == (None, None),
-          "a CROSS_CHECK is NULL -- it WAS parsed in full, but ParseResult carries "
-          "only the primary's delta, so its cost is unknown rather than invented",
-          str(by_role.get("CROSS_CHECK")))
+          "a CROSS_CHECK with no per-source measurement is NULL, not zero -- "
+          "unknown must not read as free", str(by_role.get("CROSS_CHECK")))
     check(None not in by_role.get("EXCLUDED", (None,)),
           "so NULL and zero mean different things and both survive the round trip")
+
+    # --- and the third state: a cross-check that WAS measured ---------------
+    # `parse_shipment_email` now returns a delta per source document, so the
+    # discarded work has a price on it instead of being inferred. That number is
+    # the one the multi-shipment question turns on: if a cross-check already cost
+    # a full extraction, proposing its lines is nearly free.
+    engine2 = fresh_db()
+    poller.poll_once(engine2, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+    row2 = next(r for r in ep.pending_messages(engine2)
+                if r["graph_message_id"] == "msg-symmetry-003")
+    measured = ParseResult(
+        lines=parsed.lines, parser="claude-assisted",
+        usage={"input_tokens": 100, "output_tokens": 50},
+        source_usage={
+            str(row2["paths"][0].resolve()): {"input_tokens": 100, "output_tokens": 50},
+            str(row2["paths"][1].resolve()): {"input_tokens": 900, "output_tokens": 400},
+        },
+    )
+    canned2 = ac.ClassificationResult(
+        # `is_rollup` decides which becomes PRIMARY -- see
+        # ClassificationResult.primary. Set it explicitly rather than relying on
+        # the display-name tiebreaker, which is what made a first draft of this
+        # test read the two figures the wrong way round.
+        selected=[ac.AttachmentClassification(
+            path=row2["paths"][0], doc_type=ac.DocType.PACKING_LIST, has_size_breakdown=True,
+            reason="stub", method="stub", display_name="primary.pdf", is_rollup=True),
+            ac.AttachmentClassification(
+            path=row2["paths"][1], doc_type=ac.DocType.PACKING_LIST, has_size_breakdown=True,
+            reason="stub", method="stub", display_name="cross.pdf", is_rollup=False)],
+        excluded=[])
+    try:
+        ac.classify_attachments = lambda paths, **kw: canned2
+        dp.parse_shipment_email = lambda paths, **kw: measured
+        ing.ingest_shipment(engine2, row2["paths"],
+                            client=NetSuiteClient(mock_data={"1720": []}),
+                            display_names=row2["display_names"], now=NOW)
+    finally:
+        ac.classify_attachments, dp.parse_shipment_email = orig_c, orig_p
+
+    with engine2.connect() as conn:
+        roles = {r.role: (r.input_tokens, r.output_tokens) for r in conn.execute(
+            sa_select(shipment_sources.c.role, shipment_sources.c.input_tokens,
+                      shipment_sources.c.output_tokens))}
+        total = conn.execute(sa_select(shipments.c.extractor_input_tokens,
+                                       shipments.c.extractor_output_tokens)).one()
+    check(roles.get("CROSS_CHECK") == (900, 400),
+          "a MEASURED cross-check carries its own figure -- the discarded work "
+          "now has a price on it", str(roles.get("CROSS_CHECK")))
+    check(roles.get("PRIMARY") == (100, 50),
+          "and the primary keeps its own, not the sum", str(roles.get("PRIMARY")))
+    check((total.extractor_input_tokens, total.extractor_output_tokens) == (1000, 450),
+          "the shipment total is the SUM of its documents, so the rows reconcile",
+          f"{total.extractor_input_tokens}/{total.extractor_output_tokens}")
+    check(roles["CROSS_CHECK"][0] > roles["PRIMARY"][0],
+          "and a cross-check can cost MORE than the document that was kept")
+
+def test_parse_shipment_email_accounting_for_real(tmp: Path) -> None:
+    section("the accounting itself, through parse_shipment_email -- not a fixture")
+    import attachment_classifier as ac
+    import document_parsers as dp
+    from extraction_schema import ParseResult
+
+    # A stub extractor whose `last_usage` ACCUMULATES exactly as the real one
+    # does, so the deltas under test are computed the way production computes
+    # them. The previous test drove `ingest` with a hand-built ParseResult, which
+    # exercised the CONSUMER of source_usage and never the code that fills it.
+    class _Extractor:
+        def __init__(self):
+            self.last_usage = {}
+            self.parsed = []
+
+        def spend(self, i, o):
+            self.last_usage["input_tokens"] = self.last_usage.get("input_tokens", 0) + i
+            self.last_usage["output_tokens"] = self.last_usage.get("output_tokens", 0) + o
+
+    ex = _Extractor()
+    a, b, c = (tmp / "a.pdf"), (tmp / "b.pdf"), (tmp / "c.pdf")
+    for f in (a, b, c):
+        f.write_bytes(b"x")
+
+    def item(path, name, rollup=False):
+        return ac.AttachmentClassification(
+            path=path, doc_type=ac.DocType.PACKING_LIST, has_size_breakdown=True,
+            reason="stub", method="stub", display_name=name, is_rollup=rollup)
+
+    canned = ac.ClassificationResult(selected=[item(a, "primary.pdf", True),
+                                               item(b, "cross-ok.pdf"),
+                                               item(c, "cross-fails.pdf")])
+
+    def fake_classify(paths, **kw):
+        ex.spend(700, 40)          # the classification pass: belongs to no document
+        return canned
+
+    def fake_parse_packing_slip(path, extractor=None, **kw):
+        if Path(path) == a:
+            ex.spend(100, 50)
+            return ParseResult(lines=[], parser="claude-assisted",
+                               usage={"input_tokens": 100, "output_tokens": 50})
+        if Path(path) == b:
+            ex.spend(900, 400)
+            return ParseResult(lines=[], parser="claude-assisted",
+                               usage={"input_tokens": 900, "output_tokens": 400})
+        ex.spend(30, 5)            # spent, THEN raised
+        raise dp.ExtractionError("simulated cross-check failure")
+
+    orig = (ac.classify_attachments, dp.classify_attachments if hasattr(dp, "classify_attachments")
+            else None, dp.parse_packing_slip, dp.parse_shipping_info_from_documents)
+    try:
+        ac.classify_attachments = fake_classify
+        dp.parse_packing_slip = fake_parse_packing_slip
+        dp.parse_shipping_info_from_documents = lambda *aa, **kk: (
+            ex.spend(60, 10) or ({}, []))
+        result = dp.parse_shipment_email([a, b, c], extractor=ex, cross_check=True)
+    finally:
+        ac.classify_attachments = orig[0]
+        dp.parse_packing_slip = orig[2]
+        dp.parse_shipping_info_from_documents = orig[3]
+
+    su = {Path(k).name: v for k, v in result.source_usage.items()}
+    check(su.get("a.pdf") == {"input_tokens": 100, "output_tokens": 50},
+          "the primary carries its own delta", str(su.get("a.pdf")))
+    check(su.get("b.pdf") == {"input_tokens": 900, "output_tokens": 400},
+          "a successful cross-check carries ITS own delta -- the discarded work "
+          "is priced", str(su.get("b.pdf")))
+    check(su.get("c.pdf") == {"input_tokens": 30, "output_tokens": 5},
+          "and a cross-check that RAISED still records what it spent first",
+          str(su.get("c.pdf")))
+    check(len(su) == 3, "one entry per document actually attempted", str(sorted(su)))
+
+    attributable = sum(v.get("input_tokens", 0) for v in result.source_usage.values())
+    check(attributable == 1030, "attributable input spend is 100+900+30", str(attributable))
+    check(result.total_usage.get("input_tokens") == 1790,
+          "but the TOTAL is 1,790 -- classification (700) and shipping info (60) "
+          "belong to no document and would vanish from a per-document sum",
+          str(result.total_usage.get("input_tokens")))
+    check(result.total_usage["input_tokens"] > attributable,
+          "so the shipment total EXCEEDS the sum of its rows, deliberately")
+
+
+def test_no_packing_sheet_records_what_it_spent(tmp: Path) -> None:
+    section("a primary that raises NoPackingSheetFound is not free")
+    import attachment_classifier as ac
+    import document_parsers as dp
+    from claude_extractor import NoPackingSheetFound
+
+    class _Extractor:
+        def __init__(self):
+            self.last_usage = {}
+
+        def spend(self, i, o):
+            self.last_usage["input_tokens"] = self.last_usage.get("input_tokens", 0) + i
+            self.last_usage["output_tokens"] = self.last_usage.get("output_tokens", 0) + o
+
+    ex = _Extractor()
+    book = tmp / "book.xlsx"
+    book.write_bytes(b"x")
+    canned = ac.ClassificationResult(selected=[ac.AttachmentClassification(
+        path=book, doc_type=ac.DocType.PACKING_LIST, has_size_breakdown=True,
+        reason="stub", method="stub", display_name="book.xlsx", is_rollup=True)])
+
+    def fake_classify(paths, **kw):
+        ex.spend(500, 30)
+        return canned
+
+    def fake_parse(path, extractor=None, **kw):
+        ex.spend(250, 20)          # classify_sections ran and billed
+        raise NoPackingSheetFound(Path(path), [])
+
+    orig_c, orig_p = ac.classify_attachments, dp.parse_packing_slip
+    try:
+        ac.classify_attachments = fake_classify
+        dp.parse_packing_slip = fake_parse
+        result = dp.parse_shipment_email([book], extractor=ex)
+    finally:
+        ac.classify_attachments, dp.parse_packing_slip = orig_c, orig_p
+
+    check(result.needs_manual_entry, "it routes to manual entry, as before")
+    spend = result.source_usage.get(str(book.resolve()))
+    check(spend is not None,
+          "and it RECORDS what it spent rather than leaving source_usage empty",
+          str(spend))
+    check(spend == {"input_tokens": 750, "output_tokens": 50},
+          "the full delta, classification included", str(spend))
+    check(spend["input_tokens"] != 0,
+          "NOT zero -- an empty source_usage made ingest write (0,0), so a real "
+          "cost read as 'genuinely free'")
 
 def main() -> int:
     print("=" * 78)
@@ -1354,6 +1539,8 @@ def main() -> int:
         test_max_messages_cannot_drag_the_watermark_backwards,
         test_reforward_does_not_create_a_second_shipment,
         test_usage_round_trips,
+        test_parse_shipment_email_accounting_for_real,
+        test_no_packing_sheet_records_what_it_spent,
         test_graph_surface_is_read_only,
         test_client_selection,
         test_retry_after,

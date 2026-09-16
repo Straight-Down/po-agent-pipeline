@@ -639,6 +639,13 @@ def parse_shipment_email(
     from attachment_classifier import DocType, classify_attachments
 
     extractor = extractor or ClaudeExtractor()
+    # EVERYTHING this call spends, classification included. The per-document
+    # figures are ATTRIBUTABLE spend; this is TOTAL spend, and the two differ by
+    # the calls belonging to no single document -- the classification pass and
+    # the shipping-info extraction. Reporting only the attributable sum as "what
+    # the shipment cost" understates it plausibly, which is the failure this
+    # whole feature exists to stop.
+    call_usage_before = dict(getattr(extractor, "last_usage", {}) or {})
     # `display_names` carries the vendor's filenames when the bytes are stored
     # content-addressed and the path is a hash -- see classify_attachments.
     classification = classify_attachments(attachment_paths, extractor=extractor,
@@ -667,6 +674,10 @@ def parse_shipment_email(
             ],
         )
         result.needs_manual_entry = True
+        # Classification ran and billed even though nothing was parsed. No
+        # primary exists to attribute it to, so it lands on the total only.
+        result.total_usage = usage_delta(
+            call_usage_before, getattr(extractor, "last_usage", {}) or {})
         return result
 
     primary = classification.primary
@@ -706,17 +717,46 @@ def parse_shipment_email(
             + [f"full extractor diagnostic: {exc}"],
         )
         result.needs_manual_entry = True
+        # IT SPENT TOKENS BEFORE IT RAISED -- `classify_sections` ran and billed.
+        # Leaving `source_usage` empty made `_doc_usage`'s PRIMARY fallback write
+        # (0, 0), so a real cost read as "genuinely free": the same
+        # unknown-becomes-zero confusion the three-state design exists to prevent,
+        # on the one path that had not been given the treatment the cross-check
+        # failure path already had. Reachable on any multi-sheet workbook whose
+        # sheets all classify as non-packing.
+        spent = usage_delta(call_usage_before, getattr(extractor, "last_usage", {}) or {})
+        result.source_usage[str(Path(primary.path).resolve())] = dict(spent)
+        result.total_usage = dict(spent)
         return result
     result.notes = notes + result.notes
     result.warnings = warnings + result.warnings
 
+    # The PRIMARY's own spend, before any cross-check adds to it. `parse_packing_slip`
+    # always sets `usage` -- its own delta, or FREE_USAGE on the deterministic
+    # route -- so there is no empty case to guard here.
+    result.source_usage[str(Path(primary.path).resolve())] = dict(result.usage)
+
     if cross_check and classification.cross_checks:
         for other in classification.cross_checks:
+            # EACH cross-check gets its OWN delta. Folding them into the primary's
+            # figure is what made "what did the discarded work cost" unanswerable:
+            # a cross-check is a full extraction whose lines are then thrown away,
+            # and that is precisely the number worth seeing.
+            before = dict(getattr(extractor, "last_usage", {}) or {}) if extractor else {}
             try:
                 secondary = parse_packing_slip(other.path, extractor=extractor)
             except ExtractionError as exc:
                 result.warnings.append(f"cross-check against {named(other.path)} failed: {exc}")
+                # Recorded even on failure: it was attempted, and an attempt that
+                # raised may still have spent tokens before it did.
+                result.source_usage[str(Path(other.path).resolve())] = usage_delta(
+                    before, getattr(extractor, "last_usage", {}) or {})
                 continue
+            # `secondary.usage` is already this document's own delta --
+            # `parse_packing_slip` snapshots and subtracts internally -- so it is
+            # used directly. `before` exists for the failure path above, where no
+            # ParseResult comes back to carry a figure.
+            result.source_usage[str(Path(other.path).resolve())] = dict(secondary.usage)
             result.warnings.extend(_compare_line_sets(result.lines, secondary.lines, named(other.path)))
 
     # Vendor dates: reference only. The diff engine never proposes a receipt date
@@ -743,6 +783,12 @@ def parse_shipment_email(
             f"unaffected, and the receipt date was always Paula's to enter anyway"
         )
 
+    # LAST, so it includes everything: classification, every document, and the
+    # shipping-info extraction above. Set any earlier and it silently omits
+    # whatever comes after -- which it did, missing the shipping-info call and
+    # reporting a total that looked right and was short.
+    result.total_usage = usage_delta(call_usage_before,
+                                     getattr(extractor, "last_usage", {}) or {})
     return result
 
 

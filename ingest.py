@@ -297,19 +297,47 @@ def _upsert_attachment(conn, path: Path, classification, now: dt.datetime) -> st
     return sha
 
 
-def _doc_usage(parsed, role: str) -> dict:
+def _shipment_tokens(parsed, key: str) -> int:
     """
-    Per-document token spend, keyed by role.
+    What the shipment ACTUALLY cost -- not the sum of its documents.
 
-    The PRIMARY carries the parse's own figure. A CROSS_CHECK was parsed too --
-    fully, and its lines discarded -- but `ParseResult` only carries the primary's
-    delta, so its own cost is recorded as unknown (NULL) rather than invented as
-    zero. Zero would assert it was free, and the 2026-09-14 run showed cross-check
-    parsing is exactly where unaccounted spend hides.
+    `ParseResult.total_usage` is measured around the whole parse, so it includes
+    the calls that belong to no single document: the classification pass, and the
+    shipping-info extraction. The per-document rows are ATTRIBUTABLE spend and
+    normally sum to LESS than this. That gap is real, and reporting the smaller
+    number as the shipment's cost would be a plausible understatement -- the
+    exact failure mode this accounting was added to remove.
 
-    An EXCLUDED document was never opened for data at all, so zero is the truth
-    there and NULL would understate what is known.
+    Falls back to the per-document sum, then to the primary's own figure, for
+    callers whose extractor exposes no usage at all (offline stubs).
     """
+    total = (parsed.total_usage or {}).get(key)
+    if total:
+        return int(total)
+    per_source = parsed.source_usage or {}
+    if per_source:
+        return sum(int((u or {}).get(key, 0) or 0) for u in per_source.values())
+    return int((parsed.usage or {}).get(key, 0) or 0)
+
+
+def _doc_usage(parsed, role: str, path: Path) -> dict:
+    """
+    Per-document token spend, from the parse's own per-source measurement.
+
+    THREE states, and keeping them apart is the whole point:
+
+      MEASURED  -- `ParseResult.source_usage` has this path. True for the primary
+                   and, since cross-check deltas landed, for every cross-check
+                   too. A cross-check costs a FULL extraction whose lines are then
+                   discarded; that figure is the one worth seeing.
+      ZERO      -- an EXCLUDED document, never opened for data. Known, not absent.
+      NULL      -- parsed by a path that does not account, or a row written before
+                   the columns existed. Unknown, and must not read as free.
+    """
+    measured = (parsed.source_usage or {}).get(str(Path(path).resolve()))
+    if measured is not None:
+        return {"input_tokens": int(measured.get("input_tokens", 0) or 0),
+                "output_tokens": int(measured.get("output_tokens", 0) or 0)}
     if role == "PRIMARY":
         usage = parsed.usage or {}
         return {"input_tokens": int(usage.get("input_tokens", 0) or 0),
@@ -680,8 +708,11 @@ def ingest_shipment(
             # What this shipment cost, primary plus every cross-check. Written
             # here because here is where the parse happened -- storing a figure
             # anywhere else means recomputing or guessing it later.
-            "extractor_input_tokens": int((parsed.usage or {}).get("input_tokens", 0) or 0),
-            "extractor_output_tokens": int((parsed.usage or {}).get("output_tokens", 0) or 0),
+            # EVERY document this shipment paid for, primary and cross-checks.
+            # `parsed.usage` is the primary's alone; summing `source_usage` is
+            # what makes the shipment total agree with the sum of its rows.
+            "extractor_input_tokens": _shipment_tokens(parsed, "input_tokens"),
+            "extractor_output_tokens": _shipment_tokens(parsed, "output_tokens"),
             "created_by": actor,
             "created_at": now,
         })
@@ -725,7 +756,7 @@ def ingest_shipment(
                 # Per document. NULL for one nothing read -- an EXCLUDED file was
                 # never opened for data, which is different from opening it and
                 # spending nothing. See migration 0006.
-                **(_doc_usage(parsed, role)),
+                **(_doc_usage(parsed, role, item.path)),
             })
             counts["shipment_sources"] += 1
 

@@ -100,7 +100,20 @@ QUANTITY_TOLERANCE = 0.001
 #: answerable from the row alone.
 BASIS_FIRST_SHIPMENT = "FIRST_SHIPMENT"  # nothing written before; base is zero
 BASIS_ACCUMULATED = "ACCUMULATED"  # added to what this tool previously wrote
-BASIS_DISPUTED = "DISPUTED"  # NetSuite disagrees with our record; nothing proposed
+
+#: No history AND the line already carries receipts from before this tool existed.
+#: **Not a dispute** -- nothing disagrees, there is simply nothing to compare. It is
+#: the expected state of every partially-received line on first contact, it asks for
+#: a one-time confirmation, and it RETIRES ITSELF: once confirmed and written the
+#: line has history, so every later slip is an ordinary ACCUMULATED.
+BASIS_PRE_EXISTING_RECEIPT = "PRE_EXISTING_RECEIPT"
+
+#: Our record and NetSuite genuinely CONTRADICT each other -- we wrote one number
+#: and the line holds another, or the line moved since we last looked. Someone
+#: changed something behind the tool. This must never become routine, and it is kept
+#: separate from PRE_EXISTING_RECEIPT precisely so a predictable first-contact wave
+#: cannot teach a reviewer to skim past the word that means "alarm".
+BASIS_DISPUTED = "DISPUTED"
 
 
 @dataclass(frozen=True)
@@ -813,14 +826,27 @@ def _accumulated_quantity(
       base is zero and the slip's figure is the proposal, which is what this
       engine did for every line before accumulation existed.
     - **Never seen before, but goods have already been received against it.**
-      `quantity_received > 0` with no record of our own means a shipment arrived
-      that this tool knows nothing about. Accumulating from zero would propose
-      only this slip and lose the earlier units -- the precise loss Paula's ruling
-      is about -- so it is flagged instead.
+      `PRE_EXISTING_RECEIPT`, and **deliberately not a dispute.** Nothing
+      contradicts anything; there is simply no history, which is the expected state
+      of every partially-received line the first time a slip touches it after this
+      feature shipped. Accumulating from zero would propose only this slip and lose
+      the earlier units, so nothing is proposed and a human confirms the total once.
+      It **retires itself**: that confirmation becomes history, and the next slip on
+      the line is an ordinary `ACCUMULATED`.
     - **Seen before but never written** (proposed and rejected, or still pending).
       The base is still zero, because an unwritten proposal changed nothing. But
       the observation is kept: if NetSuite's quantity has moved since we looked,
-      someone edited the line, and that is flagged on the same footing.
+      someone edited the line, and THAT is a genuine dispute.
+
+    ## Why the expected case and the alarming case do not share a label
+
+    `DISPUTED` means someone changed something behind the tool's back, and it should
+    never be routine. `PRE_EXISTING_RECEIPT` is guaranteed to arrive in a batch on
+    first contact with any PO partly received before this code existed. If the two
+    wore one label, that predictable wave would teach a reviewer to skim past the
+    word -- and the case she would skim past is the alarming one. A signal that
+    fires on expected conditions stops being a signal; the extraction-confidence
+    flag already demonstrated exactly that on this project (RUNBOOK section 7).
 
     **Residual gap, named rather than hidden:** a line this tool has never seen,
     with nothing received, whose quantity was edited by hand, is indistinguishable
@@ -883,12 +909,14 @@ def _accumulated_quantity(
     payload.update({"base_quantity": 0.0, "prior_writes": 0,
                     "quantity_received": received})
     if received > QUANTITY_TOLERANCE:
-        payload["basis"] = BASIS_DISPUTED
+        # Expected, one-time, and phrased as a question rather than an alarm.
+        # See the docstring on why this is deliberately not DISPUTED.
+        payload["basis"] = BASIS_PRE_EXISTING_RECEIPT
         return None, payload, (
-            f"NetSuite line {line.line_id} already shows {received:g} received, but this tool has "
-            "no record of ever proposing or writing to it — a shipment reached this line that it "
-            f"knows nothing about. Proposing the shipped {slip:g} alone would drop the earlier "
-            "units. No quantity proposed — confirm what this line should total"
+            f"this line had {received:g} units received before the tool started tracking it, "
+            f"and this slip adds {slip:g}. Nothing disagrees — there is simply no history to "
+            "add to, so confirm the total this line should hold. Once confirmed, later "
+            "shipments on this line accumulate automatically"
         )
     payload["basis"] = BASIS_FIRST_SHIPMENT
     return slip, payload, None

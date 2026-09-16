@@ -572,11 +572,24 @@ proposed_changes = Table(
     # -- first, because the vendor's slip shows only the new shipment (Paula,
     # -- 2026-09-16). So `proposed_quantity` is a TOTAL, and on its own it does not
     # -- say what it was a total OF.
-    # --   FIRST_SHIPMENT  nothing written before; base 0, proposal = this slip
-    # --   ACCUMULATED     base = what this tool last wrote, + this slip
-    # --   DISPUTED        NetSuite disagrees with our record of what we wrote, or
-    # --                   goods reached a line we have no record of. NOTHING is
-    # --                   proposed; `attention_reason` carries both numbers.
+    # --   FIRST_SHIPMENT        nothing written before; base 0, proposal = this slip
+    # --   ACCUMULATED           base = what this tool last wrote, + this slip
+    # --   PRE_EXISTING_RECEIPT  no history AND the line already carries receipts
+    # --                         from before this tool existed. NOT a dispute --
+    # --                         nothing contradicts anything, there is just nothing
+    # --                         to add to. Expected in a batch on first contact,
+    # --                         asks for a one-time confirmation, and RETIRES
+    # --                         ITSELF: the confirmation becomes history, so the
+    # --                         next slip on that line is ACCUMULATED.
+    # --   DISPUTED              our record and NetSuite CONTRADICT each other --
+    # --                         we wrote one number and the line holds another, or
+    # --                         the line moved since we last looked. Someone
+    # --                         changed something behind the tool. Kept separate
+    # --                         from PRE_EXISTING_RECEIPT so a predictable wave
+    # --                         cannot train a reviewer to skim past the word that
+    # --                         means alarm.
+    # -- Neither of the last two proposes anything; `attention_reason` carries the
+    # -- numbers.
     # -- The base is this tool's OWN audit trail, never NetSuite's current
     # -- quantity -- that is a field this tool writes, and feeding it back in would
     # -- let past output decide future output (lesson 13). See
@@ -681,7 +694,7 @@ proposed_changes = Table(
     ),
     CheckConstraint(
         "accumulation_basis IS NULL OR accumulation_basis IN "
-        "('FIRST_SHIPMENT','ACCUMULATED','DISPUTED')",
+        "('FIRST_SHIPMENT','ACCUMULATED','PRE_EXISTING_RECEIPT','DISPUTED')",
         name="accumulation_basis",
     ),
     # Same principle as the colour and size provenance constraints: a claim that

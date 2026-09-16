@@ -1327,7 +1327,7 @@ def test_netsuite_disagreeing_with_our_record_is_flagged() -> None:
 
 
 def test_untracked_line_with_receipts_is_flagged() -> None:
-    section("no history, but goods already arrived: flag rather than start from zero")
+    section("no history, goods already arrived: PRE_EXISTING_RECEIPT, not a dispute")
     engine = fresh_db()
     report = _ship(engine, po="1662", graph_id="AAMk-batch-2",
                    slip_lines=[line(qty=100)],
@@ -1336,17 +1336,101 @@ def test_untracked_line_with_receipts_is_flagged() -> None:
 
     check(change.proposed_quantity is None, "nothing proposed",
           str(change.proposed_quantity))
-    check(change.accumulation_basis == "DISPUTED",
-          "basis DISPUTED -- a shipment reached this line that the tool never saw",
-          str(change.accumulation_basis))
-    check(change.state == sc.STATE_NEEDS_ATTENTION, "flagged for Paula", change.state)
+    check(change.accumulation_basis == "PRE_EXISTING_RECEIPT",
+          "basis PRE_EXISTING_RECEIPT", str(change.accumulation_basis))
+    check(change.accumulation_basis != "DISPUTED",
+          "and specifically NOT DISPUTED -- nothing contradicts anything here, there "
+          "is simply no history to add to")
+    check(change.state == sc.STATE_NEEDS_ATTENTION,
+          "it still needs Paula, because the total has to be confirmed once",
+          change.state)
+
     reason = change.attention_reason or ""
-    check("128" in reason, "the reason states what was already received", reason[:100])
-    check("no record" in reason.lower(),
-          "and says plainly that the tool has no record of it", reason[:100])
+    check("128" in reason, "the reason states what was already received", reason[:110])
+    check("100" in reason, "and what this slip adds", reason[:110])
+    check("confirm the total" in reason,
+          "phrased as a one-time confirmation, not a report of a disagreement",
+          reason[:110])
+    check("Nothing disagrees" in reason,
+          "and says so outright, so a reviewer is not hunting for a conflict that "
+          "does not exist", reason[:110])
     check("vendor line has no quantity" not in reason,
-          "and does NOT blame the document -- the slip stated 100 perfectly clearly",
-          reason[:100])
+          "it does NOT blame the document -- the slip stated 100 perfectly clearly",
+          reason[:110])
+
+
+def test_pre_existing_receipt_retires_itself() -> None:
+    section("the day-one case is one-time: confirm it once, then it accumulates")
+    engine = fresh_db()
+
+    # First contact with a line that was partly received before the tool existed.
+    first = _ship(engine, po="1662", graph_id="AAMk-batch-1",
+                  slip_lines=[line(qty=100)],
+                  ns_lines=[ns_line("18", qty=300, recv=128.0)])
+    change_1 = _only_change(engine, first.shipment_id)
+    check(change_1.accumulation_basis == "PRE_EXISTING_RECEIPT",
+          "first contact: PRE_EXISTING_RECEIPT", str(change_1.accumulation_basis))
+
+    # Paula confirms the total: the 128 already there plus this slip's 100.
+    _record_write(engine, change_1, 228, dt.datetime(2026, 9, 16, 10, 0, 0))
+
+    # A later slip on the same line. NetSuite now holds the confirmed 228.
+    second = _ship(engine, po="1662", graph_id="AAMk-batch-2",
+                   slip_lines=[line(qty=50)],
+                   ns_lines=[ns_line("18", qty=228, recv=228.0)],
+                   now=dt.datetime(2026, 10, 1, 9, 0, 0))
+    change_2 = _only_change(engine, second.shipment_id)
+
+    check(change_2.accumulation_basis == "ACCUMULATED",
+          "the NEXT slip is an ordinary ACCUMULATED -- the flag retired itself",
+          str(change_2.accumulation_basis))
+    check(change_2.accumulation_basis != "PRE_EXISTING_RECEIPT",
+          "it does NOT ask again; the confirmation became the history")
+    check(float(change_2.proposed_quantity) == 278.0,
+          "and proposes 228 + 50 = 278, with the confirmed total as the base",
+          str(change_2.proposed_quantity))
+    check(change_2.state == sc.STATE_PENDING_REVIEW,
+          "back to an ordinary proposal", change_2.state)
+
+
+def test_the_two_no_proposal_cases_do_not_share_a_label() -> None:
+    section("a genuine contradiction and a missing history read differently")
+    # Same outward shape -- nothing proposed, NEEDS_ATTENTION -- and they must
+    # still be distinguishable, or the predictable wave trains Paula to skim the
+    # word that means alarm.
+    engine_a = fresh_db()
+    first = _ship(engine_a, po="1662", graph_id="AAMk-batch-1",
+                  slip_lines=[line(qty=128)],
+                  ns_lines=[ns_line("18", qty=300, recv=0.0)])
+    _record_write(engine_a, _only_change(engine_a, first.shipment_id), 128,
+                  dt.datetime(2026, 9, 1, 10, 0, 0))
+    disputed = _only_change(engine_a, _ship(
+        engine_a, po="1662", graph_id="AAMk-batch-2", slip_lines=[line(qty=100)],
+        ns_lines=[ns_line("18", qty=150, recv=0.0)],
+        now=dt.datetime(2026, 9, 16, 9, 0, 0)).shipment_id)
+
+    engine_b = fresh_db()
+    day_one = _only_change(engine_b, _ship(
+        engine_b, po="1662", graph_id="AAMk-batch-2", slip_lines=[line(qty=100)],
+        ns_lines=[ns_line("18", qty=300, recv=128.0)]).shipment_id)
+
+    check(disputed.proposed_quantity is None and day_one.proposed_quantity is None,
+          "both refuse to propose a quantity")
+    check(disputed.state == day_one.state == sc.STATE_NEEDS_ATTENTION,
+          "and both land in the same state, so the state cannot tell them apart")
+    check(disputed.accumulation_basis != day_one.accumulation_basis,
+          "but the BASIS does",
+          f"{disputed.accumulation_basis} vs {day_one.accumulation_basis}")
+    check(disputed.accumulation_basis == "DISPUTED",
+          "the contradiction is DISPUTED", str(disputed.accumulation_basis))
+    check(day_one.accumulation_basis == "PRE_EXISTING_RECEIPT",
+          "the missing history is PRE_EXISTING_RECEIPT", str(day_one.accumulation_basis))
+    check("changed the line outside this tool" in (disputed.attention_reason or ""),
+          "and only the contradiction accuses anyone of changing anything",
+          (disputed.attention_reason or "")[:110])
+    check("outside this tool" not in (day_one.attention_reason or ""),
+          "the day-one case makes no such accusation, because none happened",
+          (day_one.attention_reason or "")[:110])
 
 
 def test_unwritten_proposals_do_not_move_the_base() -> None:
@@ -1424,6 +1508,8 @@ def main() -> int:
         test_second_shipment_accumulates,
         test_netsuite_disagreeing_with_our_record_is_flagged,
         test_untracked_line_with_receipts_is_flagged,
+        test_pre_existing_receipt_retires_itself,
+        test_the_two_no_proposal_cases_do_not_share_a_label,
         test_unwritten_proposals_do_not_move_the_base,
     )
 

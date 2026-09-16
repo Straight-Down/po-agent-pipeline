@@ -851,6 +851,75 @@ class NetSuiteClient:
 
     # -- reads --------------------------------------------------------------
 
+    def suiteql(self, sql: str, *, page_size: int = 1000, max_rows: int = 100_000) -> list:
+        """
+        Run a read-only SuiteQL query and return every row, paging as needed.
+
+        Added for reporting reads -- the first being "how many open PO lines
+        already carry a receipt this tool has no record of", which sizes the
+        `PRE_EXISTING_RECEIPT` wave (`scripts/estimate_pre_existing_receipts.py`).
+        The endpoint was reachable by this role already; the same
+        `Reports > SuiteAnalytics Workbook` permission that gates collection
+        queries gates this one.
+
+        **SELECT only, enforced structurally rather than by convention.** This
+        client's whole point is that it cannot surprise anyone with a write, so a
+        query method that would happily run an UPDATE is the wrong shape however
+        carefully every caller behaves. The check is deliberately crude -- it
+        rejects anything that does not begin with SELECT or WITH -- because a
+        clever one invites arguments about which statements are really harmless.
+
+        **No parameter binding, and do not add interpolation instead.** NetSuite's
+        SuiteQL endpoint returns 400 INVALID_CONTENT for
+        `{"q": "... = ?", "params": [...]}`; that is what made an earlier PO-lookup
+        fallback fail in a misleading way (`suiteql_url`). Queries here are
+        literals in source, which is also why there is nothing to bind.
+
+        `Prefer: transient` keeps NetSuite from persisting the result set;
+        `_request` preserves caller headers across a retry precisely so this one
+        survives.
+
+        **`page_size` is the page size, not a row cap, and the distinction is not
+        pedantic.** An earlier signature called it `limit`, which reads like "give
+        me at most N rows"; passing 3 to peek at a couple of rows instead walked an
+        entire transaction table three rows at a time. `max_rows` is the actual
+        cap, and exceeding it raises rather than truncating -- a silently short
+        result set is the wrong failure for a reporting query someone will quote a
+        number from.
+        """
+        words = sql.strip().lstrip("(").split()
+        verb = words[0].upper() if words else ""
+        if verb not in ("SELECT", "WITH"):
+            raise NetSuiteError(
+                f"suiteql() runs SELECT statements only, and this one starts {verb or '(empty)'!r}. "
+                "It is a reporting read, not a write path -- if something needs to change a "
+                "record, it goes through the record API, where the audit trail and the "
+                "human-approval gate live."
+            )
+
+        rows: list = []
+        offset = 0
+        while True:
+            response = self._request(
+                "POST",
+                f"{self._require_live('suiteql').suiteql_url}"
+                f"?limit={page_size}&offset={offset}",
+                headers={"Prefer": "transient"},
+                json={"q": sql},
+            )
+            payload = response.json()
+            batch = payload.get("items") or []
+            rows.extend(batch)
+            if not batch or not payload.get("hasMore"):
+                return rows
+            offset += len(batch)
+            if len(rows) >= max_rows:
+                raise NetSuiteError(
+                    f"suiteql() stopped after {len(rows):,} rows (max_rows={max_rows:,}) and "
+                    "NetSuite still reports more. Aggregate in the query or raise max_rows "
+                    "deliberately -- returning a truncated set silently would be worse."
+                )
+
     def resolve_po_internal_id(self, po_number: str) -> str:
         """
         Map a printed PO reference OR a tranId to its internal record id.

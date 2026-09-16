@@ -84,21 +84,26 @@ structure, tests, packaging) to whatever standard you'd normally build to.
    *opposite* recommendations depending on grant type — unchecked for the
    interactive flow, likely checked (but unverified) for M2M — see
    architecture doc §6, don't copy the interactive-flow setting blindly.
-3. **Outlook/M365 connector only has access to Kiko's mailbox, not Paula's**
-   (confirmed — a direct search against her mailbox returned 403). She's the
-   one who receives vendor emails. Settle whether she forwards into a shared
-   mailbox or grants delegate/app-only access before building the email
-   intake service (Phase 2 of the build plan).
-4. **NEW 2026-08-04 — blocks Phase 2's PO matching:** the "PO Update" role
-   can read a PO directly by internal id but cannot perform REST
-   collection/search queries (`GET /purchaseOrder?limit=1` and similar
-   return `400 USER_ERROR` despite View-level List permissions). Vendor
-   packing slips carry human PO numbers ("1662"), not internal ids
-   ("8489541") — resolving one to the other needs exactly the query access
-   this role doesn't have. Needs a NetSuite admin conversation about which
-   permission grants collection/search access without over-widening the
-   role. See architecture doc §6. Don't work around this by guessing at
-   broader permissions without checking first.
+3. ~~**Outlook/M365 connector only has access to Kiko's mailbox, not Paula's**~~
+   **RESOLVED 2026-09-09/14, and the answer was neither option listed here.**
+   Paula's inbox was explicitly rejected as the target: `Mail.Read` is
+   mailbox-level, not folder-level, so pointing an app-only permission at her
+   account would expose her whole inbox. A dedicated **`shipments@` shared
+   mailbox** was created instead, with app-only `Mail.Read` scoped to it alone.
+   Scoping is **observed**, not asserted — `scripts/probe_graph_auth.py` reads
+   that mailbox and is refused (`403 ErrorAccessDenied`) on a second one. The
+   intake service is built and has run against it (build plan Phase 2).
+4. ~~**NEW 2026-08-04 — blocks Phase 2's PO matching:** the "PO Update" role
+   cannot perform REST collection/search queries.~~ **RESOLVED 2026-08-12.**
+   The missing permission was **`Reports > SuiteAnalytics Workbook`**,
+   confirmed by bisect as the sole cause; it gates every collection `GET`,
+   every `?q=` filter and all SuiteQL, while by-id `GET`/`PATCH` is ungated.
+   `Edit` is the only level the permission offers. The role is now **seven**
+   permissions, not the five listed in item 2 above —
+   `NETSUITE-M2M-SETUP.md` Step 2 carries the current set and is the file to
+   follow when building the production role. PO-number resolution ran end to
+   end on live mail on 2026-09-14: 5 of 5, including a zero-padded
+   `0001725`.
 
 ## Open technical questions (validate early, don't assume)
 
@@ -147,3 +152,123 @@ structure, tests, packaging) to whatever standard you'd normally build to.
 - **Human review before every NetSuite write, permanently** — not a
   training-wheels step to be removed later. This was an explicit, deliberate
   decision, not a default to revisit without checking back in.
+
+---
+
+<!-- ===================================================================
+     Added 2026-09-14. Everything above this line was written 2026-08-04
+     and parts of it are now out of date - see "Staleness warning" below.
+     =================================================================== -->
+
+## Staleness warning - read before trusting anything above
+
+The sections above describe the project as of **2026-08-04**. Several
+statements in them are no longer true, and Claude Code weights this file more
+heavily than the code it can read. Known drift as of 2026-09-14:
+
+- The file-table entry for `netsuite_client.py` calls it a "stub" whose
+  "method bodies are mocked/`NotImplementedError`". It is not. It is a
+  1,293-line client making real REST calls, with zero `NotImplementedError`
+  remaining.
+- The file table lists only the Phase 0 prototypes. The repo now also contains
+  `ingest.py`, `schema.py`, `extraction_schema.py`, `claude_extractor.py`,
+  `document_parsers.py`, `attachment_classifier.py`, `size_vocabulary.py`,
+  `canonical.py`, `config.py`, alembic migrations 0001-0006, and seven test
+  modules — plus, since Phase 2 closed on 2026-09-14, the mailbox intake:
+  `graph_client.py` (a four-method Graph interface with a mock and a real
+  client), `poller.py` (the polling job and the content-addressed attachment
+  store) and `extract_pending.py` (the ingest -> extraction driver, a separate
+  command by design).
+- "Nothing here has touched production data" should be re-confirmed rather
+  than assumed, given how much has been built since.
+
+**Rule: when a change makes a statement in this file untrue, fix the statement
+in the same turn.** A wrong line here costs more than a missing one, because
+every future session inherits it and trusts it over the source.
+
+## Commands
+
+The project venv is at `.venv` (Windows layout - `.venv\Scripts\`).
+
+```
+# runtime deps
+.venv\Scripts\python -m pip install -r requirements.txt
+
+# verification tooling (pytest, ruff) - REQUIRED for the hooks to do anything
+.venv\Scripts\python -m pip install -r requirements-dev.txt
+
+# full suite
+.venv\Scripts\python -m pytest -q
+
+# one module / one test
+.venv\Scripts\python -m pytest test_parsing.py -q
+.venv\Scripts\python -m pytest test_parsing.py::test_routing -q
+
+# lint one file
+.venv\Scripts\python -m ruff check <file>.py
+
+# re-baseline the known-failure ratchet (deliberate, not routine)
+.venv\Scripts\python .claude\hooks\verify_stop.py --write-baseline
+```
+
+Git note: `.git` is a gitfile pointing at `C:/dev/po-agent.git`, deliberately
+outside the OneDrive tree so OneDrive does not corrupt the object store. Git
+commands work normally from the project root.
+
+## Definition of done
+
+A change is not finished until all four hold. Do not report success before
+then.
+
+1. The file compiles and `ruff check` is clean on what you touched.
+2. `pytest -q` introduces no failure that was not already in
+   `.claude/known-failures.txt`.
+3. The `code-reviewer` subagent has reviewed the diff and its blocking
+   findings are resolved.
+4. Any statement in `CLAUDE.md`, `RUNBOOK.md` or the architecture doc that
+   this change made untrue has been corrected.
+
+The PostToolUse and Stop hooks in `.claude/settings.json` enforce 1 and 2
+automatically. 3 and 4 you invoke.
+
+## Test suite status
+
+There is a backlog of pre-existing failures recorded in
+`.claude/known-failures.txt`. The Stop hook ignores those and blocks only on
+**new** failures, so a long-standing red test cannot trap a session in a loop.
+
+That file is a ratchet. Delete lines from it as you fix them. Never add a line
+to it to get a turn to pass - if a change breaks a test, fix the change.
+
+## Gotchas log
+
+Append one line here every time a bug is fixed that a future session could
+plausibly reintroduce. Write them as instructions with the failure attached,
+not as history - a rule without its failure mode gets rationalised away.
+
+- Choose the Excel reader by **file signature, not extension**. `xlrd>=2.0`
+  reads `.xls` only and `openpyxl` reads `.xlsx` only; Tainan's packing list
+  is a genuine `.xls` and is that PO's only size-level source.
+- A line that cannot be matched returns `NEEDS_ATTENTION`. Never drop, skip,
+  or default it - a silent matching miss loses real shipment quantities.
+- Match on the exact-match custom fields (`custcol_sd_tmpl_style`,
+  `custcol_product_color.refName`, `custcol_product_size.refName` with size
+  normalisation). Display-name substring matching was tried and rejected; do
+  not reintroduce it.
+- The PO Update role can read a PO by internal id but cannot run REST
+  collection/search queries. Do not work around a `400 USER_ERROR` by widening
+  the role - raise it instead.
+- Pass the vendor's FILENAME alongside the bytes. Attachments are stored
+  content-addressed, so the path is a SHA-256 and carries no signal; handing it
+  to the classifier silently disabled every filename rule, including the
+  inspection-report ban. `display_names` exists for this.
+- `ClaudeExtractor.last_usage` ACCUMULATES for the life of the instance and is
+  never reset. Take a delta across the parse boundary (`usage_delta`); copying
+  it wholesale reports the run's running total as one document's cost.
+- `NetSuiteClient(cfg)` binds a config to `account_id` and yields a silent MOCK
+  client with no data. It raises now, and `config` is keyword-only - use
+  `NetSuiteClient(config=cfg)`.
+- A flag that only satisfies a guard is a no-op. `--from-beginning` never set
+  the window, so with a watermark present it read from the watermark and hid a
+  message. Assert a flag's EFFECT, not that it is accepted.
+- <add the next one here>

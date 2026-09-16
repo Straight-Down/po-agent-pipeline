@@ -46,7 +46,7 @@ No additional time/cost — already sunk and reusable.
 | 4 | **Canonical-form normalizer** (`canonical.py`): NFKC → dash folding → zero-width handling → whitespace collapse → strip → casefold, applied at *every* keying and matching site, on **both** operands. Replaces ad-hoc `.strip().upper()`. Verbatim source text is preserved; only the comparison key is derived. | Symmetry detail **stable at 25 / 1669 with identical row order across five consecutive runs** — completing idempotency. A colour printed `NEW  INDIGO` now matches NetSuite's `NEW INDIGO`, and a dirty *NetSuite* value matches a clean vendor one. |
 | 5 | **Resolve a key matching several NetSuite PO lines** instead of taking the first. `(PO, style, colour, size)` is not unique per PO line — 64 of 1,659 POs carry duplicates, created during *receiving*, so this pipeline meets them disproportionately. The old code updated the first match and silently dropped the rest. Now: gather all candidates, filter to `isOpen`, one open line → target it, zero → flagged, two or more → `NEEDS_RESOLUTION` with every candidate's figures. No tiebreaker. `POLine` gains `is_open`, `quantity_received`, `quantity_billed`, `rate`. | Fixtures reproduce the three real shapes; every branch covered; NetSuite-side lines asserted **never** summed while extraction-side aggregation is asserted **unchanged**. Offline 401 → **456**, client 94 → **103**, all passing. |
 
-Test totals **at that point**: 456 offline + 103 NetSuite client, over eight tracked vendor documents. **Current totals: 688 parsing / 167 ingest / 152 NetSuite client / 106 schema / 71 config — 1,184 checks** (corrected 2026-09-14: `test_schema` had been reporting **115** because `test_colour_provenance_columns` was registered twice and its ten checks counted twice — 105 distinct, plus one new registration guard per suite; RUNBOOK §8 lesson 19), over **eleven** tracked vendor documents (the original eight plus Tainan's legacy `.xls` and the two footwear workbooks). The growth is Phases 2–3 work landing on top of Phase 1's, not Phase 1 expanding.
+Test totals **at that point**: 456 offline + 103 NetSuite client, over eight tracked vendor documents. **Current totals: 688 parsing / 167 ingest / 152 NetSuite client / 108 schema / 71 config / 190 poller — 1,376 checks** (corrected 2026-09-14: `test_schema` had been reporting **115** because `test_colour_provenance_columns` was registered twice and its ten checks counted twice — 105 distinct, plus one new registration guard per suite; RUNBOOK §8 lesson 19), over **eleven** tracked vendor documents (the original eight plus Tainan's legacy `.xls` and the two footwear workbooks). The growth is Phases 2–3 work landing on top of Phase 1's, not Phase 1 expanding.
 
 **Test fixtures added for change 5, and what each one exists to catch** — all synthetic records reproducing real sandbox shapes, so the suite stays offline:
 
@@ -64,7 +64,7 @@ Test totals **at that point**: 456 offline + 103 NetSuite client, over eight tra
 - ~~Lines present in NetSuite but absent from a packing slip~~ **Resolved and built.** Routine batch shipping, not cancellation — no record is created for them, not even `NO_CHANGE`.
 - **STILL OPEN — true multi-batch shipments.** The over-ship case is resolved and built (the packing list is authoritative; a shipped quantity replaces the ordered one). What is *not* settled is what a **second** shipment against the same PO line should do to a quantity the first one already wrote — replace it, or add to it. Nothing in the corpus has exercised this yet, so it is unanswered rather than wrong. **This one does block Phase 3's diff engine; the other two no longer do.**
 
-## Phase 2 — Email intake + data layer (~3–5 days)
+## Phase 2 — Email intake + data layer (~3–5 days) — COMPLETE 2026-09-14
 
 1. ~~Register an Entra ID app (Graph API, `Mail.Read` app-only permission) against a **new shared mailbox (`shipments@`)**, scoped to that mailbox alone via **RBAC for Applications**.~~ **DONE 2026-09-09/14.** Both admin halves were exercised: Entra (registration, certificate, admin consent) and Exchange (the `shipments@` mailbox and its scope). `scripts/probe_graph_auth.py` reads that mailbox (`200`, with a message count) and is **refused on a second populated mailbox in the same tenant** (`403 ErrorAccessDenied`) — so the scoping is OBSERVED, not asserted. What a `403` cannot distinguish is *which* mechanism implements it; RBAC for Applications and an application access policy look identical from outside. RUNBOOK §6 item 26. **Changed 2026-08-24 — not Paula's own mailbox:** `Mail.Read` is mailbox-level, not folder-level, so pointing it at her account would expose her whole inbox; her inbox was explicitly rejected as the target. **Two admin roles are needed, not one** — Entra ID admin (Application Administrator or Global Administrator) for the app registration and tenant-wide consent, **and** Exchange admin for the shared mailbox and its RBAC scope. **Confirm both, by name, BEFORE starting** — Kiko may hold neither. The risk register already names missing admin access as a recurring pattern in this project: it blocked the NetSuite Integration record, then the role permissions, twice. Identify the admin and confirm the access exists as the first task of Phase 2, not mid-debug.
 2. ~~Build the intake job as polling (confirmed sufficient at 10–20 emails/week — no webhook needed), pulling new messages + attachments from a designated folder every 15–30 minutes.~~ **BUILT 2026-09-14.** `graph_client.py` (the four-method interface plus a mock and a real client), `poller.py` (the job and the content-addressed store) and `extract_pending.py` (the extraction driver). 87 checks in `test_poller.py`, offline throughout.
@@ -103,7 +103,53 @@ Test totals **at that point**: 456 offline + 103 NetSuite client, over eight tra
 
    **Measured result:** footwear **28 → 44 proposals — 16 assignment groups covering 32 changes, plus 12 unambiguous singles** — reconciling exactly against the sheets. Zero change on the four single-recap vendors, which report zero recap labels and zero assignment cases: Inprotex 6,387 units / **77 of 77 targeted**, Legendz 1,049 / 8, Symmetry 1,669 / 25, Tainan 1,725 / 56 with 28 targeted. Tests at the time: 687 parsing / 166 ingest / 151 client / 100 schema. (Schema counts before this date are additionally inflated by ten — see the correction above.)
 
-**Exit criteria:** ~~forwarding/receiving a real vendor email results in a correct, persisted `proposed_changes` row set, matched against sandbox PO data from Phase 1.~~ **MET against the mock, 2026-09-14** — seven messages in, rows out, idempotent on re-poll. **Not yet against the live mailbox:** `GRAPH_CLIENT` stays `mock`, and flipping it to `real` is the first task of whatever comes next, not something to do without watching it.
+**Exit criteria:** ~~forwarding/receiving a real vendor email results in a correct, persisted `proposed_changes` row set, matched against sandbox PO data from Phase 1.~~ **MET 2026-09-14, against the live mailbox.** Not against the mock, and not by inspection — the evidence:
+
+| | |
+|---|---|
+| Messages polled | **7**, zero `poll_error` |
+| Shipments created | **4** |
+| Duplicate forwards short-circuited **before any model call** | **2** (`INGEST_SKIPPED_DUPLICATE` on `primary_attachment_sha`) |
+| Message with no attachments, retired from the queue | 1 |
+| `proposed_changes` | **118** |
+| `PENDING_REVIEW` carrying a real NetSuite line id | **10** |
+| PO numbers resolved | **5 of 5**, including a zero-padded `0001725` → `PO0001725` |
+| Ground truth reproduced exactly | **both** — Symmetry 25 keys / 1,669 units, Tainan ACT 28 / 865 |
+| Cost | $14.45 |
+
+The 108 `NEEDS_ATTENTION` are not matching failures: closed PO lines, Tainan's `REV` sheet correctly matching nothing, and the confidence flag §7 already records as inert. RUNBOOK §6 item 29 carries the full breakdown.
+
+### Item status at close
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Entra app, `Mail.Read`, shared mailbox, RBAC scope | **DONE** — scoping OBSERVED (403 on a second mailbox), not asserted |
+| 2 | Polling intake job | **DONE** — `graph_client.py`, `poller.py`, `extract_pending.py` |
+| 3 | Database and migrations | **DONE** — 12 tables, migrations 0001–0006 |
+| 4 | Parsing output → `PENDING_REVIEW` rows | **DONE** — and now proven on live mail rather than on files handed in |
+| 5 | Collection/search permission | **DONE** — `Reports > SuiteAnalytics Workbook` |
+| 6 | tranId transformation | **DONE** — and exercised end to end for the first time in this run |
+| 7 | Transport-mode recap rows | **DONE** — no assignment case arose in this mail, correctly |
+
+### What Phase 2 never anticipated and got built anyway
+
+The plan's item 2 was one sentence. These are the pieces it turned out to need, none of them a line item:
+
+- **A four-method Graph interface** (`list_messages` / `get_message` / `list_attachments` / `get_attachment`) as the entire Graph surface, enforced by an AST scan that fails on any HTTP verb but GET and verifies itself against a synthetic violating module.
+- **Two implementations** selected by `GRAPH_CLIENT` with no code change — a mock serving the five real vendors in realistic envelopes, and a certificate-auth real client.
+- **`scripts/probe_graph_auth.py`**, which found a missing certificate on its first run and converted mailbox scoping from asserted to observed.
+- **`config.GraphConfig`** — one `.env` loader, strict client selection with no default, and a certificate-pair check that catches "the cert uploaded to Entra is not this key's".
+- **A content-addressed attachment store**, filename = SHA-256 = the `attachments` primary key, so the store and the database agree by construction.
+- **The ingest → extraction seam.** `ingest_shipment` is unchanged; `extract_pending.py` re-runs extraction over stored rows without touching Graph, which is what makes a parser change cheap.
+- **Cost instrumentation** (migration 0006) — per shipment and per source document, after the first live run showed the figure was being computed and discarded.
+
+### Deferred by evidence, not by omission
+
+**Multi-shipment-per-email.** One email carrying several vendors' shipments produces one shipment; the others' lines are parsed as cross-checks and not proposed. That is visible on `shipment_sources` rows and priced per document, but not supported.
+
+**It is deferred because the live mail does not need it.** The only message mixing vendors was `2026-09-14 20:31:08`, subject **"Shipment updates"** — a seeded test message, the only one without a `Fw:` prefix and the only one predating the historical forwards. **Paula's five real forwards each carry exactly one vendor.** One shipment per email is what real vendor mail looks like, which is what `ingest_shipment` already assumes.
+
+Build it when a real multi-vendor email appears, not before — and when it does, the economics are already measured rather than guessed: a cross-check costs a full extraction, so proposing its lines is nearly free.
 
 ## Phase 3 — Review/approval + write-back (~4–6 days)
 

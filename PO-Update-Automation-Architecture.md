@@ -91,7 +91,7 @@ Computes proposed new Quantity, Expected Receipt Date, Override Expected Receipt
 
 **Review & approve**
 Human-in-the-loop step, permanent by design (per Paula's and Kiko's decision this session). Two viable implementations, roughly in order of build effort:
-- *Simplest*: an email digest with an approve/reject link per shipment (or per line), no custom UI to build.
+- *Simplest*: an email digest with an approve/reject link **per PO**, no custom UI to build. **The unit is per PO, not per shipment or per line** — PROPOSED and pending Paula's confirmation; reasoning in `PO-Update-Automation-Phase3-Requirements.md` §6, which also consolidates every other requirement this step has to satisfy.
 - *Small dashboard*: a lightweight internal web page (e.g., a single FastAPI + HTMX or Next.js page) listing pending shipments with a diff table and Approve/Reject/Edit buttons — closer to what the sample spreadsheet we generated this session (`Proposed_PO_Updates_SD-219.xlsx`) shows, but interactive and persistent instead of a one-off file.
 - **Decided by Paula (2026-08-10): receipt dates are never auto-proposed.** She determines Expected Receipt Date / Updated Receipt Date herself — "it's a receiving date and includes buffers," not the vendor's port ETA or any other vendor-stated date. This means the simple approve/reject-a-computed-value pattern **does not work for the date fields specifically**, even though it's fine for Quantity. The review step needs an input, not just a decision: show the vendor's raw ETD/ETA as reference only (clearly labeled as reference, not a proposal), and require Paula to type in the actual receipt date before the write-back can proceed. An email-link flow needs a lightweight form for this (even a simple "reply with the date" or a linked mini-form), not a bare Approve button, for any shipment carrying a date field. Quantity can still move through a plain approve/reject, since that value is decided by policy, not by Paula's judgment.
 
@@ -115,7 +115,7 @@ Confirms success/failure back to Paula (and optionally Kiko) — email or Teams 
 | NetSuite | SuiteTalk REST Web Services | Confirmed available on the account; standard REST API handles the sublist writes directly, no RESTlet needed (§6) |
 | LLM | Anthropic API (Claude) | Flexible-format extraction, human-readable change summaries |
 | Database | **Azure SQL Database, serverless compute tier** | See below |
-| Review UI | Email-approval for v1 (approve/reject link per shipment) | Keep v1 scope small; matches the HTTP-trigger design below |
+| Review UI | Email-approval for v1, **approve/reject per PO** — PROPOSED, pending Paula (see `PO-Update-Automation-Phase3-Requirements.md` §6) | Keeps v1 scope small and matches the HTTP-trigger design below. **Not per shipment:** one Inprotex sheet interleaves six POs, so a shipment-level click fires writes across unrelated orders (§6.2). Any PO carrying a date needs a form, not a bare Approve button (§4.1, §6.1) |
 
 #### Hosting & trigger decision
 

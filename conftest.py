@@ -32,6 +32,58 @@ def pytest_addoption(parser):
         default=False,
         help="also run tests that make real Anthropic API calls (costs tokens)",
     )
+    parser.addoption(
+        "--mssql",
+        action="store_true",
+        default=False,
+        help=(
+            "require this run to be against SQL Server rather than SQLite. Reads the "
+            "connection string from PO_AGENT_TEST_DB_URL and FAILS if it is unset -- "
+            "see dialect_target"
+        ),
+    )
+
+
+def pytest_configure(config):
+    """
+    `--mssql` asserts the dual-dialect run is real; it does not arrange one.
+
+    The connection string lives in `PO_AGENT_TEST_DB_URL` and nowhere else, so no
+    credential is ever written into this repo. The flag exists because the
+    environment variable ALONE has a silent failure mode: forget to set it and the
+    suite runs happily on SQLite and reports the same green, which is precisely
+    the run you did not want (RUNBOOK section 8 lesson 18). Passing `--mssql` turns
+    "I meant to test the production dialect" into something that can fail.
+    """
+    if not config.getoption("--mssql"):
+        return
+
+    import dialect_target as dt_target
+
+    if dt_target.is_sqlite():
+        raise pytest.UsageError(
+            "--mssql was passed but PO_AGENT_TEST_DB_URL is unset or points at SQLite, "
+            f"so this run would have used {dt_target.target_url()!r} and proved nothing "
+            "about the deployment dialect.\n"
+            "Set it first, e.g.\n"
+            "  set PO_AGENT_TEST_DB_URL=mssql+pyodbc://sa:<pw>@localhost:1433/po_agent_test"
+            "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes\n"
+            "See dialect_target's docstring for standing up a server."
+        )
+    # Fail here, once, rather than inside the first test that opens a connection --
+    # and as a UsageError, so pytest prints the message instead of an INTERNALERROR
+    # traceback that buries it.
+    try:
+        dt_target.connect().dispose()
+    except dt_target.TargetUnreachable as exc:
+        raise pytest.UsageError(str(exc)) from exc
+
+
+def pytest_report_header(config):
+    """Name the target at the top of every run, so a green run is attributable."""
+    import dialect_target as dt_target
+
+    return dt_target.describe()
 
 
 @pytest.fixture

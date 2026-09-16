@@ -57,6 +57,8 @@ from sqlalchemy import (
     event,
 )
 from sqlalchemy.engine import Engine
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.schema import CreateIndex
 
 # Stable, predictable constraint names -- required for Alembic batch mode on
 # SQLite, and it keeps autogenerate diffs from churning.
@@ -76,6 +78,21 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 
+#: The dialects `_partial()` knows how to spell a filtered index for. SQLite is
+#: the development database; MSSQL is Azure SQL, the deployment target. Adding a
+#: dialect here means adding its `<name>_where` kwarg below IN THE SAME EDIT --
+#: the guard exists precisely so that cannot be forgotten.
+PARTIAL_INDEX_DIALECTS = frozenset({"sqlite", "mssql"})
+
+
+class PartialIndexUnsupported(Exception):
+    """
+    Raised when a filtered index would be emitted as a FULL index.
+
+    See `_partial` for why this is an exception rather than a fallback.
+    """
+
+
 def _partial(predicate: str) -> dict:
     """
     A filtered unique index, spelled for both engines.
@@ -84,8 +101,70 @@ def _partial(predicate: str) -> dict:
     places the dialects genuinely differ (the other being NULL equality in unique
     indexes, which is why several of these predicates say `IS NOT NULL`), so it is
     worth having in one function rather than repeated at each call site.
+
+    ## Why this also carries `info`, and why a guard compiles off it
+
+    **SQLAlchemy accepts dialect-prefixed keyword arguments it does not
+    recognise, and silently ignores the ones that do not match the dialect being
+    compiled for.** That is the intended behaviour and it is usually what you
+    want. Here it is a trap: compile these indexes against PostgreSQL and every
+    `WHERE` clause disappears, with no error, no warning, and no failing test.
+    The index is still created -- as a FULL unique index, which is a different
+    and stricter constraint than the one written here.
+
+    What that costs is not theoretical. Without its predicate,
+    `ux_change_candidates_one_selected` becomes `UNIQUE(change_id)` and permits
+    one candidate row per change, when the whole point of `change_candidates` is
+    to hold SEVERAL for a human to choose between; and
+    `ux_proposed_changes_canonical_key` loses `WHERE key_size <> ''` and starts
+    rejecting the second sizeless row on a PO, which is real vendor data.
+
+    So `info["partial_predicate"]` marks these indexes, and the
+    `CreateIndex` compiler hook below **refuses to emit one on a dialect this
+    function has no predicate for**. The fix for a new dialect is to teach
+    `_partial` its spelling, not to let the index quietly widen.
+
+    Note the deliberate choice NOT to simply add `postgresql_where`. That would
+    fix this instance and leave the shape intact -- the next dialect, or the next
+    dialect-specific kwarg anywhere in this file, would fail the same silent way.
     """
-    return {"sqlite_where": text_clause(predicate), "mssql_where": predicate}
+    return {
+        "sqlite_where": text_clause(predicate),
+        "mssql_where": predicate,
+        # Read by _refuse_silent_full_index. The predicate is kept as text so the
+        # error can quote what WOULD have been lost.
+        "info": {"partial_predicate": predicate},
+    }
+
+
+@compiles(CreateIndex)
+def _refuse_silent_full_index(element, compiler, **kw):
+    """
+    Refuse to compile a filtered index on a dialect that would drop the filter.
+
+    Registered for EVERY dialect and delegating to the normal compiler in the
+    supported cases, so the check cannot be bypassed by reaching for a dialect
+    nobody thought about. An unfiltered index compiles exactly as before; only
+    one carrying `info["partial_predicate"]` is inspected.
+    """
+    index = element.element
+    predicate = (index.info or {}).get("partial_predicate")
+    dialect = compiler.dialect.name
+    if predicate and dialect not in PARTIAL_INDEX_DIALECTS:
+        raise PartialIndexUnsupported(
+            f"Index {index.name!r} is a FILTERED index (WHERE {predicate}), and the "
+            f"{dialect!r} dialect has no predicate spelled for it in schema._partial. "
+            f"SQLAlchemy would ignore the dialect kwargs it does not recognise and emit "
+            f"a FULL unique index instead -- silently, and enforcing something stricter "
+            f"than what was written. Refusing.\n"
+            f"Supported dialects: {', '.join(sorted(PARTIAL_INDEX_DIALECTS))}. "
+            f"If {dialect!r} is genuinely a target, teach _partial its `<dialect>_where` "
+            f"spelling and add it to PARTIAL_INDEX_DIALECTS in the same edit -- and check "
+            f"the predicate's own syntax while you are there, since "
+            f"`selected = 1` is valid on sqlite and mssql and a type error on a dialect "
+            f"with a real boolean."
+        )
+    return compiler.visit_create_index(element, **kw)
 
 
 def text_clause(predicate: str):

@@ -1,0 +1,26 @@
+# Development and verification tooling.
+#
+# None of this ships with the pipeline -- it exists so that Claude Code can
+# check its own work instead of handing unverified output back to you.
+#
+# Install:
+#     .venv\Scripts\python -m pip install -r requirements-dev.txt
+#
+# Without pytest installed, the ~7,400 lines of test files in this repo
+# cannot run at all, and the Stop hook has nothing to verify against.
+
+-r requirements.txt
+
+pytest>=8.3                # the test suite this repo already has
+pytest-timeout>=2.3        # stops a hung NetSuite/Graph call wedging a run
+ruff>=0.14                 # fast lint; replaces flake8/isort/pyflakes
+
+# The dual-dialect run (PO_AGENT_TEST_DB_URL / pytest --mssql). SQLite stays the
+# fast loop; this is what lets the same suites run against the DEPLOYMENT dialect,
+# because offline DDL compilation says nothing about collation, isolation levels
+# or deadlocks. See dialect_target.py.
+#
+# NOTE: pyodbc is a wrapper. It also needs Microsoft's ODBC Driver 18 for SQL
+# Server installed on the machine -- pip cannot supply that, and its absence
+# shows up as a connect-time error rather than an import error.
+pyodbc>=5.1

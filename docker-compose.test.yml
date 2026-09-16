@@ -1,0 +1,34 @@
+# A real SQL Server for the dual-dialect test run.
+#
+#   set MSSQL_SA_PASSWORD=<something long enough>
+#   docker compose -f docker-compose.test.yml up -d
+#   set PO_AGENT_TEST_DB_URL=mssql+pyodbc://sa:%MSSQL_SA_PASSWORD%@localhost:11433/po_agent_test?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes
+#   .venv\Scripts\python -m pytest -q --mssql
+#
+# Why this exists: Azure SQL is the deployment target and SQLite is the
+# development database. Compiling DDL offline proves they agree about generating
+# statements; it says nothing about running them. This is the cheapest way to run
+# the real dialect without provisioning anything in Azure or involving IT.
+#
+# The password is read from the environment and is NOT stored here. SQL Server
+# rejects weak ones, so use something long.
+#
+# Port 11433, not 1433, so this cannot collide with a real local SQL Server.
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: po-agent-test-sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD before starting}
+      MSSQL_PID: Developer
+    ports:
+      - "11433:1433"
+    healthcheck:
+      # The container reports healthy only once it accepts a login, so
+      # `up --wait` does not return before the suite could connect.
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s

@@ -23,6 +23,7 @@ from pathlib import Path
 from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError
 
+import dialect_target as dt_target
 import schema as sc
 from schema import (
     attachments,
@@ -73,28 +74,14 @@ def section(title: str) -> None:
 
 
 def fresh_db():
-    """A schema built from the metadata, with the state machine and views in place."""
-    engine = sc.connect("sqlite://")  # in-memory
-    sc.metadata.create_all(engine)
-    with engine.begin() as conn:
-        conn.execute(
-            change_states.insert(),
-            [
-                {"state": s, "is_terminal": t, "description": d}
-                for s, t, d in sc.CHANGE_STATES
-            ],
-        )
-        conn.execute(
-            change_state_transitions.insert(),
-            [
-                {"from_state": f, "to_state": t, "trigger": g, "actor_kind": a}
-                for f, t, g, a in sc.CHANGE_STATE_TRANSITIONS
-            ],
-        )
-        for _name, ddl in sc.VIEWS:
-            conn.execute(text(ddl))
-    return engine
+    """
+    A schema built from the metadata, with the state machine and views in place.
 
+    Delegates to `dialect_target`, so `PO_AGENT_TEST_DB_URL` (or pytest's
+    `--mssql`) moves every test in this file onto a real SQL Server without
+    changing a line here. Default is unchanged: SQLite in memory.
+    """
+    return dt_target.fresh_engine()
 
 def mk_message(conn, graph_id="AAMkAGI1", **kw):
     row = {
@@ -237,10 +224,11 @@ def test_migration_seed_matches_schema() -> None:
         db = Path(td) / "seed.db"
         cfg = Config(str(HERE / "alembic.ini"))
         cfg.set_main_option("script_location", str(HERE / "migrations"))
-        cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db.as_posix()}")
+        seed_url = dt_target.migration_url(db)
+        cfg.set_main_option("sqlalchemy.url", seed_url)
         command.upgrade(cfg, "head")
 
-        engine = sc.connect(f"sqlite:///{db.as_posix()}")
+        engine = sc.connect(seed_url)
         with engine.connect() as conn:
             in_db_states = {
                 (r[0], bool(r[1]), r[2])
@@ -352,12 +340,17 @@ def test_migration_round_trip() -> None:
         db = Path(td) / "roundtrip.db"
         config = Config(str(HERE / "alembic.ini"))
         config.set_main_option("script_location", str(HERE / "migrations"))
-        config.set_main_option("sqlalchemy.url", f"sqlite:///{db.as_posix()}")
+        # On a server this runs the migrations against the PRODUCTION dialect --
+        # batch mode, the view drop/recreate dance and every constraint rename
+        # live only in migrations and never in metadata.create_all.
+        url = dt_target.migration_url(db)
+        config.set_main_option("sqlalchemy.url", url)
 
         command.upgrade(config, "head")
-        check(db.exists(), "upgrade head builds the database")
+        check(db.exists() or not dt_target.is_sqlite(),
+              "upgrade head builds the database", dt_target.dialect_name())
 
-        engine = sc.connect(f"sqlite:///{db.as_posix()}")
+        engine = sc.connect(url)
         names = set(inspect(engine).get_table_names())
         expected = {t.name for t in sc.metadata.sorted_tables}
         check(expected <= names, "every table in the metadata exists",
@@ -384,7 +377,7 @@ def test_migration_round_trip() -> None:
             check(False, "alembic check: no drift", str(exc)[:120])
 
         command.downgrade(config, "base")
-        engine = sc.connect(f"sqlite:///{db.as_posix()}")
+        engine = sc.connect(url)
         left = set(inspect(engine).get_table_names()) - {"alembic_version"}
         views_left = set(inspect(engine).get_view_names())
         engine.dispose()
@@ -392,7 +385,7 @@ def test_migration_round_trip() -> None:
         check(not views_left, "and both views", str(sorted(views_left)))
 
         command.upgrade(config, "head")
-        engine = sc.connect(f"sqlite:///{db.as_posix()}")
+        engine = sc.connect(url)
         check(expected <= set(inspect(engine).get_table_names()),
               "and it rebuilds cleanly -- the round trip is safe to rely on")
         engine.dispose()
@@ -1103,6 +1096,98 @@ def test_foreign_keys_are_enforced() -> None:
         )
 
 
+
+def test_partial_indexes_refuse_unsupported_dialects() -> None:
+    section("a filtered index must never quietly become a FULL unique index")
+    from sqlalchemy.dialects import mssql, mysql, oracle, postgresql, sqlite
+    from sqlalchemy.schema import CreateIndex
+
+    indexes = {i.name: i for t in sc.metadata.tables.values() for i in t.indexes}
+    partial = {n: i for n, i in indexes.items()
+               if (i.info or {}).get("partial_predicate")}
+    plain = {n: i for n, i in indexes.items()
+             if not (i.info or {}).get("partial_predicate")}
+
+    check(len(partial) == 4, "four filtered indexes carry a predicate",
+          str(sorted(partial)))
+    check(len(plain) >= 1, "and the plain indexes are marked differently",
+          str(len(plain)))
+
+    # The two supported dialects must still emit the WHERE. Without this half the
+    # guard could "pass" by refusing everything everywhere.
+    for label, dialect in (("sqlite", sqlite.dialect()), ("mssql", mssql.dialect())):
+        emitted = []
+        for name, index in partial.items():
+            sql = str(CreateIndex(index).compile(dialect=dialect))
+            if "WHERE" in sql.upper():
+                emitted.append(name)
+        check(len(emitted) == len(partial),
+              f"{label}: every filtered index still compiles WITH its WHERE",
+              f"{len(emitted)}/{len(partial)}")
+
+    # And the unsupported ones must RAISE rather than silently widen. postgresql
+    # is the one that matters -- it is the reflexive default, and it is exactly
+    # where the predicate used to vanish.
+    for label, dialect in (("postgresql", postgresql.dialect()),
+                           ("mysql", mysql.dialect()),
+                           ("oracle", oracle.dialect())):
+        refused = []
+        widened = []
+        for name, index in partial.items():
+            try:
+                sql = str(CreateIndex(index).compile(dialect=dialect))
+            except sc.PartialIndexUnsupported:
+                refused.append(name)
+            else:
+                if "WHERE" not in sql.upper():
+                    widened.append(name)
+        check(not widened,
+              f"{label}: NO filtered index compiles to a full unique index",
+              str(widened or "none"))
+        check(len(refused) == len(partial),
+              f"{label}: all {len(partial)} raise PartialIndexUnsupported instead",
+              f"{len(refused)}/{len(partial)}")
+
+    # The error has to be actionable: which index, which dialect, and what was
+    # about to be lost. A bare "unsupported" would send someone hunting.
+    try:
+        CreateIndex(partial["ux_change_candidates_one_selected"]).compile(
+            dialect=postgresql.dialect())
+    except sc.PartialIndexUnsupported as exc:
+        text_ = str(exc)
+        check("ux_change_candidates_one_selected" in text_,
+              "the error names the index", text_[:80])
+        check("postgresql" in text_, "and the dialect that could not spell it")
+        check("selected = 1" in text_,
+              "and quotes the predicate that would have been dropped")
+        check("PARTIAL_INDEX_DIALECTS" in text_,
+              "and says what to change to support the dialect properly")
+    else:
+        check(False, "compiling that index on postgresql raised at all")
+
+    # The guard is registered for EVERY dialect but must only inspect filtered
+    # indexes -- an ordinary index has to keep compiling anywhere.
+    unaffected = []
+    for name, index in plain.items():
+        try:
+            str(CreateIndex(index).compile(dialect=postgresql.dialect()))
+            unaffected.append(name)
+        except Exception:  # noqa: BLE001 -- any failure here is the finding
+            pass
+    check(len(unaffected) == len(plain),
+          "ordinary indexes are untouched by the guard on an unsupported dialect",
+          f"{len(unaffected)}/{len(plain)}")
+
+    # WHY THIS TEST EXISTS, stated where it will be read: SQLAlchemy accepts
+    # dialect-prefixed kwargs it does not recognise and ignores the ones that do
+    # not apply. `sqlite_where` and `mssql_where` are therefore invisible to
+    # postgresql -- it emitted a FULL unique index, with no error and nothing
+    # failing. `ux_change_candidates_one_selected` without its predicate is
+    # UNIQUE(change_id), which permits ONE candidate row per change, when the
+    # entire purpose of change_candidates is to hold several for a human to
+    # choose between.
+    check(True, "(the silent-widening failure is now unrepresentable)")
+
 def main() -> int:
     print("=" * 78)
     print("SCHEMA TESTS -- migration 0001")
@@ -1129,6 +1214,7 @@ def main() -> int:
         test_migrations_import_no_application_code,
         test_scope_boundaries_in_the_schema,
         test_foreign_keys_are_enforced,
+        test_partial_indexes_refuse_unsupported_dialects,
     )
 
     # A test registered twice runs twice and its checks are counted twice. That

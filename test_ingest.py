@@ -19,6 +19,7 @@ from pathlib import Path
 
 from sqlalchemy import func, select, text
 
+import dialect_target as dt_target
 import ingest as ing
 import schema as sc
 from extraction_schema import ParseResult
@@ -53,18 +54,13 @@ def section(title: str) -> None:
 
 
 def fresh_db():
-    engine = sc.connect("sqlite://")
-    sc.metadata.create_all(engine)
-    with engine.begin() as conn:
-        conn.execute(sc.change_states.insert(), [
-            {"state": s, "is_terminal": t, "description": d} for s, t, d in sc.CHANGE_STATES])
-        conn.execute(sc.change_state_transitions.insert(), [
-            {"from_state": f, "to_state": t, "trigger": g, "actor_kind": a}
-            for f, t, g, a in sc.CHANGE_STATE_TRANSITIONS])
-        for _name, ddl in sc.VIEWS:
-            conn.execute(text(ddl))
-    return engine
+    """
+    A built, seeded schema on whichever target is configured.
 
+    SQLite in memory by default; `PO_AGENT_TEST_DB_URL` or `--mssql` points the
+    whole file at SQL Server instead. See `dialect_target`.
+    """
+    return dt_target.fresh_engine()
 
 def counts(engine) -> dict:
     tables = {"messages": messages, "attachments": attachments,

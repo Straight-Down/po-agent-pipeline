@@ -278,4 +278,12 @@ not as history - a rule without its failure mode gets rationalised away.
   errors; the base comes from `proposed_changes` in `WRITTEN` state joined to
   a SUCCESSFUL `write_attempts` row. NetSuite's value is a consistency check
   only — where it disagrees, propose nothing and flag with both numbers.
+- **Never backfill `write_attempts` to quiet the PRE_EXISTING_RECEIPT wave.**
+  Writing "we wrote N" for a quantity this tool did not write fabricates the
+  base every later accumulation on that line is computed from - wrong forever,
+  compounding, and indistinguishable from a real write afterwards.
+- **SuiteQL's `transactionLine` has no `isopen`, and `isclosed = 'F'` is NOT a
+  substitute.** It counts every settled line ever received against; it
+  overstated one real count by 56x. Narrow with SuiteQL, then confirm through
+  `POLine.is_open` - the field the matcher actually branches on.
 - <add the next one here>

@@ -397,7 +397,7 @@ line.
 | Line matches what our record says we wrote | `ACCUMULATED` — propose base + this slip |
 | Line differs from what we wrote | `DISPUTED` — **nothing proposed**, both numbers to Paula |
 | No history, nothing received | `FIRST_SHIPMENT` — base zero, propose the slip |
-| No history, but goods already received | `DISPUTED` — a shipment reached the line we never saw |
+| No history, but goods already received | `PRE_EXISTING_RECEIPT` — confirm the total once |
 | Seen before, never written, line has moved since | `DISPUTED` — edited outside the tool |
 
 **The tool does not reconcile.** Picking one source as authoritative is exactly the judgement that
@@ -423,12 +423,31 @@ difference between "first shipment of 228" and "128 already written plus 100 mor
 the reviewer is being asked to approve. Same reasoning as the colour columns in 0002 and the size
 axes in 0003.
 
-**Rollout expectation, not a defect.** Every in-flight PO line that already carries a partial
-receipt from before this tool existed will land as `DISPUTED` the first time a slip touches it,
-because the tool has no record of what put that quantity there. On the first live run after
-2026-09-16 that arrives as a batch of `NEEDS_ATTENTION` and will read as a regression. Either accept
-it or do a one-time audited backfill — but the branch does not get silenced, because it is the only
-thing between a pre-existing receipt and a silent under-write.
+### The day-one case is separate from the alarming one
+
+`PRE_EXISTING_RECEIPT` is **not** a dispute. Nothing contradicts anything: the line simply has no
+history and already carries receipts from before this tool existed. It asks *"this line had N units
+received before the tool started tracking it; confirm the total"*, and it **retires itself** — the
+confirmation becomes history, so the next slip on that line is an ordinary `ACCUMULATED`.
+
+`DISPUTED` is reserved for a genuine contradiction and should never be routine. **They cannot share
+a label:** `PRE_EXISTING_RECEIPT` is guaranteed to arrive in a batch on first contact, and a
+predictable wave wearing the alarm word teaches a reviewer to skim the alarm word. The case she
+would skim past is the one that means someone changed something behind the tool. This project has
+already watched that happen once — §5 above is the same failure in the confidence flag.
+
+**The wave is 426 open PO lines across 33 POs** (sandbox, 2026-09-16,
+`scripts/estimate_pre_existing_receipts.py`). A ceiling, not a forecast: only the part of it that
+actually ships asks anything, and each asks once. Re-run against production before cutover.
+
+**Do not backfill `write_attempts` to suppress it.** Writing "this tool wrote N" for a quantity it
+did not write fabricates the record that every later accumulation on that line is computed from —
+one invented base is wrong forever, compounds with each shipment, and is indistinguishable
+afterwards from a real write. 426 one-time questions is the cheaper price.
+
+**For the screen:** these two need visibly different treatment. A `PRE_EXISTING_RECEIPT` row is a
+confirmation prompt; a `DISPUTED` row is an alarm. They share a state (`NEEDS_ATTENTION`) and are
+told apart only by `accumulation_basis`.
 
 **For the screen:** show the basis. An `ACCUMULATED` row is the one case where the proposed quantity
 is not a number printed on any document, and a reviewer who does not know that will read `228`

@@ -567,6 +567,22 @@ proposed_changes = Table(
     Column("current_quantity", Numeric(12, 3)),
     Column("current_quantity_received", Numeric(12, 3)),
     Column("proposed_quantity", Numeric(12, 3)),
+    # -- HOW that proposed quantity was arrived at (migration 0007). Slips
+    # -- ACCUMULATE: a second shipment's quantity adds to what was written for the
+    # -- first, because the vendor's slip shows only the new shipment (Paula,
+    # -- 2026-09-16). So `proposed_quantity` is a TOTAL, and on its own it does not
+    # -- say what it was a total OF.
+    # --   FIRST_SHIPMENT  nothing written before; base 0, proposal = this slip
+    # --   ACCUMULATED     base = what this tool last wrote, + this slip
+    # --   DISPUTED        NetSuite disagrees with our record of what we wrote, or
+    # --                   goods reached a line we have no record of. NOTHING is
+    # --                   proposed; `attention_reason` carries both numbers.
+    # -- The base is this tool's OWN audit trail, never NetSuite's current
+    # -- quantity -- that is a field this tool writes, and feeding it back in would
+    # -- let past output decide future output (lesson 13). See
+    # -- `matcher._accumulated_quantity`.
+    Column("accumulation_basis", String(16)),
+    Column("accumulation_base_quantity", Numeric(12, 3)),
     # -- NetSuite's date state at proposal time, for display beside the reference dates
     Column("current_expected_receipt_date", Date),
     Column("current_updated_receipt_date", Date),
@@ -662,6 +678,20 @@ proposed_changes = Table(
     CheckConstraint(
         "quantity_write_status = 'NONE' OR approved_quantity IS NOT NULL",
         name="quantity_scope_needs_quantity",
+    ),
+    CheckConstraint(
+        "accumulation_basis IS NULL OR accumulation_basis IN "
+        "('FIRST_SHIPMENT','ACCUMULATED','DISPUTED')",
+        name="accumulation_basis",
+    ),
+    # Same principle as the colour and size provenance constraints: a claim that
+    # a quantity was accumulated is not auditable unless the row also says what it
+    # was accumulated ONTO. Without the base, `proposed_quantity` is a total whose
+    # parts cannot be recovered -- and the parts are the whole question when a
+    # reviewer asks why a slip saying 100 proposed 228.
+    CheckConstraint(
+        "accumulation_basis <> 'ACCUMULATED' OR accumulation_base_quantity IS NOT NULL",
+        name="accumulation_needs_base",
     ),
 )
 
@@ -849,6 +879,8 @@ SELECT pc.id                        AS change_id,
        pc.current_quantity_received AS current_quantity_received,
        pc.proposed_quantity         AS proposed_quantity,
        pc.current_quantity - COALESCE(pc.current_quantity_received, 0) AS outstanding,
+       pc.accumulation_basis        AS accumulation_basis,
+       pc.accumulation_base_quantity AS accumulation_base_quantity,
        pc.colour_resolution_method  AS colour_resolution_method,
        pc.colour_resolved_code      AS colour_resolved_code,
        pc.colour_resolved_name      AS colour_resolved_name,

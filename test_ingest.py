@@ -12,6 +12,7 @@ the persistence contract, which is the part that must not drift.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import tempfile
 import traceback
 from pathlib import Path
@@ -32,6 +33,7 @@ from schema import (
     shipment_pos,
     shipment_sources,
     shipments,
+    write_attempts,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -1168,6 +1170,235 @@ def test_gaps_are_reported_not_defaulted() -> None:
           str(ship.extractor_prompt_version))
 
 
+
+# ---------------------------------------------------------------------------
+# Multi-batch accumulation (Paula, 2026-09-16)
+# ---------------------------------------------------------------------------
+
+
+def _ship(engine, *, po, slip_lines, ns_lines, graph_id, now=NOW):
+    """One full ingest. Distinct bytes per call, or the re-forward dedup fires."""
+    with tempfile.TemporaryDirectory() as td:
+        docs = make_docs(Path(td), (f"packing-{graph_id}.xlsx",), payload=graph_id.encode())
+        classification = FakeClassification(
+            selected=[FakeClassification.Item(docs[0], "packing_list")])
+        parsed = ParseResult(lines=slip_lines, parser="claude", vendor_name="Inprotex")
+        client = NetSuiteClient(mock_data={po: ns_lines})
+        monkey = {}
+        install_stub_parse(monkey, parsed, classification)
+        try:
+            return ing.ingest_shipment(
+                engine, docs, message=msg(graph_id=graph_id), client=client, now=now)
+        finally:
+            restore(monkey)
+
+
+def _only_change(engine, shipment_id):
+    with engine.connect() as conn:
+        return conn.execute(select(proposed_changes)
+                            .where(proposed_changes.c.shipment_id == shipment_id)).one()
+
+
+def _record_write(engine, change, quantity, when, *,
+                  state=sc.STATE_WRITTEN, write_status="WRITTEN", outcome="SUCCESS"):
+    """Mark a change written the way the write path will, attempt row and all."""
+    with engine.begin() as conn:
+        conn.execute(proposed_changes.update()
+                     .where(proposed_changes.c.id == change.id)
+                     .values(state=state, approved_quantity=quantity,
+                             quantity_approved_by="paula@straightdown.com",
+                             quantity_approved_at=when, quantity_write_status=write_status,
+                             updated_at=when))
+        conn.execute(write_attempts.insert(), {
+            "id": sc.new_id(), "change_id": change.id, "scope": "QUANTITY",
+            "attempt_no": 1, "ns_internal_id": "8489541",
+            "ns_line_id": change.ns_line_id,
+            "payload_json": json.dumps({"quantity": quantity}),
+            "idempotency_key": f"{change.id}:QUANTITY:1", "outcome": outcome,
+            "http_status": 200 if outcome == "SUCCESS" else 400,
+            "error_kind": None if outcome == "SUCCESS" else "TRANSIENT",
+            "attempted_at": when,
+        })
+
+
+def test_first_shipment_proposes_the_slip() -> None:
+    section("first shipment against an untouched line: the base is zero")
+    engine = fresh_db()
+    report = _ship(engine, po="1662", graph_id="AAMk-batch-1",
+                   slip_lines=[line(qty=128)],
+                   ns_lines=[ns_line("18", qty=300, recv=0.0)])
+    change = _only_change(engine, report.shipment_id)
+
+    check(float(change.proposed_quantity) == 128.0,
+          "proposes the slip's own figure, 128", str(change.proposed_quantity))
+    check(change.accumulation_basis == "FIRST_SHIPMENT",
+          "basis recorded as FIRST_SHIPMENT", str(change.accumulation_basis))
+    check(float(change.accumulation_base_quantity) == 0.0,
+          "on a base of zero -- nothing was written before",
+          str(change.accumulation_base_quantity))
+    check(change.state == sc.STATE_PENDING_REVIEW,
+          "and it is an ordinary PENDING_REVIEW", change.state)
+    check(float(change.current_quantity) == 300.0,
+          "the ORDERED 300 is still recorded as NetSuite's current value, untouched "
+          "by the accumulation", str(change.current_quantity))
+
+
+def test_second_shipment_accumulates() -> None:
+    section("second shipment over a WRITTEN first: 128 + 100 = 228, not 100")
+    engine = fresh_db()
+
+    first = _ship(engine, po="1662", graph_id="AAMk-batch-1",
+                  slip_lines=[line(qty=128)],
+                  ns_lines=[ns_line("18", qty=300, recv=0.0)])
+    change_1 = _only_change(engine, first.shipment_id)
+    _record_write(engine, change_1, 128, dt.datetime(2026, 9, 1, 10, 0, 0))
+
+    # NetSuite now holds what we wrote, and the goods have arrived.
+    second = _ship(engine, po="1662", graph_id="AAMk-batch-2",
+                   slip_lines=[line(qty=100)],
+                   ns_lines=[ns_line("18", qty=128, recv=128.0)],
+                   now=dt.datetime(2026, 9, 16, 9, 0, 0))
+    change_2 = _only_change(engine, second.shipment_id)
+
+    check(float(change_2.proposed_quantity) == 228.0,
+          "proposes 228 -- the written 128 plus this slip's 100",
+          str(change_2.proposed_quantity))
+    check(float(change_2.proposed_quantity) != 100.0,
+          "NOT 100, which is what replace semantics wrote and how 28 units went missing")
+    check(change_2.accumulation_basis == "ACCUMULATED",
+          "basis ACCUMULATED", str(change_2.accumulation_basis))
+    check(float(change_2.accumulation_base_quantity) == 128.0,
+          "and the base it added to is recorded, so 228 is legible from the row alone",
+          str(change_2.accumulation_base_quantity))
+    check(change_2.src_quantity_text == "100",
+          "the slip's own figure is still preserved verbatim", str(change_2.src_quantity_text))
+    check(change_2.state == sc.STATE_PENDING_REVIEW,
+          "an ordinary proposal -- accumulating is not an exception", change_2.state)
+
+    # Provenance: the base came from OUR record of the first write, not off the
+    # line. Both read 128 here, so only the citation distinguishes them.
+    hist = ing._line_history(engine, ["1662"])[("1662", "18")]
+    check(hist.written_quantity == 128.0,
+          "the history reports what we wrote", str(hist.written_quantity))
+    check(hist.written_change_id == change_1.id,
+          "citing the change that wrote it", str(hist.written_change_id))
+    check(hist.write_count == 1, "one successful write behind that total", str(hist.write_count))
+
+
+def test_netsuite_disagreeing_with_our_record_is_flagged() -> None:
+    section("NetSuite disagrees with what we wrote: flag, do NOT compute")
+    engine = fresh_db()
+
+    first = _ship(engine, po="1662", graph_id="AAMk-batch-1",
+                  slip_lines=[line(qty=128)],
+                  ns_lines=[ns_line("18", qty=300, recv=0.0)])
+    change_1 = _only_change(engine, first.shipment_id)
+    _record_write(engine, change_1, 128, dt.datetime(2026, 9, 1, 10, 0, 0))
+
+    # Someone edited the line to 150 outside the tool.
+    second = _ship(engine, po="1662", graph_id="AAMk-batch-2",
+                   slip_lines=[line(qty=100)],
+                   ns_lines=[ns_line("18", qty=150, recv=0.0)],
+                   now=dt.datetime(2026, 9, 16, 9, 0, 0))
+    change_2 = _only_change(engine, second.shipment_id)
+
+    check(change_2.proposed_quantity is None,
+          "NOTHING is proposed -- the tool refuses to compute on a base it cannot "
+          "vouch for", str(change_2.proposed_quantity))
+    check(change_2.accumulation_basis == "DISPUTED",
+          "basis DISPUTED", str(change_2.accumulation_basis))
+    check(change_2.state == sc.STATE_NEEDS_ATTENTION, "and it goes to Paula", change_2.state)
+
+    reason = change_2.attention_reason or ""
+    check("150" in reason, "the reason carries NetSuite's number", reason[:100])
+    check("128" in reason, "and what this tool believes it wrote", reason[:100])
+    check(change_1.id in reason,
+          "citing the change that wrote it, not just the figure")
+    check("100" in reason,
+          "and the slip's quantity, which is not lost -- only unapplied")
+
+    # THIS is the check that separates the two implementations. An engine basing
+    # accumulation on NetSuite's current quantity would return 250 here and look
+    # entirely reasonable; one basing it on its own record cannot, because the two
+    # sources disagree and that disagreement IS the signal.
+    check(change_2.proposed_quantity != 250,
+          "and specifically NOT 150 + 100 = 250, which is what reading the base back "
+          "out of NetSuite would have produced")
+
+
+def test_untracked_line_with_receipts_is_flagged() -> None:
+    section("no history, but goods already arrived: flag rather than start from zero")
+    engine = fresh_db()
+    report = _ship(engine, po="1662", graph_id="AAMk-batch-2",
+                   slip_lines=[line(qty=100)],
+                   ns_lines=[ns_line("18", qty=300, recv=128.0)])
+    change = _only_change(engine, report.shipment_id)
+
+    check(change.proposed_quantity is None, "nothing proposed",
+          str(change.proposed_quantity))
+    check(change.accumulation_basis == "DISPUTED",
+          "basis DISPUTED -- a shipment reached this line that the tool never saw",
+          str(change.accumulation_basis))
+    check(change.state == sc.STATE_NEEDS_ATTENTION, "flagged for Paula", change.state)
+    reason = change.attention_reason or ""
+    check("128" in reason, "the reason states what was already received", reason[:100])
+    check("no record" in reason.lower(),
+          "and says plainly that the tool has no record of it", reason[:100])
+    check("vendor line has no quantity" not in reason,
+          "and does NOT blame the document -- the slip stated 100 perfectly clearly",
+          reason[:100])
+
+
+def test_unwritten_proposals_do_not_move_the_base() -> None:
+    section("rejected, pending and failed proposals contribute NOTHING to the base")
+    cases = (
+        ("never approved", sc.STATE_PENDING_REVIEW, None, None),
+        ("rejected outright", sc.STATE_DISCARDED, None, None),
+        ("approved but the write FAILED", sc.STATE_WRITE_FAILED, "FAILED", "FAILED"),
+    )
+    for label, state, write_status, outcome in cases:
+        engine = fresh_db()
+        first = _ship(engine, po="1662", graph_id="AAMk-batch-1",
+                      slip_lines=[line(qty=128)],
+                      ns_lines=[ns_line("18", qty=300, recv=0.0)])
+        change_1 = _only_change(engine, first.shipment_id)
+        if write_status:
+            _record_write(engine, change_1, 128, dt.datetime(2026, 9, 1, 10, 0, 0),
+                          state=state, write_status=write_status, outcome=outcome)
+        elif state != sc.STATE_PENDING_REVIEW:
+            with engine.begin() as conn:
+                conn.execute(proposed_changes.update()
+                             .where(proposed_changes.c.id == change_1.id)
+                             .values(state=state, human_verdict="REJECTED",
+                                     verdict_by="paula@straightdown.com", verdict_at=NOW))
+
+        # The line still holds 300: nothing was ever written to it.
+        second = _ship(engine, po="1662", graph_id="AAMk-batch-2",
+                       slip_lines=[line(qty=100)],
+                       ns_lines=[ns_line("18", qty=300, recv=0.0)],
+                       now=dt.datetime(2026, 9, 16, 9, 0, 0))
+        change_2 = _only_change(engine, second.shipment_id)
+
+        check(change_2.accumulation_basis == "FIRST_SHIPMENT",
+              f"{label}: still a FIRST_SHIPMENT", str(change_2.accumulation_basis))
+        check(float(change_2.accumulation_base_quantity) == 0.0,
+              f"{label}: the base stays zero", str(change_2.accumulation_base_quantity))
+        check(float(change_2.proposed_quantity) == 100.0,
+              f"{label}: proposes the slip alone, 100", str(change_2.proposed_quantity))
+        check(float(change_2.proposed_quantity) != 228.0,
+              f"{label}: NOT 228 -- an unwritten proposal changed nothing")
+        check(float(change_2.proposed_quantity) != 400.0,
+              f"{label}: and NOT 300 + 100, which is NetSuite's ordered quantity used "
+              "as a base")
+
+        hist = ing._line_history(engine, ["1662"])[("1662", "18")]
+        check(hist.written_quantity is None,
+              f"{label}: the history records no write", str(hist.written_quantity))
+        check(hist.observed_quantity == 300.0,
+              f"{label}: but DOES remember seeing the line at 300, which is how an "
+              "edit made later would still be caught", str(hist.observed_quantity))
+
+
 def main() -> int:
     print("=" * 78)
     print("INGEST TESTS -- parser output -> database rows")
@@ -1189,6 +1420,11 @@ def main() -> int:
         test_tranid_resolution,
         test_scope_boundaries,
         test_gaps_are_reported_not_defaulted,
+        test_first_shipment_proposes_the_slip,
+        test_second_shipment_accumulates,
+        test_netsuite_disagreeing_with_our_record_is_flagged,
+        test_untracked_line_with_receipts_is_flagged,
+        test_unwritten_proposals_do_not_move_the_base,
     )
 
     # A test registered twice runs twice and its checks are counted twice. That

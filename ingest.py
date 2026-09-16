@@ -66,6 +66,7 @@ from schema import (
     shipment_pos,
     shipment_sources,
     shipments,
+    write_attempts,
 )
 
 logger = logging.getLogger(__name__)
@@ -460,6 +461,11 @@ def _change_row(change: mt.ProposedChange, line: dict, shipment_id, po_id, sha, 
         "current_quantity": balance.get("line_quantity"),
         "current_quantity_received": balance.get("quantity_received"),
         "proposed_quantity": change.proposed_quantity,
+        # How that total was arrived at. Written because `proposed_quantity` is
+        # now a TOTAL and does not say what it is a total of -- 228 on a row whose
+        # slip printed 100 is unreadable without the base.
+        "accumulation_basis": (change.accumulation or {}).get("basis"),
+        "accumulation_base_quantity": (change.accumulation or {}).get("base_quantity"),
         # NetSuite's date state at proposal time, for display beside the references
         "current_expected_receipt_date": _as_date(change.current_expected_receipt_date),
         "current_updated_receipt_date": _as_date(change.current_updated_receipt_date),
@@ -495,6 +501,116 @@ def _change_row(change: mt.ProposedChange, line: dict, shipment_id, po_id, sha, 
 
 def _as_date(value: Optional[str]) -> Optional[dt.date]:
     return dt.date.fromisoformat(value) if value else None
+
+
+def _line_history(engine, po_keys: Sequence[str]) -> dict:
+    """
+    What this tool's OWN record says about every line on these POs.
+
+    Returns `{(po_number_key, ns_line_id): matcher.LineHistory}`, which
+    `build_proposed_changes` uses as the base for accumulation (Paula, 2026-09-16:
+    a second slip adds to the first rather than replacing it).
+
+    **Read from this database, deliberately, and never from NetSuite.** The
+    obvious base for "previous total plus this shipment" is the line's current
+    NetSuite quantity, and it is wrong: that is a field this tool writes, so using
+    it would let the tool's own past output decide its next output, compounding
+    any error instead of correcting it (RUNBOOK section 8 lesson 13). The full
+    argument is in `matcher._accumulated_quantity`; this function is the half that
+    supplies the uncontaminated number.
+
+    Two queries because they answer two different questions:
+
+    - **What did we WRITE?** A `proposed_changes` row with
+      `quantity_write_status = 'WRITTEN'` *and* a successful QUANTITY
+      `write_attempts` row. Both are required: the status column is the intent and
+      the attempt row is the evidence, and a row claiming one without the other is
+      not something to do arithmetic on. This is also what excludes a proposal
+      that was rejected, discarded, or approved but never written -- none of them
+      moved the line, so none of them may move the base.
+    - **What did we last SEE?** Any row carrying a `current_quantity`, written or
+      not. Not a base -- an unwritten proposal changed nothing -- but the yardstick
+      for "has this line been edited since we last looked".
+
+    The latest of each wins, ordered by when the write actually landed rather than
+    when it was approved, since that is the moment the line's value changed.
+
+    **The ordering assumption, named because it is load-bearing:** "latest" is
+    `write_attempts.attempted_at`, so this trusts that timestamp to track the order
+    writes really reached NetSuite. Two overlapping runs against one line could in
+    principle attempt writes out of the order their timestamps imply, and the wrong
+    total would be picked as the base. That risk is inherent to any audit-trail
+    base and is far smaller than the read-back-from-NetSuite failure it replaces --
+    which compounds silently and forever, where this needs concurrent writes to the
+    same line to bite at all. If the write path ever runs concurrently per line,
+    order on a monotonic sequence rather than a clock.
+    """
+    # Local import: `schema` is this module's data layer and everything else here
+    # goes through it. This is the one place needing a query builder directly.
+    from sqlalchemy import select
+
+    keys = [k for k in po_keys if k]
+    if not keys:
+        return {}
+
+    pc, sp, wa = proposed_changes, shipment_pos, write_attempts
+    observed: dict = {}
+    written: dict = {}
+
+    with engine.connect() as conn:
+        for row in conn.execute(
+            select(sp.c.po_number_key, pc.c.ns_line_id, pc.c.current_quantity, pc.c.created_at)
+            .select_from(pc.join(sp, pc.c.shipment_po_id == sp.c.id))
+            .where(sp.c.po_number_key.in_(keys))
+            .where(pc.c.ns_line_id.is_not(None))
+            .where(pc.c.current_quantity.is_not(None))
+            .order_by(pc.c.created_at)
+        ):
+            # Ascending, so the last row for a key is the most recent observation.
+            observed[(row.po_number_key, str(row.ns_line_id))] = (
+                float(row.current_quantity), row.created_at,
+            )
+
+        for row in conn.execute(
+            select(sp.c.po_number_key, pc.c.ns_line_id, pc.c.approved_quantity,
+                   pc.c.id.label("change_id"), wa.c.attempted_at)
+            .select_from(
+                pc.join(sp, pc.c.shipment_po_id == sp.c.id)
+                  .join(wa, wa.c.change_id == pc.c.id)
+            )
+            .where(sp.c.po_number_key.in_(keys))
+            .where(pc.c.ns_line_id.is_not(None))
+            .where(pc.c.quantity_write_status == "WRITTEN")
+            .where(pc.c.approved_quantity.is_not(None))
+            .where(wa.c.scope == "QUANTITY")
+            .where(wa.c.outcome == "SUCCESS")
+            .order_by(wa.c.attempted_at)
+        ):
+            key = (row.po_number_key, str(row.ns_line_id))
+            prior = written.get(key)
+            # Count DISTINCT changes, not attempt rows: one change retried after a
+            # failure still wrote once.
+            seen = set(prior[3]) if prior else set()
+            seen.add(row.change_id)
+            written[key] = (
+                float(row.approved_quantity), row.attempted_at, row.change_id, seen,
+            )
+
+    history: dict = {}
+    for key in set(observed) | set(written):
+        obs = observed.get(key)
+        wrt = written.get(key)
+        history[key] = mt.LineHistory(
+            po_number=key[0],
+            line_id=key[1],
+            written_quantity=wrt[0] if wrt else None,
+            written_at=wrt[1].isoformat() if wrt and wrt[1] else None,
+            written_change_id=wrt[2] if wrt else None,
+            write_count=len(wrt[3]) if wrt else 0,
+            observed_quantity=obs[0] if obs else None,
+            observed_at=obs[1].isoformat() if obs and obs[1] else None,
+        )
+    return history
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +770,10 @@ def ingest_shipment(
         etd=parsed.ship_info.get("etd"),
         shipment_needs_manual_entry=parsed.needs_manual_entry,
         colour_lookups=colour_lookups,
+        # What we previously wrote to these lines, from our own audit trail. This
+        # is what makes a second slip ADD to the first (Paula, 2026-09-16) without
+        # reading back a field we write -- see `_line_history`.
+        line_history=_line_history(engine, po_keys),
     )
 
     # WHICH sheet supplied the matched lines. A multi-sheet workbook can hold

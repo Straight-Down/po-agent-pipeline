@@ -25,10 +25,20 @@ a human types one in. `to_netsuite_fields()` physically cannot emit a date field
 before that happens — see `DateNotConfirmed`. This replaces the earlier
 behaviour, which proposed the raw port ETA for all three date fields.
 
-**Quantity replaces, and over-shipment is normal.** The packing list's shipped
-quantity becomes the line's new quantity, replacing the ordered amount. Shipped
-exceeding ordered is standard practice and is NOT flagged, surfaced as an
-anomaly, or treated differently in any way.
+**Over-shipment is normal.** Shipped exceeding ordered is standard practice and
+is NOT flagged, surfaced as an anomaly, or treated differently in any way.
+
+**Quantity ACCUMULATES across shipments (Paula, 2026-09-16).** This supersedes
+the replace semantics this engine shipped with. Her words: *"The vendor's packing
+slip only shows the new shipment's quantities."* So a second slip against a line
+this tool has already written adds to what was written, rather than overwriting
+it — replacing a first shipment of 128 with a second of 100 would silently lose
+28 units. The first slip against an untouched line still proposes the slip's own
+figure, because the base is zero.
+
+**The arithmetic base is this tool's own record, never NetSuite's current
+quantity.** That is not an optimisation and it is not an oversight; see
+`_accumulated_quantity`, which exists mainly to explain it.
 
 **A PO line absent from a packing list is the normal case, not an event.** POs
 routinely ship in batches, so most shipments cover only some of a PO's styles.
@@ -79,6 +89,64 @@ STATUS_NEEDS_RESOLUTION = "NEEDS_RESOLUTION"
 #: out of several for ONE shipment row, this is PAIRING N shipment rows to N lines.
 #: A human assigns; see `_assignment_payload`.
 STATUS_NEEDS_ASSIGNMENT = "NEEDS_ASSIGNMENT"
+
+#: Quantities are counts, but they round-trip through `Numeric(12, 3)` and back,
+#: so compare with a tolerance below the smallest representable difference rather
+#: than with `==` on floats.
+QUANTITY_TOLERANCE = 0.001
+
+#: `accumulation["basis"]` -- how the proposed quantity was arrived at. Recorded on
+#: every matched line, because "why is this 228 when the slip says 100" must be
+#: answerable from the row alone.
+BASIS_FIRST_SHIPMENT = "FIRST_SHIPMENT"  # nothing written before; base is zero
+BASIS_ACCUMULATED = "ACCUMULATED"  # added to what this tool previously wrote
+BASIS_DISPUTED = "DISPUTED"  # NetSuite disagrees with our record; nothing proposed
+
+
+@dataclass(frozen=True)
+class LineHistory:
+    """
+    What THIS TOOL knows about one NetSuite PO line from its own past runs.
+
+    Built by `ingest` from `proposed_changes` and `write_attempts` and handed in,
+    the same way `colour_lookups` is: this module stays free of database I/O, and
+    a caller with no history (a demo, a test, the first run against a line) simply
+    passes nothing.
+
+    Two different facts, and the difference matters:
+
+    - `written_quantity` -- the cumulative total this tool last successfully WROTE
+      to the line. None when it has never written one. This is the accumulation
+      base.
+    - `observed_quantity` -- what NetSuite's `quantity` read the last time this
+      tool looked at the line, whether or not it went on to write anything. This
+      is not a base; it is the yardstick for "has someone edited this line since
+      we last saw it".
+
+    A line proposed but never written contributes an `observed_quantity` and no
+    `written_quantity`. That is the point: a rejected or still-pending proposal
+    must not move the arithmetic, but it is still evidence of what the line looked
+    like at a known moment.
+    """
+
+    po_number: str
+    line_id: str
+
+    #: The cumulative total last written, and where that claim comes from. The
+    #: provenance is carried so a disputed line can tell Paula not just the number
+    #: but which approval produced it.
+    written_quantity: Optional[float] = None
+    written_at: Optional[str] = None
+    written_change_id: Optional[str] = None
+    write_count: int = 0
+
+    #: NetSuite's quantity as of this tool's most recent look at the line.
+    observed_quantity: Optional[float] = None
+    observed_at: Optional[str] = None
+
+    @property
+    def has_written(self) -> bool:
+        return self.written_quantity is not None
 
 
 class LineClosed(Exception):
@@ -178,7 +246,12 @@ class ProposedChange:
     size: str
     line_id: Optional[str]
 
-    # Quantity — replace semantics; this is the part that can be plainly approved.
+    #: Quantity. ACCUMULATE semantics since Paula's ruling of 2026-09-16:
+    #: `proposed_quantity` is what the LINE should hold in total, which on a second
+    #: shipment is the previously-written total plus this slip -- not the slip's own
+    #: figure. `accumulation` below carries the breakdown. None here means the tool
+    #: refused to compute one, which is not the same as the slip being silent about
+    #: quantity; `accumulation["basis"]` says which.
     current_quantity: Optional[int]
     proposed_quantity: Optional[int]
 
@@ -215,6 +288,16 @@ class ProposedChange:
     #: The five quantity figures for this line, on EVERY change -- see
     #: `_line_balance`. Display context, never a gate.
     line_balance: dict = field(default_factory=dict)
+
+    #: How `proposed_quantity` was arrived at -- see `_accumulated_quantity`.
+    #: Carries `basis` (FIRST_SHIPMENT / ACCUMULATED / DISPUTED), the base it added
+    #: to, this slip's own figure, and on a DISPUTED line both disagreeing numbers.
+    #:
+    #: Separate from `line_balance` on purpose. Those five figures are a fixed,
+    #: documented set that the review screen and `v_review_lines` are built around;
+    #: this is a different question (where did the arithmetic start) and folding it
+    #: in would quietly redefine a contract other things depend on.
+    accumulation: dict = field(default_factory=dict)
 
     #: Set when the colour matched through the item's long-form NAME rather than by
     #: code, e.g. "printed 'NEW INDIGO' resolved to code NIN ('New Indigo')".
@@ -677,6 +760,140 @@ def _line_balance(line: Optional[POLine], slip_quantity: Optional[float]) -> dic
     }
 
 
+def _accumulated_quantity(
+    line: Optional[POLine],
+    slip_quantity: Optional[float],
+    history: Optional[LineHistory],
+) -> tuple[Optional[float], dict, Optional[str]]:
+    """
+    What the line's quantity should become, given that slips accumulate.
+
+    Returns `(proposed_quantity, accumulation, problem)`. A `problem` means the
+    tool refused to compute anything: `proposed_quantity` comes back None and the
+    caller flags the line for Paula.
+
+    ## Why the base is not NetSuite's current quantity
+
+    This will look like an omission to anyone reading it fresh, because the
+    obvious implementation is one line — `line.quantity + slip` — and it is
+    wrong for a reason that is invisible from the call site.
+
+    **`quantity` is a field this tool writes.** It is one of the four in
+    `WRITABLE_LINE_FIELDS`. Reading it back as the base for the next write means
+    the tool's own past output becomes the input to its next decision, and the
+    arithmetic drifts in whatever direction its mistakes already pointed, with
+    nothing to arrest it — every run makes the next run more confident in the same
+    error. RUNBOOK section 8 lesson 13 states the general test: *would this field
+    have this value if the tool had never run?* For `quantity` on a line this tool
+    has written, the answer is no. It is not evidence about the world; it is a
+    record of what the tool already did.
+
+    That is not a hypothetical worry here. The failure it produces is silent and
+    compounding: one missed write, or one manual correction by Paula that the tool
+    reads as its own, and every later shipment on that line is off by the same
+    amount, forever, with each run confirming the previous one.
+
+    So the base is `history.written_quantity` -- what the tool's own audit trail
+    says it last successfully wrote, from `proposed_changes` joined to a
+    successful `write_attempts` row. That record exists independently of NetSuite
+    and cannot be contaminated by what NetSuite currently holds.
+
+    ## What NetSuite's value IS used for
+
+    A consistency check, which is the honest use of it. If our record says we
+    wrote 128 and the line now reads 128, the two agree and the accumulation is
+    safe. If the line reads anything else, someone changed it outside this tool
+    and **the tool does not guess and does not reconcile** -- it reports both
+    numbers and stops. Reconciling would mean picking one source as authoritative,
+    which is exactly the judgement that belongs to Paula.
+
+    ## The three ways a line can have no written history
+
+    - **Never seen before, nothing received.** An ordinary first shipment. The
+      base is zero and the slip's figure is the proposal, which is what this
+      engine did for every line before accumulation existed.
+    - **Never seen before, but goods have already been received against it.**
+      `quantity_received > 0` with no record of our own means a shipment arrived
+      that this tool knows nothing about. Accumulating from zero would propose
+      only this slip and lose the earlier units -- the precise loss Paula's ruling
+      is about -- so it is flagged instead.
+    - **Seen before but never written** (proposed and rejected, or still pending).
+      The base is still zero, because an unwritten proposal changed nothing. But
+      the observation is kept: if NetSuite's quantity has moved since we looked,
+      someone edited the line, and that is flagged on the same footing.
+
+    **Residual gap, named rather than hidden:** a line this tool has never seen,
+    with nothing received, whose quantity was edited by hand, is indistinguishable
+    from an untouched line. NetSuite carries no separate "originally ordered"
+    figure to compare against -- `quantity` is both the ordered value and the
+    field we overwrite -- so there is nothing to detect it with. The first
+    shipment this tool processes on such a line will propose the slip's figure.
+    Every line it has seen once is covered from then on.
+    """
+    if line is None or slip_quantity is None:
+        # Nothing to accumulate against, or nothing to add. Both are already
+        # flagged by the caller for their own reasons; the slip's figure travels
+        # through unchanged so the reviewer still sees what the document said.
+        return slip_quantity, {}, None
+
+    ns_quantity = float(line.quantity)
+    slip = float(slip_quantity)
+    payload: dict = {
+        "slip_quantity": slip,
+        "netsuite_quantity": ns_quantity,
+    }
+
+    if history is not None and history.has_written:
+        expected = float(history.written_quantity)
+        payload.update({
+            "base_quantity": expected,
+            "base_written_at": history.written_at,
+            "base_change_id": history.written_change_id,
+            "prior_writes": history.write_count,
+        })
+        if abs(ns_quantity - expected) > QUANTITY_TOLERANCE:
+            payload["basis"] = BASIS_DISPUTED
+            return None, payload, (
+                f"NetSuite line {line.line_id} holds {ns_quantity:g}, but this tool's own record "
+                f"says it last wrote {expected:g} (change {history.written_change_id}, "
+                f"{history.written_at}). Someone changed the line outside this tool, so the "
+                f"shipped {slip:g} on this slip cannot be added to a base the tool cannot "
+                "vouch for. No quantity proposed — confirm which figure is right and what "
+                "this line should total"
+            )
+        payload["basis"] = BASIS_ACCUMULATED
+        return expected + slip, payload, None
+
+    if history is not None and history.observed_quantity is not None:
+        observed = float(history.observed_quantity)
+        payload.update({"base_quantity": 0.0, "observed_quantity": observed,
+                        "observed_at": history.observed_at, "prior_writes": 0})
+        if abs(ns_quantity - observed) > QUANTITY_TOLERANCE:
+            payload["basis"] = BASIS_DISPUTED
+            return None, payload, (
+                f"NetSuite line {line.line_id} holds {ns_quantity:g}, but read {observed:g} when "
+                f"this tool last looked at it ({history.observed_at}) and it has never written to "
+                "it. Someone changed the line outside this tool. No quantity proposed — the "
+                f"shipped {slip:g} on this slip cannot be added to a base the tool cannot vouch for"
+            )
+        payload["basis"] = BASIS_FIRST_SHIPMENT
+        return slip, payload, None
+
+    received = float(line.quantity_received or 0.0)
+    payload.update({"base_quantity": 0.0, "prior_writes": 0,
+                    "quantity_received": received})
+    if received > QUANTITY_TOLERANCE:
+        payload["basis"] = BASIS_DISPUTED
+        return None, payload, (
+            f"NetSuite line {line.line_id} already shows {received:g} received, but this tool has "
+            "no record of ever proposing or writing to it — a shipment reached this line that it "
+            f"knows nothing about. Proposing the shipped {slip:g} alone would drop the earlier "
+            "units. No quantity proposed — confirm what this line should total"
+        )
+    payload["basis"] = BASIS_FIRST_SHIPMENT
+    return slip, payload, None
+
+
 def _resolve_target_line(
     candidates: list[POLine],
 ) -> tuple[Optional[POLine], Optional[str], list[POLine]]:
@@ -786,6 +1003,7 @@ def build_proposed_changes(
     etd: Optional[str] = None,
     shipment_needs_manual_entry: bool = False,
     colour_lookups: Optional[dict] = None,
+    line_history: Optional[dict] = None,
 ) -> list[ProposedChange]:
     """
     Stage the changes a shipment implies, for human review.
@@ -802,6 +1020,15 @@ def build_proposed_changes(
     Omit it and matching is by code only, which is what a code-printing vendor
     needs and all this did before change 7. The lookups are passed in rather than
     built here so this function stays free of per-item I/O.
+
+    `line_history` maps `(po_number, line_id)` to a `LineHistory` -- what this tool
+    itself previously wrote to that NetSuite line, and when it last looked at it.
+    It is what makes a second shipment ADD rather than replace (Paula, 2026-09-16).
+    Passed in for the same reason `colour_lookups` is: the history lives in the
+    database and this module does no I/O. **Omitting it does not silently fall back
+    to replace semantics** -- every line then reads as a first shipment, which is
+    the correct answer when there is genuinely no history and the honest one when
+    the caller simply did not look. `ingest` always supplies it.
     """
     eta_date = _parse_eta_to_date(eta)
     etd_date = _parse_eta_to_date(etd)
@@ -870,6 +1097,22 @@ def build_proposed_changes(
         else:
             match, resolution_problem, ambiguous_lines = _resolve_target_line(candidates)
 
+        # ACCUMULATE rather than replace (Paula, 2026-09-16). The base is what this
+        # tool's own audit trail says it last wrote to the line -- NOT NetSuite's
+        # current quantity, which is a field this tool writes and therefore an echo
+        # of itself. `_accumulated_quantity` carries the full reasoning, and is
+        # also what turns a disagreement between the two into a flag.
+        slip_quantity = _as_quantity(vl.get("quantity"))
+        history = (line_history or {}).get((po_number, match.line_id)) if match else None
+        proposed_quantity, accumulation, accumulation_problem = _accumulated_quantity(
+            match, slip_quantity, history
+        )
+        if not accumulation:
+            # No accumulation applied: unmatched line, or a quantity that is not a
+            # number. Carry the vendor's value through exactly as before, so a
+            # non-numeric quantity still reaches the reviewer as it was printed.
+            proposed_quantity = vl.get("quantity")
+
         change = ProposedChange(
             po_number=po_number,
             style_number=str(vl.get("style_number") or "").strip(),
@@ -879,7 +1122,8 @@ def build_proposed_changes(
             ns_item_internal_id=match.item_internal_id if match else None,
             ns_line_is_open=match.is_open if match else None,
             current_quantity=match.quantity if match else None,
-            proposed_quantity=vl.get("quantity"),
+            proposed_quantity=proposed_quantity,
+            accumulation=accumulation,
             current_expected_receipt_date=_iso_or_none(match.expected_receipt_date) if match else None,
             current_updated_receipt_date=_iso_or_none(match.updated_receipt_date) if match else None,
             current_override_flag=match.override_expected_receipt if match else False,
@@ -917,6 +1161,11 @@ def build_proposed_changes(
             reasons.append(resolution_problem)
         if assignment_problem:
             reasons.append(assignment_problem)
+        if accumulation_problem:
+            # NetSuite's line disagrees with what this tool believes it wrote, or
+            # goods reached a line it has no record of. Both numbers go to Paula
+            # verbatim: the tool does not pick one and does not reconcile them.
+            reasons.append(accumulation_problem)
         if match is None and candidates and all(line.closed for line in candidates):
             # Nothing writable and the candidates were deliberately closed. Keep
             # the structural guard alive: to_netsuite_fields() must still refuse,
@@ -951,7 +1200,11 @@ def build_proposed_changes(
             reasons.append(f"extraction confidence {confidence}" + (f": {note}" if note else ""))
         if not po_number:
             reasons.append("vendor line has no PO number")
-        if change.proposed_quantity is None:
+        if change.proposed_quantity is None and not accumulation_problem:
+            # Guarded: a refused accumulation also leaves proposed_quantity None,
+            # and reporting that as "the vendor line has no quantity" would blame
+            # the document for the tool's own refusal. The slip's figure is right
+            # there in `accumulation["slip_quantity"]`.
             reasons.append("vendor line has no quantity")
 
         if reasons:

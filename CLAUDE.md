@@ -45,7 +45,7 @@ anything else depends on it.
 | `Claude-Code-Kickoff-Prompts.md` | Ready-to-paste prompts for Claude Code, one per build phase — use these in order, don't skip ahead |
 | `parse_packing_slip.py` | **Validated reference implementation** — parses the Inprotex-format packing slip Excel + shipping advice PDF. Every line it extracts was hand-checked against the vendor's own summary email (100% match). Reuse this logic; don't re-derive it from scratch. |
 | `netsuite_client.py` | Stub NetSuite client — defines the interface (`get_purchase_order`, `update_po_line`) the rest of the pipeline codes against. Method bodies are mocked/`NotImplementedError` pending M2M NetSuite access — swap in real REST calls here. Docstring has the confirmed field names/types and the CFO-vs-least-privilege-role caveat — read it before implementing. |
-| `matcher.py` | Diff/staging logic — matches parsed vendor lines to NetSuite PO lines and computes proposed changes. Matching uses exact-match fields confirmed live against sandbox (`custcol_sd_tmpl_style`, `custcol_product_color.refName`, `custcol_product_size.refName` with size normalization) — no longer a display-name substring heuristic. Still has 3 unresolved business-logic questions (date mapping/buffer, split shipments, absent lines) — see architecture doc §6.1 before finalizing the diff behavior. |
+| `matcher.py` | Diff/staging logic — matches parsed vendor lines to NetSuite PO lines and computes proposed changes. Matching uses exact-match fields confirmed live against sandbox (`custcol_sd_tmpl_style`, `custcol_product_color.refName`, `custcol_product_size.refName` with size normalization) — no longer a display-name substring heuristic. The three business-logic questions are all resolved (see above); quantities ACCUMULATE as of 2026-09-16, and `_accumulated_quantity` is the function to read before touching quantity behaviour. |
 | `demo_matcher.py` | Proves `matcher.py` works: mocks NetSuite's current state using a real example from Paula (PO 1662/M120246/TID showing S=12,M=71 in NetSuite vs. the real shipment's S=9,M=50) and confirms the diff engine catches it. Lines with no mock NetSuite data correctly come back `NEEDS_ATTENTION` instead of being silently dropped — preserve that behavior in the real implementation; a matching miss on live PO data should never fail silently. |
 | `0626建躍空運成衣 (SD-219國外)Invoice_Packing.xlsx` | Real sample vendor packing slip |
 | `Shipping Advice 6128990769 建躍.pdf` | Real sample shipping advice |
@@ -134,16 +134,17 @@ structure, tests, packaging) to whatever standard you'd normally build to.
 - ~~Confirmed shipment volume~~ **Answered by Paula: 10–20 emails/week.**
   Polling every 15–30 minutes is sufficient — do not build a real-time Graph
   webhook subscription for v1, it's unneeded complexity at this volume.
-- **Three business-logic questions still need Paula's input before Phase 3**
-  (see architecture doc §6.1 for full detail and conservative defaults to use
-  in the meantime): (1) which vendor date maps to `expectedReceiptDate` /
-  `custcol_sd_updatedreceiptdate`, and whether there's a transit-time buffer
-  between a shipment's port ETA and the actual receipt date — real sandbox
-  data shows an 18-day gap on one real example, so don't assume raw ETA is
-  correct; (2) does a second shipment's quantity replace or add to an
-  existing PO line's quantity; (3) does a PO line missing from a given
-  packing slip mean "not shipped yet" or "cancelled." None of these are
-  safe to guess silently — the diff engine's correctness depends on them.
+- ~~**Three business-logic questions still need Paula's input before Phase 3**~~
+  **ALL RESOLVED.** (1) Which vendor date maps to the receipt fields — none;
+  Paula sets the date herself, enforced structurally (no
+  `proposed_*_date` field exists). (2) Does a second shipment replace or add
+  — **ADD**, ruled 2026-09-16; the code replaced until then and was losing
+  units silently. (3) A PO line missing from a packing slip — "not shipped
+  yet", never cancelled; no record is created at all.
+  **Paula's remaining Phase 3 rulings, also 2026-09-16:** approval is per PO,
+  partial write failures retry per failed line with no rollback, and Paula is
+  the sole approver with no delegation. Every Phase 3 requirement is now
+  consolidated in `PO-Update-Automation-Phase3-Requirements.md`.
 
 ## Working agreement (from the planning session)
 
@@ -271,4 +272,10 @@ not as history - a rule without its failure mode gets rationalised away.
 - A flag that only satisfies a guard is a no-op. `--from-beginning` never set
   the window, so with a watermark present it read from the watermark and hid a
   message. Assert a flag's EFFECT, not that it is accepted.
+- **Quantities ACCUMULATE, and the base is OUR record, not NetSuite's
+  `quantity`.** A second slip adds to what this tool last wrote. Reading the
+  base back off the line is an echo (§8 lesson 13) and compounds its own
+  errors; the base comes from `proposed_changes` in `WRITTEN` state joined to
+  a SUCCESSFUL `write_attempts` row. NetSuite's value is a consistency check
+  only — where it disagrees, propose nothing and flag with both numbers.
 - <add the next one here>

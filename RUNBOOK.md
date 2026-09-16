@@ -46,12 +46,12 @@ In short: the hard, uncertain part (can this reliably read messy vendor document
 
 `matcher.py`'s `ProposedChange` represents one line's proposed update. The rules baked into it come directly from Paula, not from assumptions:
 
-- **Quantity**: the packing list's shipped quantity **replaces** the PO line's current quantity. Shipping more than was ordered is normal and accepted — it does not get flagged as unusual.
+- **Quantity**: the packing list's shipped quantity **ACCUMULATES** onto what this tool has already written to the line (Paula, 2026-09-16: *"The vendor's packing slip only shows the new shipment's quantities"*). A first shipment against an untouched line proposes the slip's own figure, because the base is zero; a second proposes the written total plus this slip. **The base is this tool's own audit trail, never NetSuite's current quantity** — that is a field this tool writes, so reading it back would be an echo (§8 lesson 13). Where the two disagree, nothing is proposed and both numbers go to Paula. Full detail in §6 item 30. Shipping more than was ordered is normal and accepted — it does not get flagged as unusual.
 - **Receipt dates are never computed or proposed by this system.** Paula determines the actual receipt date herself, using her own knowledge of customs/trucking buffers — she explicitly does not use the vendor's stated arrival date. Enforced structurally: `ProposedChange` has no `proposed_expected_receipt_date` field at all. The vendor's ETD/ETA are still shown as labeled reference information, but `to_netsuite_fields(include_dates=True)` will raise `DateNotConfirmed` until a human calls `confirm_receipt_date()`. Quantity-only writes are unaffected by this and work normally.
 - **Inspection reports (QC documents) are never a data source**, even on the rare occasion one contains data the packing list lacks. This is enforced in code — `parse_shipment_documents` raises `ExtractionError` if handed an inspection report.
 - **A vendor's packing list that can't be resolved to individual size-level lines results in a manual-entry flag**, not a guess (no proportional splitting, no inference from another document).
 
-**Not yet confirmed:** if a single PO ships in two genuinely separate batches weeks apart (not just multiple styles on one PO), does the second batch's quantity replace what's in NetSuite, or add to it? The code currently replaces. Low urgency, worth asking Paula before this goes further.
+**RESOLVED 2026-09-16, and it was not low urgency.** A PO shipping in two genuinely separate batches ADDS rather than replaces. This question sat here marked *"low urgency"* since 2026-08-10 on the reasoning that it fires rarely — but what it produced when it fired was a line written **down** from 128 to 100, losing 28 units, with nothing recording that it happened. **The urgency of an open question is what happens when it fires, not how often.** Built 2026-09-16; §6 item 30.
 
 **One vendor line can match several NetSuite lines**, because `(PO, style, colour, size)` is not unique per PO line. One open line among them is targeted normally; several open lines produce `NEEDS_RESOLUTION` with every candidate's figures attached and **no** automatic choice. Full evidence and reasoning in §6 item 10 — including why NetSuite-side duplicates must never be summed while extraction-side duplicates must.
 
@@ -514,6 +514,40 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
     The cost of that artefact was real, though: three cross-checks were parsed in full and none of their lines proposed — Inprotex's 77 (free, deterministic parser), the Symmetry detail's 25 (a genuine corroboration, agreed exactly), and Legendz's 8 (paid and discarded). **110 lines extracted and thrown away against 118 kept**, almost all of it caused by the seeded email rather than by the design.
 
+30. **NEW 2026-09-16 — Paula ruled on the four questions Phase 3 was blocked on, and one of them turned out to be a live data-loss bug rather than a design question.** Recorded together because the fourth is the reason the other three matter less than it does.
+
+    | Question | Ruling | Needed code? |
+    |---|---|---|
+    | Approval unit | **Per PO** | no — `shipment_po_id` was already the grouping key |
+    | Partial failure | **Successes stand, failures flagged with the reason and retried individually. No rollback, no all-or-nothing** | no — matched the schema's §6 mechanics exactly |
+    | Approver | **Paula only. No delegation, no backup. Work queues until she returns** | no |
+    | Multi-batch quantity | **ACCUMULATE** — *"The vendor's packing slip only shows the new shipment's quantities"* | **yes** |
+
+    **The first three confirmed what the schema already assumed.** The state machine needed no new transition: `APPROVED → WRITTEN`, `APPROVED → WRITE_FAILED`, `WRITE_FAILED → WRITTEN`, `WRITE_FAILED → APPROVED` and `WRITE_FAILED → DISCARDED` already express "some succeeded, some failed, retry those", because state is per `proposed_changes` row and `write_attempts` is unique on `(change_id, scope, attempt_no)`. No rollback edge exists, which is the ruling rather than a gap — the only outbound from `WRITTEN` is the additive `WRITTEN → APPROVED` for a date supplied late.
+
+    **The fourth was filed as "low urgency" and was silently losing units.** §4 of this runbook had carried it since 2026-08-10 as *"Low urgency, worth asking Paula before this goes further"* — on the reasoning that it only affects a PO shipping in two separate batches weeks apart. But the failure it produces is not a mis-flag or a wrong status: a line already written to 128 that receives a second slip for 100 would be **written down to 100, losing 28 units, with nothing anywhere recording that it happened**. The urgency of an open question is not how often it fires; it is what happens when it does. "Rare and silently wrong" ranks above "frequent and visibly wrong".
+
+    **What was built.** `matcher._accumulated_quantity` and `ingest._line_history`, plus migration 0007 (`accumulation_basis`, `accumulation_base_quantity`, both surfaced on `v_review_lines`).
+
+    **The base is this tool's own audit trail, and that is the whole design.** The obvious implementation is `line.quantity + slip`, and it is wrong: `quantity` is one of the four fields in `WRITABLE_LINE_FIELDS`, so reading it back as a base lets the tool's own past output decide its next output — §8 lesson 13, applied to arithmetic rather than to matching. An error would compound instead of correcting, and every run would confirm the previous one. The base therefore comes from `proposed_changes` in `WRITTEN` state joined to a **successful** `write_attempts` row. A proposal rejected, discarded, still pending, or whose write failed contributes nothing, because none of them moved the line.
+
+    **NetSuite's value is a consistency check, and a disagreement is a full stop, not a reconciliation:**
+
+    | | |
+    |---|---|
+    | Line matches our record | `ACCUMULATED` — propose base + slip |
+    | Line differs from our record | `DISPUTED` — **nothing proposed**, both numbers and the citing change go to Paula |
+    | No history, nothing received | `FIRST_SHIPMENT` — base zero |
+    | No history, goods already received | `DISPUTED` — a shipment reached the line this tool never saw |
+    | Seen before, never written, line has moved | `DISPUTED` — edited outside the tool |
+
+    **Why the test suite proves this rather than merely exercising it.** Accumulating 128 + 100 = 228 is the same answer a NetSuite-based implementation gives, so that case cannot distinguish the two. The discriminating test is the disputed one: history says 128, the line reads 150. A base read from NetSuite returns 250 and looks entirely reasonable; a base read from our own record cannot, because the two sources disagree and **that disagreement is the signal**. Five tests, 49 checks, and the one that matters asserts `proposed_quantity IS NULL`.
+
+    **ROLLOUT EXPECTATION, and it is not a bug — read this before the first live run after 2026-09-16.** The "no history, goods already received" branch fires on **every in-flight PO line carrying a partial receipt from before this tool existed**, the first time a slip touches it. Those lines will land as `NEEDS_ATTENTION` / `DISPUTED` in a batch, and on day one that will look like a regression. It is the conservative branch working: the tool genuinely has no record of what put that quantity there, and proposing from a zero base would drop it. Decide before the run whether to accept the wave or do a one-time, explicitly-audited backfill of `write_attempts` for lines whose history is known — but do not silence the branch, because it is the only thing standing between a pre-existing receipt and a silent under-write.
+
+    **Residual gap, named rather than hidden:** a line this tool has never seen, with nothing received, whose quantity was edited by hand, is indistinguishable from an untouched line. NetSuite carries no separate "originally ordered" figure to compare against — `quantity` is both the ordered value and the field this tool overwrites. Every line the tool has seen once is covered from then on.
+
+
 ## 7. Design constraints discovered by testing
 
 These are not open questions — they are settled constraints that later phases must respect. Each was found by measurement, not design review.
@@ -534,8 +568,8 @@ The original observation, kept because the shape of the problem has not changed:
 
 **A shipment is not 1:1 with a PO, and the fan-out is larger than assumed.** One Inprotex sheet interleaves **six** POs (1640, 1645, 1650, 1662, 1667, 1704); the Symmetry set spans two (1720, 1721). Consequences for Phase 2/3:
 - the `shipments` / `proposed_changes` schema must model one email spanning many POs,
-- the Phase 3 **approval unit** must be defined deliberately — per PO, per shipment, or per line — rather than falling out of the implementation,
-- **write-back needs partial-failure semantics**: one approval can mean six PO writes, and the fifth can fail. What the audit log records, and what Paula sees, when three succeeded and one didn't, has to be decided before the write path is wired.
+- ~~the Phase 3 **approval unit** must be defined deliberately — per PO, per shipment, or per line~~ **RESOLVED 2026-09-16: per PO.** Per line is 118 separate acts for one morning's mail; per shipment fires writes across six unrelated POs from one click. §6 item 30.
+- ~~**write-back needs partial-failure semantics**: one approval can mean six PO writes, and the fifth can fail. What the audit log records, and what Paula sees, when three succeeded and one didn't~~ **RESOLVED 2026-09-16: successes stand, failures are flagged with the reason and retried individually. No rollback, no all-or-nothing.** Already expressible on the existing state machine; no transition added. §6 item 30.
 
 **A fractional quantity in a shipped column is not a count — and a recap row that is a clean multiple of an order row is a plan wearing a count's clothes.** This is the part of the ACT/REV forensics (§6 item 20) that outlives the file. You cannot ship 17.28 pairs of trousers, so a fractional value in a size column is *derived*; and a tally of cartons does not come out as a constant multiple of the order, so a row that does is a target. Either signal identifies a plan on sight, with none of the cell-by-cell comparison it actually took to establish.
 
@@ -1163,5 +1197,5 @@ See `PO-Update-Automation-Build-Plan.md` for full phase detail. **Corrected 2026
 
 - **Phase 1 — done**, and the write-back test re-run under the current seven-permission role (§6 item 27). The parsing/matching layer is validated live against **five** real vendors.
 - **Phase 2 — done against the mock.** Schema and migrations, `ingest.py`, and now the mailbox intake job: a four-method Graph interface with a mock and a real client, a content-addressed attachment store, watermark with overlap, per-message failure isolation, and a separate extraction driver. `GRAPH_CLIENT` is still `mock`; pointing it at the live mailbox is the next step and should be watched, not scheduled.
-- **Phase 3 — not started.** No review UI exists. Its requirements are unusually complete but were scattered across **five** sources — the build plan, this runbook's §7, `PO-Update-Automation-Schema-Rationale.md`, `PO-Update-Automation-Architecture.md`, and several docstrings. **Consolidated 2026-09-16 into `PO-Update-Automation-Phase3-Requirements.md`**, which indexes all eleven and cites each back to its source; those sources stay authoritative. Two decisions in it are PROPOSED, PENDING PAULA: the approval unit (per PO) and what she sees on a partial write failure.
+- **Phase 3 — not started.** No review UI exists. Its requirements are unusually complete but were scattered across **five** sources — the build plan, this runbook's §7, `PO-Update-Automation-Schema-Rationale.md`, `PO-Update-Automation-Architecture.md`, and several docstrings. **Consolidated 2026-09-16 into `PO-Update-Automation-Phase3-Requirements.md`**, which indexes all eleven and cites each back to its source; those sources stay authoritative. **Paula ruled on the last four open questions on 2026-09-16** (§6 item 30), so nothing in it is now pending a decision — the approval unit is per PO, partial failures retry per line, Paula is the sole approver, and multi-batch quantities accumulate. Only the fourth needed code; the screen itself is still unwritten.
 - **Phase 4 — not started.** Three production re-verification items (tranId, colour resolution, the size vocabulary) share one shape: §8 lesson 16. Phase 3 (review/approval UI, write-back wiring) has not started. Phase 4 (production cutover, monitoring) has not started.

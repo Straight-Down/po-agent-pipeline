@@ -7,9 +7,11 @@ where they disagree with this file, they win.
 
 **Why it exists:** the requirements are unusually complete and were spread across
 `PO-Update-Automation-Build-Plan.md`, `RUNBOOK.md`, `PO-Update-Automation-Schema-Rationale.md`,
-`PO-Update-Automation-Architecture.md` and several docstrings. Six substantive rules exist only
-*outside* the build plan, and two of those are decisions that have to be made **before** the screen
-is designed rather than discovered while building it.
+`PO-Update-Automation-Architecture.md` and several docstrings. Eight substantive rules exist only
+*outside* the build plan, and four of those were decisions that had to be made **before** the screen
+was designed rather than discovered while building it. **Paula ruled on all four on 2026-09-16**;
+one of them, multi-batch accumulation, turned out to be a live data-loss bug rather than a design
+question and is now built.
 
 **Status vocabulary, used on every entry:**
 
@@ -18,7 +20,12 @@ is designed rather than discovered while building it.
 | **BUILT AND TESTED** | enforced in code today, with a test naming it |
 | **DECIDED BUT UNBUILT** | the decision is recorded and settled; nothing implements it |
 | **OPEN** | not decided. Someone must choose before the screen can be designed |
+| **CONFIRMED** | Paula ruled on it. A decision, not a recommendation |
 | **PROPOSED, PENDING PAULA** | a recommendation made in this document, not yet her decision |
+
+**Paula ruled on four of these on 2026-09-16.** Nothing in this document is now
+PROPOSED, and the screen is no longer blocked on a decision. Entries 6, 7, 12 and 13 carry her
+wording.
 
 ---
 
@@ -33,12 +40,14 @@ The column that matters is the second-to-last: **six of these the build plan doe
 | 3 | Assignment groups presented as groups | Build plan item 2 · `Architecture.md` §6.3 · `matcher._assignment_payload` | **yes** | DECIDED BUT UNBUILT |
 | 4 | Ordered-vs-shipped document summary | `RUNBOOK.md` §7 | no | DECIDED BUT UNBUILT |
 | 5 | Show the note, not the confidence level | `RUNBOOK.md` §7 · `Architecture.md` §6.2 | no | DECIDED BUT UNBUILT |
-| 6 | Approval unit chosen deliberately | `RUNBOOK.md` §7 · `Schema-Rationale.md` §1 · `Architecture.md` §6.2 | no | **OPEN** → PROPOSED |
-| 7 | Partial-failure semantics | `RUNBOOK.md` §7 · `Schema-Rationale.md` §6 · `Architecture.md` §6.2 | no | split — see §7 |
+| 6 | Approval unit chosen deliberately | `RUNBOOK.md` §7 · `Schema-Rationale.md` §1 · `Architecture.md` §6.2 | no | **CONFIRMED** 2026-09-16 |
+| 7 | Partial-failure semantics | `RUNBOOK.md` §7 · `Schema-Rationale.md` §6 · `Architecture.md` §6.2 | no | **CONFIRMED** 2026-09-16 |
 | 8 | The five figures, and that nothing gates on them | `Schema-Rationale.md` §10 · `schema.py` · `matcher._line_balance` | no | BUILT AND TESTED |
 | 9 | Vendor dates are information, never a proposal | `matcher.reference_dates_label` · `Architecture.md` §6.1, §6.3 | no | BUILT AND TESTED |
 | 10 | Date field optional, forever | Build plan item 1 · `Schema-Rationale.md` §5 · `matcher.to_netsuite_fields` | **yes** | BUILT AND TESTED |
 | 11 | Override flag only when a date is written | Build plan item 1 · `Architecture.md` §6.3 · `matcher.to_netsuite_fields` | **yes** | BUILT AND TESTED |
+| 12 | Multi-batch quantities ACCUMULATE | `Architecture.md` §6.1 · `matcher._accumulated_quantity` · migration 0007 | no | **BUILT AND TESTED** |
+| 13 | Paula is the only approver | `Architecture.md` §7 | no | **CONFIRMED** 2026-09-16 |
 
 ---
 
@@ -156,9 +165,9 @@ calibrates it.
 
 ---
 
-## 6. The approval unit — PROPOSED: PER PO, PENDING PAULA
+## 6. The approval unit — PER PO
 
-**Recorded as OPEN in three places.** Proposed here; hers to decide.
+**CONFIRMED by Paula, 2026-09-16: "per PO".** Recorded as OPEN in three places before that; the reasoning below is what was put to her and what she agreed with.
 
 > *"the Phase 3 approval unit must be defined deliberately — per PO, per shipment, or per line —
 > rather than falling out of the implementation."* — `RUNBOOK.md` §7
@@ -170,7 +179,7 @@ calibrates it.
 > *"the Phase 3 **approval unit** (per PO, per shipment, or per line) must be chosen deliberately"*
 > — `Architecture.md` §6.2
 
-### Proposal: **per PO**
+### The ruling, and why
 
 **Per line is unworkable at the observed volume.** The live run of 2026-09-14 produced **118
 proposed changes** from one morning's mail; per-line approval is 118 separate acts.
@@ -187,7 +196,7 @@ already models it (`shipment_pos` sits between `shipments` and `proposed_changes
    does not stall the other five"* (`Schema-Rationale.md` §1). Approval inherits that isolation.
 3. **The summary's own scope.** §4's ordered-versus-shipped figure is *"for the whole PO"*.
 
-**Already expressible:** `proposed_changes.shipment_po_id` is the grouping key. No schema change.
+**Already expressible:** `proposed_changes.shipment_po_id` is the grouping key. No schema change was needed and none was made.
 
 **Note for whoever designs the email flow:** a per-PO *approve button* is not sufficient on its own
 for any PO carrying a date — §9 and §10 require an input, not a decision. `Architecture.md` §4.1:
@@ -195,9 +204,11 @@ for any PO carrying a date — §9 and §10 require an input, not a decision. `A
 
 ---
 
-## 7. Partial-failure semantics — half decided, half PROPOSED
+## 7. Partial-failure semantics — successes stand, failures retry individually
 
-This splits cleanly, and the split is the point.
+**CONFIRMED by Paula, 2026-09-16:** *successes stand, failures are flagged with the reason and retried individually. No rollback, no all-or-nothing.* This matched the mechanics `Schema-Rationale.md` §6 had already decided, so nothing in the schema moved.
+
+The question split cleanly into a half that was already settled and a half that was genuinely open, and the split is worth keeping visible.
 
 ### The mechanics: **DECIDED, and already in the schema.** Not open.
 
@@ -219,7 +230,7 @@ settles it:
 > what Paula sees**, when three succeeded and one didn't, has to be decided before the write path is
 > wired."* — `RUNBOOK.md` §7, and near-identically `Architecture.md` §6.2
 
-### PROPOSED, PENDING PAULA
+### What she ruled
 
 **Approval is per PO; state stays per line.** A partly-succeeded approval is simply rows in
 `WRITTEN` and rows in `WRITE_FAILED`, each with its own `write_attempts` row.
@@ -229,7 +240,7 @@ writes that can themselves fail — turning one partial failure into two. Retry 
 line**, and only for `TRANSIENT`; `PERMISSION` and `LINE_CLOSED` go to a human, not to a retry
 button.
 
-**What Paula sees:** *"6 of 8 updated, 2 failed, why, retry those two."*
+**What Paula sees:** *"6 of 8 updated, 2 failed, why, retry those two."* Her phrasing: failures are *"flagged with the reason"* — `write_attempts.error_kind` and `error_detail` are where that reason already lives.
 
 ### Checked against the state machine: **already expressible. No transition needs adding.**
 
@@ -348,6 +359,108 @@ date stale."*
 
 ---
 
+## 12. A second shipment ADDS to the first — it does not replace it
+
+**BUILT AND TESTED**, 2026-09-16. This one changed behaviour rather than describing it.
+
+**CONFIRMED by Paula, 2026-09-16:** *"The vendor's packing slip only shows the new shipment's
+quantities."*
+
+It had been open since 2026-08-10 in `Architecture.md` §6.1, where it was filed as low urgency —
+*"whether a PO shipping in two genuinely separate batches, weeks apart, has the second batch's
+quantity replace the current NetSuite value or accumulate. The code currently replaces."*
+
+**It was not low urgency.** Replace semantics against a line that had already been written 128 and
+then received a slip for 100 would write 100 and **silently lose 28 units**, with nothing anywhere
+saying so. Accumulation is now the behaviour: base plus this slip.
+
+### The constraint that shapes the implementation
+
+**The arithmetic base is this tool's own record, never NetSuite's current quantity.** That is the
+whole design, and it looks like an omission to anyone who does not know the rule behind it — the
+obvious implementation is `line.quantity + slip` and it is wrong.
+
+`quantity` is one of the four fields in `WRITABLE_LINE_FIELDS`. Reading it back as the base lets the
+tool's own past output become the input to its next decision, so an error compounds instead of
+correcting and every run confirms the last one. RUNBOOK §8 lesson 13 gives the test: **would this
+field have this value if the tool had never run?** For a line this tool has written, no.
+
+So the base comes from `proposed_changes` in `WRITTEN` state joined to a **successful**
+`write_attempts` row — an audit trail NetSuite cannot contaminate. A proposal that was rejected,
+discarded, still pending, or whose write failed contributes nothing, because none of them moved the
+line.
+
+### NetSuite's value is a consistency check, and disagreement is a full stop
+
+| Situation | What happens |
+|---|---|
+| Line matches what our record says we wrote | `ACCUMULATED` — propose base + this slip |
+| Line differs from what we wrote | `DISPUTED` — **nothing proposed**, both numbers to Paula |
+| No history, nothing received | `FIRST_SHIPMENT` — base zero, propose the slip |
+| No history, but goods already received | `DISPUTED` — a shipment reached the line we never saw |
+| Seen before, never written, line has moved since | `DISPUTED` — edited outside the tool |
+
+**The tool does not reconcile.** Picking one source as authoritative is exactly the judgement that
+belongs to Paula, so a disputed line carries both figures, what we believe we wrote, and which
+change wrote it.
+
+**Residual gap, named rather than hidden:** a line this tool has never seen, with nothing received,
+whose quantity was edited by hand, is indistinguishable from an untouched line. NetSuite carries no
+separate "originally ordered" figure — `quantity` is both the ordered value and the field we
+overwrite — so there is nothing to detect it with. Every line the tool has seen once is covered from
+then on.
+
+### Where it lives
+
+`matcher._accumulated_quantity` (the arithmetic and the reasoning), `ingest._line_history` (the two
+queries that supply the uncontaminated base), and **migration 0007**, which adds
+`accumulation_basis` and `accumulation_base_quantity` to `proposed_changes` and surfaces both on
+`v_review_lines`.
+
+**Why those columns exist:** `proposed_quantity` is now a TOTAL, and a total does not say what it is
+a total of. `228` on a row whose slip printed `100` is unreadable without the base, and the
+difference between "first shipment of 228" and "128 already written plus 100 more" is precisely what
+the reviewer is being asked to approve. Same reasoning as the colour columns in 0002 and the size
+axes in 0003.
+
+**Rollout expectation, not a defect.** Every in-flight PO line that already carries a partial
+receipt from before this tool existed will land as `DISPUTED` the first time a slip touches it,
+because the tool has no record of what put that quantity there. On the first live run after
+2026-09-16 that arrives as a batch of `NEEDS_ATTENTION` and will read as a regression. Either accept
+it or do a one-time audited backfill — but the branch does not get silenced, because it is the only
+thing between a pre-existing receipt and a silent under-write.
+
+**For the screen:** show the basis. An `ACCUMULATED` row is the one case where the proposed quantity
+is not a number printed on any document, and a reviewer who does not know that will read `228`
+against a slip saying `100` as an extraction error.
+
+---
+
+## 13. Paula is the only approver — no delegation, no backup
+
+**CONFIRMED by Paula, 2026-09-16: Paula only. No delegation, no backup. Work queues until she
+returns.**
+
+Open since the architecture doc was written — `Architecture.md` §7: *"Who else, besides Paula,
+should be able to approve changes (e.g., backup approver when she's out)?"*
+
+**This is her explicit choice, not an omission.** It is recorded that way deliberately: an absent
+answer invites a future reader to add a backup approver as an obvious convenience, and a recorded
+decision does not.
+
+**The operational consequence, stated plainly: the pipeline has a single approver and no path around
+her.** While she is away nothing is written to NetSuite, however long the queue grows and however
+routine the change. That is by design — it follows from the working agreement that human review
+precedes every NetSuite write, permanently — but it is a real single point of failure on a business
+process, and it should be a known one rather than a discovered one.
+
+**For the screen:** the auth model is one person. No approver roles, no delegation UI, no
+escalation path. `quantity_approved_by` and `date_approved_by` are still recorded per row, because
+"who approved this" must be answerable from the audit trail even when the answer is always the same
+name — and because this ruling can change.
+
+---
+
 ## What is NOT a Phase 3 requirement
 
 Recorded so nobody adds it back:
@@ -369,22 +482,23 @@ Recorded so nobody adds it back:
 
 ---
 
-## Open items blocking the screen's design
+## Nothing is blocking the screen's design
 
-Everything above is either built or decided. These are not:
+Every requirement above is built, decided, or ruled on. **Paula's four rulings of 2026-09-16 closed
+the last of them**, including the two this document had raised as proposals:
 
-| | Where | Status |
+| | Was | Now |
 |---|---|---|
-| **Approval unit** (§6) | `RUNBOOK.md` §7 · `Schema-Rationale.md` §1 · `Architecture.md` §6.2 | PROPOSED **per PO** — needs Paula |
-| **What Paula sees on partial failure** (§7) | `RUNBOOK.md` §7 · `Architecture.md` §6.2 | PROPOSED — needs Paula. Mechanics already decided; no schema change |
+| Approval unit (§6) | OPEN in three documents | **per PO** |
+| Partial failure (§7) | mechanics decided, presentation open | **successes stand, failures retry individually** |
+| Multi-batch (§12) | OPEN since 2026-08-10, code silently wrong | **accumulate** — built, migration 0007 |
+| Approver (§13) | OPEN since the architecture doc | **Paula only**, no delegation |
 
-Two more, both recorded outside the Phase 3 material and both worth settling in the same
-conversation:
+**What is left is work, not decisions.** Entries 1, 3, 4 and 5 are DECIDED BUT UNBUILT — they
+describe a screen nobody has written yet. Entry 12 is the only one of the four rulings that needed
+code, and it has it.
 
-- **Multi-batch: replace or accumulate?** `Architecture.md` §6.1 — over-shipment is resolved
-  (replace), but *"whether a PO shipping in two genuinely separate batches, weeks apart, has the
-  second batch's quantity replace the current NetSuite value or accumulate"* is not. **The code
-  currently replaces.** Flagged there as *"worth a quick confirmation before Phase 3"*; surfaced
-  here because it decides the proposed quantity, which is the number the screen asks her to approve.
-- **Who else may approve when Paula is out.** `Architecture.md` §7, still open. It shapes the auth
-  model, so it is cheaper to answer before the screen than after.
+**One thing to carry into the build rather than rediscover:** §13 means the queue has no drain while
+Paula is away, and §12 means a line can now sit in `DISPUTED` indefinitely with nothing proposed.
+Both are correct behaviour and both look like the system being stuck. The screen should say which it
+is.

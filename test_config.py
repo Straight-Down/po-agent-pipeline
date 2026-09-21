@@ -464,6 +464,58 @@ def test_no_credentials_in_tracked_files() -> None:
               f"and mentions {name}, which lives elsewhere -- the contract is complete")
 
 
+
+def test_redaction_is_structural_and_fails_closed() -> None:
+    section("a connection string is masked by SHAPE, and never leaks on a bad URL")
+    from dialect_target import _redacted
+
+    SECRET = "Pa55w0rd-nobody-should-see"
+
+    cases = (
+        ("a normal URL",
+         f"mssql+pyodbc://user:{SECRET}@host/db?driver=ODBC+Driver+18+for+SQL+Server"),
+        ("a TRUNCATED URL with no @ at all",
+         f"mssql+pyodbc://user:{SECRET}"),
+        ("an unencoded @ inside the password",
+         f"mssql+pyodbc://user:{SECRET}@more@host/db"),
+        ("no query string",
+         f"mssql+pyodbc://user:{SECRET}@host/db"),
+    )
+    for label, url in cases:
+        out = _redacted(url)
+        check(SECRET not in out, f"{label}: the password does not survive", out[:70])
+        check("***" in out, f"{label}: and something is visibly masked", out[:70])
+
+    # The truncated case is the one that matters, and it is the one an earlier
+    # version got wrong: finding no `@`, it returned the string untouched, so a
+    # half-written .env line printed its password in full inside an error message
+    # that looked redacted. A malformed URL is precisely when this gets called.
+    truncated = _redacted(f"mssql+pyodbc://user:{SECRET}")
+    check(truncated == "mssql+pyodbc://user:***",
+          "a truncated credential is masked to the END rather than given up on",
+          truncated)
+
+    # Failing closed must not mean masking things that are not secrets -- an
+    # over-eager masker gets switched off, which is its own failure mode.
+    keeps = (
+        ("a port is not a password", "mssql+pyodbc://host:1433/db"),
+        ("sqlite has no credential", "sqlite://"),
+        ("in-memory sqlite", "sqlite:///:memory:"),
+    )
+    for label, url in keeps:
+        check(_redacted(url) == url, f"{label}: left alone", _redacted(url))
+
+    # THE POINT, asserted rather than only written down: the masker must work on a
+    # secret it has never been told. A filter built from a known value is stale the
+    # moment that value rotates -- it stops matching the new secret while carrying
+    # the old one into every log line. See RUNBOOK section 8 lesson 23.
+    unseen = "a-totally-different-secret-99"
+    out = _redacted(f"mssql+pyodbc://admin:{unseen}@elsewhere.example/db")
+    check(unseen not in out,
+          "a password this function has never seen is masked just the same", out)
+    check("admin" in out and "elsewhere.example" in out,
+          "while the non-secret parts stay legible, or the error is useless", out)
+
 def main() -> int:
     print("=" * 78)
     print("CONFIGURATION TESTS")
@@ -476,6 +528,7 @@ def main() -> int:
         test_repr_leaks_nothing,
         test_one_dotenv_loader,
         test_no_credentials_in_tracked_files,
+        test_redaction_is_structural_and_fails_closed,
     )
 
     # A test registered twice runs twice and its checks are counted twice. That

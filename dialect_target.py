@@ -80,15 +80,49 @@ def describe() -> str:
 
 
 def _redacted(url: str) -> str:
-    """A connection string with any password removed, for error messages."""
-    if "@" not in url:
+    """
+    A connection string with the credential masked BY SHAPE, never by value.
+
+    This is deliberately structural: it finds the credential by position -- the
+    text between the first `:` after `//` and the `@` that ends the userinfo --
+    and never compares against, or holds, the secret itself. A masker built from
+    a known password goes stale the instant the password rotates, which makes it
+    fail OPEN on the new value while carrying the old one into every log line it
+    touches. See RUNBOOK section 8 lesson 23.
+
+    **Fails CLOSED on a malformed URL**, which is the case that matters, because a
+    malformed URL is exactly what you are looking at when you call this. An
+    earlier version returned the string untouched when it found no `@` -- so a
+    truncated `scheme://user:password` (no host, no `@`) printed the password in
+    full, in an error message, while looking redacted. That shape is not
+    hypothetical; it is what a half-written `.env` line produces.
+    """
+    marker = url.find("//")
+    if marker == -1:
         return url
-    head, tail = url.split("@", 1)
-    if ":" in head and "//" in head:
-        scheme, creds = head.split("//", 1)
-        user = creds.split(":", 1)[0]
-        return f"{scheme}//{user}:***@{tail}"
-    return f"***@{tail}"
+    start = url.find(":", marker + 2)
+    if start == -1:
+        return url  # no credential segment at all, e.g. sqlite:// or //host/db
+
+    # There must be a real userinfo before that colon, or the colon belongs to
+    # something else entirely -- `sqlite:///:memory:` has one, and masking it
+    # produced `sqlite:///:***`. A masker that mangles URLs carrying no secret is
+    # a masker people route around, which is its own way of failing open.
+    userinfo = url[marker + 2:start]
+    if not userinfo or "/" in userinfo:
+        return url
+
+    # The LAST `@` before the path ends the userinfo. rfind rather than find so an
+    # unencoded `@` inside the password cannot leave its tail exposed.
+    end = url.rfind("@")
+    if end == -1 or end < start:
+        if url.find("/", start) != -1:
+            # `host:port/path` -- a port, not a password. Nothing to hide.
+            return url
+        # No `@` and no path: a truncated credential running to the end of the
+        # string. Mask to the end rather than give up.
+        end = len(url)
+    return url[:start + 1] + "***" + url[end:]
 
 
 def connect():

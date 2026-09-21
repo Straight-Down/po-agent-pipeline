@@ -312,4 +312,12 @@ not as history - a rule without its failure mode gets rationalised away.
   substitute.** It counts every settled line ever received against; it
   overstated one real count by 56x. Narrow with SuiteQL, then confirm through
   `POLine.is_open` - the field the matcher actually branches on.
+- **Redact structurally, never by literal.** Never build a filter from a secret's
+  value (`sed s/<the password>/.../`) - the filter itself carries the plaintext
+  into the shell history and the log, and it silently stops matching the moment
+  the value rotates, so it fails OPEN while looking filtered. Mask by shape
+  instead (`dialect_target._redacted`), or print
+  `make_url(...).render_as_string(hide_password=True)`. Also: never pass a
+  credential to a parser you are not sure about - `urlparse(url).port` raises a
+  ValueError that QUOTES the password. RUNBOOK section 8 lesson 23.
 - <add the next one here>

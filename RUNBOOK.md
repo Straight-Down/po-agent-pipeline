@@ -1208,6 +1208,35 @@ The mechanism that makes the feature work is the mechanism that swallows the typ
 **And the deeper reason this went unnoticed for four migrations:** the test suite runs on SQLite, which is the one dialect where the predicates work. A schema change that has never been run against the dialect it will deploy on is untested against the thing it will run on, however green the suite is. Hence `dialect_target.py` and the opt-in `--mssql` run — and the standing rule in CLAUDE.md's definition of done: **any migration touching an index, a constraint or a view is run both ways before it lands.**
 
 
+### 23. Redact structurally, never by literal — if your protection needs the plaintext, the protection is an exposure path
+
+Two secret exposures in one session, 2026-09-21, from opposite directions. They look like separate mistakes and they are one lesson.
+
+**The first: an exception carried a value nobody chose to print.** Diagnosing a connection string, `urlparse(url).port` raised `ValueError: Port could not be cast to integer value as '<the password>'`. Nothing in the code printed the password; the *parser* did, because a parse failure quotes the fragment it could not parse, and the fragment was the credential. **Every value passed to a library is a value some error path may quote back.** The only defence is not to hand it the plaintext at all.
+
+**The second: the redaction filter itself was the leak.** The response to the first was to pipe every subsequent command through `sed -e 's/<the password>/<PW>/g'`. That filter **contains the plaintext as a command-line argument** — so it is written into the shell history, the tool log, and the transcript, once per command, deliberately, as the price of "protecting" it. A filter that knows the secret publishes the secret every time it runs.
+
+**And it fails open, which is the part that makes it worse than useless.** A literal filter is stale the moment the value changes. That is not a slow drift; it is instantaneous and silent:
+
+| | a literal filter | a structural mask |
+|---|---|---|
+| after the secret rotates | **stops matching** — new secret passes through unredacted | still masks: it keys on position, not value |
+| what it carries | the OLD secret, into every log line | nothing |
+| how you find out | you do not | n/a |
+
+**Here it failed safe purely by accident.** The `.env` file had been edited 3.2 minutes earlier and the password rotated, so the literal in the `sed` was already dead — it leaked a value that no longer opened anything, and never matched the live one. **Had the rotation not happened in that window, the same code would have failed open**: publishing the live credential into every command line while silently failing to mask it in the output. The outcome was luck; the code was identical either way, which is the only thing about it worth remembering.
+
+**What actually protected the live value was a structural mask** — `re.sub(r'(://[^:/@]+:)[^@]*(@)', r'\1<PW>\2', url)`. It redacts by *shape*: "whatever sits between the colon after the username and the next `@` is a credential." It never needs to know what the secret is, so it cannot go stale, cannot be wrong after a rotation, and cannot carry the value anywhere. It also masks a secret it has never seen — which is the property that matters, because the one you have not seen is the one you are not being careful about.
+
+> **The check: does this protection require me to hold the plaintext? If yes, it is not protection — it is another copy.**
+
+Same shape as §14, one level down. §14 says do not write the *value* into the permanent record, describe the category instead. This says do not write the value into the *machinery that hides values*, match on structure instead. Both are the same refusal: **the thing that handles a secret in order to protect it is a place the secret now lives.**
+
+And the fail-open half belongs beside §18. A check that cannot fail is worse than no check because it reports success it did not earn; a redaction filter that silently stops matching is the same defect wearing a safety label — it keeps producing clean-looking output long after it stopped cleaning anything, and the output looks *more* trustworthy for having been filtered.
+
+**Applied to this repo:** the connection-string masker in `dialect_target._redacted` is already structural and should stay that way. When diagnosing anything credential-bearing, parse with `sqlalchemy.engine.make_url` and print `render_as_string(hide_password=True)`, or mask by shape — never `grep`, `sed` or a comparison against a value read out of `.env`.
+
+
 ## 9. How to recover when something breaks
 
 | Symptom | Likely cause | What to do |

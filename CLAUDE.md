@@ -229,8 +229,16 @@ then.
 4. Any statement in `CLAUDE.md`, `RUNBOOK.md` or the architecture doc that
    this change made untrue has been corrected.
 5. **If the change touches an INDEX, a CONSTRAINT or a VIEW, it has been run
-   against BOTH dialects** - SQLite and SQL Server - not just the one the
-   suite defaults to. See "Dual-dialect runs" below.
+   against BOTH dialects, IN BOTH DIRECTIONS** - SQLite and SQL Server,
+   upgrade AND downgrade - not just the one the suite defaults to and not just
+   the direction that runs on the way in. See "Dual-dialect runs" below.
+
+   The "both directions" half is not belt-and-braces: three of the eight
+   failures on the first real SQL Server run were downgrade-only, and they had
+   survived because SQLite's batch mode rebuilds tables and never issues the
+   raw DDL a downgrade contains. The forward path passed on both engines the
+   whole time. `test_migration_round_trip` does upgrade -> downgrade -> upgrade
+   and catches the category; under `--mssql` it does it on the server.
 
 The PostToolUse and Stop hooks in `.claude/settings.json` enforce 1 and 2
 automatically. 3, 4 and 5 you invoke.
@@ -320,4 +328,20 @@ not as history - a rule without its failure mode gets rationalised away.
   `make_url(...).render_as_string(hide_password=True)`. Also: never pass a
   credential to a parser you are not sure about - `urlparse(url).port` raises a
   ValueError that QUOTES the password. RUNBOOK section 8 lesson 23.
+- **The test harness only points at a database whose name ends in `-test`,** and
+  alembic reads a DIFFERENT variable (`PO_AGENT_DB_URL`) from the harness
+  (`PO_AGENT_TEST_DB_URL`). The harness DROPS EVERY TABLE ~25 times a run; one
+  variable serving both roles is set correctly for at most one of them. It was
+  once found naming the production database while the instruction said test.
+  No override - rename the database. RUNBOOK section 8 lesson 25.
+- **A migration that alters a table any VIEW depends on must DROP those views
+  first and recreate them after.** Documented since 0002 and forgotten anyway,
+  three times; now enforced by
+  `test_migrations_touching_a_viewed_table_do_the_view_dance` rather than by a
+  note. Symptom if you skip it: `error in view v_review_lines: no such table`.
+- **Do NOT write a migration by analogy to the previous one.** 0009's SQLite
+  branch is correctly a no-op (SQLite cannot represent VARCHAR vs NVARCHAR);
+  0010's was not (SQLite records and reflects a LENGTH). Write down the property
+  you are claiming both cases share - if that sentence is hard to write, the
+  analogy is doing more work than it can carry. RUNBOOK section 8 lesson 29.
 - <add the next one here>

@@ -1237,6 +1237,197 @@ And the fail-open half belongs beside §18. A check that cannot fail is worse th
 **Applied to this repo:** the connection-string masker in `dialect_target._redacted` is already structural and should stay that way. When diagnosing anything credential-bearing, parse with `sqlalchemy.engine.make_url` and print `render_as_string(hide_password=True)`, or mask by shape — never `grep`, `sed` or a comparison against a value read out of `.env`.
 
 
+### 24. A validator running on a model simpler than production validates the model, not production
+
+`alembic check` is the drift detector: it migrates an empty database to head and compares the result against `schema.py`. It works. On 2026-09-16 it caught migration 0007's two added columns **instantly**, before the migration existed, and refused to let the schema change land without one.
+
+On 2026-09-23, **108 columns changed type** — every `String(n)` became `Unicode(n)`, which is `VARCHAR(n)` → `NVARCHAR(n)` on the deployment dialect and the entire point of the change. `alembic check` reported:
+
+```
+No new upgrade operations detected.
+```
+
+Not a bug in Alembic. SQLite has type *affinity* rather than types: `VARCHAR(64)` and `NVARCHAR(64)` both reflect back as the same thing, because SQLite does not distinguish them and never has. The detector compared two things that are genuinely identical **in the dialect it was run against**, and correctly found no difference.
+
+**The property that matters is not that it missed this. It is that the same command, unchanged, is decisive in one case and blind in the other — and reports the identical output either way.** "No drift" after adding a column means the schema and the migrations agree. "No drift" after changing 108 types means SQLite cannot represent the question. Nothing in the output distinguishes them, and the person reading it cannot tell which they have without already knowing the answer.
+
+**The general form, and it is not about Alembic or SQLite:**
+
+> A validator running against a simpler model than production validates the model. Whether that tells you anything about production depends on whether the property under test survives the simplification — and the validator cannot tell you that, because the simplification is invisible from inside it.
+
+Every cheap proxy for a production environment has this shape: an in-memory database for a real one, a mock for a service, a fixture for live data, a type checker for a runtime. Each is worth having. Each is silently inapplicable to some class of change, and **the class is never announced**.
+
+**Third instance on this project, and the three together are the argument:**
+
+| | the check | what it could not see |
+|---|---|---|
+| §19 | two runners over one codebase | the script runner and pytest disagreed; only running both showed it |
+| §22 | the test suite, on SQLite | four filtered indexes silently becoming FULL unique indexes on another dialect |
+| **24** | `alembic check`, on SQLite | 108 column types changing, because SQLite renders both spellings identically |
+
+§22 was a dialect-specific *feature* vanishing. This is a dialect-specific *type distinction* vanishing. Same mechanism, one level down: the development engine is more permissive than the deployment engine, so everything compiles, everything passes, and the difference exists only where nothing is looking.
+
+**What follows, practically.** Not "distrust the drift check" — it is cheap and it caught 0007. Rather: **know which of your checks can see the change you are making**, and say so out loud when one cannot. For a change whose whole content is a type distinction SQLite does not have, a green SQLite suite is not weak evidence — it is *no* evidence, and it will look exactly like strong evidence. That is why migration 0009 carries an explicit acceptance list verified against `sys.columns` on a real SQL Server, rather than resting on a round-trip test that structurally cannot fail.
+
+**The tell to look for:** when a change is motivated by a difference between two environments, no check that runs in only one of them can confirm it. Write the acceptance criteria against the environment the change is *for*, before writing the change.
+
+
+### 25. A variable serving two consumers with different safety requirements will eventually be set correctly for only one of them
+
+`PO_AGENT_TEST_DB_URL` had two readers:
+
+| consumer | what it does to the database | safe default |
+|---|---|---|
+| the test harness (`dialect_target.fresh_engine`) | **DROPS EVERY TABLE**, once per test, ~25 times a run | a database nobody minds losing |
+| the migration tests, via `migration_url()` | runs `alembic upgrade head` against it | whatever you actually mean to migrate |
+
+Those requirements are opposite. **The safe default for one is the unsafe default for the other**, so there is no value of the variable that is right for both — and a single name cannot express the difference, because a URL is a string and a string has no opinion about what it deserves.
+
+**The near-miss, 2026-09-23.** Two Azure SQL databases were created, `sqldb-po-agent` and `sqldb-po-agent-test`. The instruction was explicit and repeated: *develop against the `-test` one*, and *"nothing touches sqldb-po-agent."* `PO_AGENT_TEST_DB_URL` was set to **`sqldb-po-agent`** — the ring-fenced one. Five characters missing from a hand-pasted line.
+
+Nothing in the code could have noticed. The variable's NAME says test; its VALUE said production; and the harness would have cheerfully dropped every table on it roughly 25 times, reporting a clean green run. The name is not a check — it is a claim, made once, by whoever typed it.
+
+**What actually caught it, and it is the transferable part.** The parsed `database` field was printed next to the database name written in prose in the instruction, and the two disagreed. That is the whole mechanism:
+
+> **One statement cannot disagree with itself.** A check needs two independent expressions of the same fact — and a variable read back from the environment and echoed is one expression, not two, however carefully it is formatted.
+
+This is why "print the config at startup" does not catch a wrong config. It restates the value; it does not test it. The comparison has to be against something derived separately — a written instruction, a naming rule, a second source of truth.
+
+**Same shape as the `limit` that was not a limit** (§8, the SuiteQL paging parameter whose name promised a row cap while it carried a page size, and walked an entire transaction table three rows at a time). Both are **one name describing one role while carrying two**. There the two roles were "how many rows do I want" and "how many per request"; here they are "what may I destroy" and "what shall I migrate". In both cases the name documents the safe reading, and the dangerous one travels along silently underneath it.
+
+**The fix is structural, in two parts, and neither is a convention:**
+
+1. **Split the variable by role.** `PO_AGENT_TEST_DB_URL` is the harness target; `PO_AGENT_DB_URL` is what Alembic migrates. Neither falls back to the other, and `migrations/env.py` refuses outright if the two name the same database -- because setting them equal re-creates the exact hazard the split removed.
+2. **Make the harness refuse a target it should not destroy.** `dialect_target` rejects any database whose name does not end in `-test`, checked before any connection is opened, with no override and no escape hatch. If the harness is ever genuinely needed elsewhere, **rename the database** -- deliberately more work than editing a variable.
+
+The suffix rule is doing something a comment could not: it moves the claim out of a value that one person types once and into a name that has to be created, which is a slower and more visible act.
+
+**And the guards were made to fire before being believed.** `test_harness_refuses_a_non_disposable_database` asserts both halves -- that the production name, a bare SQLite file, and a name merely *containing* "test" are all rejected; and that the real test database, in-memory SQLite and a `-test` SQLite file are all still allowed. A guard that refuses everything would pass a one-sided test and break the suite instead of protecting it. **A guard nobody has watched reject something is a hypothesis.**
+
+
+### 26. Stepping outside an abstraction to get one feature declines everything else it was doing silently
+
+Migration 0004 needed a conditional insert -- `INSERT ... WHERE NOT EXISTS`, so the same migration could run against a database that already had the row and one that did not. Core had no obvious spelling for it, so the author dropped to raw `sa.text()`.
+
+That bought the conditional. It also, in the same move, **declined identifier quoting** -- a service Core had been providing on every other statement in the file, silently, for free, to the point that nobody had ever had to think about it. `change_state_transitions.trigger` is a real column, `TRIGGER` is a reserved word in T-SQL, and the hand-written column list said `trigger` unbracketed:
+
+```
+[SQL Server]Incorrect syntax near the keyword 'trigger'. (156)
+```
+
+Core gets this right without being asked. Compiled the same statement:
+
+```
+mssql    INSERT INTO ... (from_state, to_state, [trigger], actor_kind) ...
+sqlite   INSERT INTO ... (from_state, to_state, "trigger", actor_kind) ...
+```
+
+**The tell:** raw SQL in a codebase that otherwise uses an ORM or a query builder is a place where *every* service that library provides has been declined at once -- quoting, parameter binding, dialect dispatch, type adaptation -- almost always to obtain exactly one of them. The question to ask at the point of writing is never "does this SQL look right" but **"what was the library doing here that I am now doing myself, and have I noticed all of it?"**
+
+**It stayed invisible for weeks because SQLite is lenient.** SQLite's own keyword list contains `TRIGGER` too, but its parser accepts a keyword as a column name in an unambiguous position, so the identical statement parsed fine on the development engine and was a syntax error on the deployment one. Same shape as §22 and §24: the permissive engine hides what the strict one refuses.
+
+**The fix was Core, not brackets.** Typing `[trigger]` by hand would have repeated the original error -- the author doing the library's job -- and would have covered only the one identifier somebody happened to notice. The conditional insert is expressible after all: `insert().from_select()` with `~sa.exists(...)`.
+
+**The full instance list, because the sweep is the point and not the case.** Of **227** schema identifiers, exactly one is reserved in either dialect: `change_state_transitions.trigger`. Hand-written SQL was then scanned for it:
+
+| where | found |
+|---|---|
+| `migrations/0004` conditional seed | the original failure |
+| `test_schema.py` seed-comparison query | a SECOND instance, in a test |
+
+The second one matters more than the first: the initial sweep covered `migrations/` and `schema.VIEWS` and reported **clean**, and the suite then failed on SQL Server with the identical error from a file the sweep never opened. **A detector with an unmapped blind spot is worse than no detector, because it converts "not checked" into "checked and clean".** `test_no_unquoted_reserved_identifiers_in_handwritten_sql` now scans every `.py` in the repo -- 200 fragments rather than 60 -- and states in its own body what it still cannot see: SQL assembled at runtime, f-string interpolations, and SQL that lives outside this repository.
+
+---
+
+### 27. A declared length that contradicts the column's own CHECK constraint is valid on one engine and broken on the other
+
+`proposed_changes.accumulation_basis` was declared **16** characters wide. Its CHECK constraint permits `PRE_EXISTING_RECEIPT`, which is **20**.
+
+Both statements sat in the same table definition, four lines apart, contradicting each other, through migration 0008 and every test run after it. SQLite does not enforce a `VARCHAR` length -- it stores what it is given -- so every test wrote all 20 characters and read all 20 back. SQL Server enforces the declaration:
+
+```
+String or binary data would be truncated in table 'proposed_changes',
+column 'accumulation_basis'. Truncated value: 'PRE_EXISTING_REC'.   (2628)
+```
+
+**Note which way the failure points.** SQL Server refuses the row loudly; the risk was never there. The risk was the engine that *accepted* it, because on any engine with silent truncation this becomes a column quietly holding `PRE_EXISTING_REC` -- which passes its own CHECK on no reading, matches no basis constant, and makes `accumulation_basis == BASIS_PRE_EXISTING_RECEIPT` false forever.
+
+**A column and its CHECK are two statements of the same fact, and they can disagree.** That makes it mechanically checkable, the same shape as the reserved-word sweep: for every column whose permitted values are enumerated, is the declared length at least the longest permitted value?
+
+| | |
+|---|---|
+| enumerated columns | **17** |
+| too short | **1** (this one) |
+| closest other | `size_composition_method`, 24 declared vs `COMPOSITION_REJECTED` at 20 |
+| zero-headroom exact fits | none |
+
+Extended to the other place the permitted values are known -- the seeded state machine, whose values are literals rather than a CHECK -- `change_states.state` is 32 against a longest of 21, `trigger` 64 against 51, `description` 500 against 287. All fit.
+
+**Generalisation:** wherever two declarations in the same schema constrain the same value, they can contradict each other, and an engine that enforces only one of them will not tell you. Find the pairs and check them mechanically. Fixed by migration 0010, widening to 32 rather than 20 so the next value does not need another migration.
+
+---
+
+### 28. A change scoped to one consumer can land on another, and the tell may be a timing change rather than an error
+
+`pytest --mssql` refused a correctly configured machine, saying `PO_AGENT_TEST_DB_URL` was unset. It was set -- in `.env`, which every other entry point loads explicitly and which pytest, alone, never did. The fix looked obvious: load `.env` in `conftest.py`.
+
+That fixed `--mssql`. It also put `PO_AGENT_TEST_DB_URL` into the environment of **every** run -- so the DEFAULT `pytest -q`, the loop run on every edit, silently moved onto an Azure database across the network, doing roughly 25 full schema teardowns per run.
+
+**Nothing failed.** The tests passed; they were simply running somewhere else. The only symptom was that an eight-second loop did not come back, and was still going at 120 seconds when the harness backgrounded it.
+
+**The tell was the duration, not an error**, and that is the part worth keeping. A change that moves *where* work happens rather than *whether it succeeds* produces no failure to notice -- the suite stays green, the output looks identical, and the only evidence is a number nobody is watching. Had the loop been slow to begin with, this would have gone unnoticed indefinitely.
+
+Same family as §25, the overloaded variable: **a change scoped to one consumer landing on another.** There the two consumers shared a variable; here they shared a config-loading side effect. The load is now scoped to the `--mssql` branch, with the reason written where someone would otherwise "simplify" it back:
+
+> Loading `.env` unconditionally puts the connection string in every run's environment and quietly moves the default loop onto the network. SQLite stays the default precisely because a slow loop is a loop people stop running.
+
+**The check to apply:** when a fix reaches for a module-level or process-wide effect -- an env var, a global, an import-time side effect -- ask which *other* consumers read it. The answer is rarely "none", and the ones that break quietly are the ones that keep passing.
+
+---
+
+### 29. "This is like the last one" is a claim that two things are the same in a respect you have not named
+
+Migration 0009 changed 115 columns from `VARCHAR` to `NVARCHAR`. Its SQLite branch is `return` -- correctly, because SQLite has type affinity rather than types and cannot represent the difference at all. `alembic check` confirms it by reporting no drift (§24).
+
+Migration 0010 widens one column from 16 to 32 characters. It was written by analogy to 0009, with the same SQLite no-op and a comment explaining that SQLite does not enforce lengths so there is nothing to do.
+
+**The analogy was false, and the drift check said so within seconds:**
+
+```
+New upgrade operations detected: [('modify_type', None, 'proposed_changes',
+                                   'accumulation_basis', ...)]
+```
+
+SQLite does not *enforce* a declared length, but it does **record and reflect** one. `VARCHAR(16)` and `VARCHAR(32)` are distinguishable there; `VARCHAR(16)` and `NVARCHAR(16)` are not. So 0009's no-op is right and 0010's was wrong, and the two migrations look like the same kind of change in every respect except the one that decides the answer.
+
+**The reasoning error is specific and worth naming.** "0010 is like 0009" was doing real work in the decision, and the respect in which they were alike was never stated -- had it been written out ("both change a column type in a way SQLite cannot represent") the second clause would have been visibly false. An unstated analogy cannot be checked, which is exactly what makes it attractive.
+
+> **When you catch yourself reasoning from the last case, write down the property you are claiming both cases share. If that sentence is hard to write, the analogy is doing more work than it can support.**
+
+Related to §16's question in form -- *if production disagreed, would anything say so?* -- but the failure here was cheaper only by luck: the drift check happened to be able to see a length change. Had 0010 differed from 0009 in some respect SQLite could not represent either, nothing would have objected.
+
+---
+
+### 30. When documentation has failed repeatedly at the same point, the fix is structural
+
+Every view over a table must be dropped before that table is altered and recreated afterwards -- SQLite's batch mode rebuilds the table and cannot drop one a view references. This has been written down since **migration 0002**, is restated in the docstring of every migration that does it, and appears in `RUNBOOK` §7.
+
+It was omitted from migration 0010 anyway, by an author who knew the rule and had written that note into other migrations in the same session:
+
+```
+sqlite3.OperationalError: error in view v_review_lines: no such table: main.proposed_changes
+```
+
+**Third occurrence.** At that point the question stops being "how do we make the note clearer" -- the note is clear, prominent, repeated, and was read -- and becomes "why is this a thing a person has to remember at all".
+
+Two structural options, and the choice is not obvious:
+
+- **A helper** (`with view_dance(bind): ...`). Rejected, on this codebase's own grounds: `test_migrations_import_no_application_code` forbids a migration importing project code, because a migration must mean what it meant at its revision rather than following a module that keeps changing. A shared helper is exactly that dependency. And a helper you forget to call is as broken as the DDL you forget to write -- it lowers the cost of remembering without removing the need to.
+- **A test that fails without it.** Built: `test_migrations_touching_a_viewed_table_do_the_view_dance` derives the viewed tables from the view SQL itself (so a view gaining a JOIN extends the check automatically), finds every migration that alters one of them -- via `batch_alter_table` or raw `ALTER TABLE` -- and asserts that it also drops and recreates the views. Static, so it covers downgrade-only paths no run happens to take. It asserts that **7** migrations alter a viewed table, so the check has something to fail on, and verifies against a synthetic offending migration that it actually rejects one.
+
+**The general form:** a rule that has been documented and broken three times is not under-documented. Each repetition is evidence that the rule needs to live somewhere a person cannot walk past -- and the choice between "make it automatic" and "make it fail" should be settled by whether the automation itself can be forgotten. Here it could, so the answer was the check.
+
+
 ## 9. How to recover when something breaks
 
 | Symptom | Likely cause | What to do |

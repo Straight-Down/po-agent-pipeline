@@ -188,20 +188,64 @@ def upgrade() -> None:
     # an IntegrityError on the other. (That 0001 does not freeze its seed the way
     # it freezes the view definitions is a wart worth knowing about; every future
     # state-adding migration has to be written this way.)
+    # AMENDED 2026-09-23. This block was raw `sa.text()` and could not run on SQL
+    # Server at all: `trigger` is a reserved word in T-SQL (and in SQLite's own
+    # keyword list), so `..., to_state, trigger, actor_kind)` is a syntax error
+    # there -- "Incorrect syntax near the keyword 'trigger'". It had gone
+    # unnoticed because SQLite's parser accepts a keyword as a column name in an
+    # unambiguous position, so the identical statement parsed fine.
+    #
+    # Rewritten through Core, which quotes identifiers because that is the
+    # dialect's job: `[trigger]` on mssql, `"trigger"` on SQLite. Deliberately
+    # NOT fixed by typing the brackets in by hand -- that would repeat the
+    # original mistake, the author doing work the library already does, and
+    # would only cover the one identifier someone happened to notice.
+    #
+    # Amending an existing migration is an exception to the freeze rule, allowed
+    # here by its stated test: the amendment cannot change the meaning of any
+    # database actually built from it. On SQL Server that set is empty because
+    # the statement could never run; on SQLite the emitted SQL is identical
+    # apart from quoting. See RUNBOOK section 8.
+    states = sa.table(
+        "change_states",
+        sa.column("state"), sa.column("is_terminal"), sa.column("description"),
+    )
     bind.execute(
-        sa.text("INSERT INTO change_states (state, is_terminal, description) "
-                "SELECT :s, 0, :d WHERE NOT EXISTS "
-                "(SELECT 1 FROM change_states WHERE state = :s)"),
-        {"s": NEW_STATE, "d": NEW_STATE_DESCRIPTION},
+        states.insert().from_select(
+            ["state", "is_terminal", "description"],
+            sa.select(
+                sa.literal(NEW_STATE), sa.literal(0), sa.literal(NEW_STATE_DESCRIPTION)
+            ).where(
+                ~sa.exists(
+                    sa.select(sa.literal(1)).select_from(states)
+                    .where(states.c.state == NEW_STATE)
+                )
+            ),
+        )
+    )
+
+    transitions = sa.table(
+        "change_state_transitions",
+        sa.column("from_state"), sa.column("to_state"),
+        sa.column("trigger"), sa.column("actor_kind"),
     )
     for frm, to, trigger, actor in NEW_TRANSITIONS:
         bind.execute(
-            sa.text("INSERT INTO change_state_transitions "
-                    "(from_state, to_state, trigger, actor_kind) "
-                    "SELECT :f, :t, :g, :a WHERE NOT EXISTS "
-                    "(SELECT 1 FROM change_state_transitions "
-                    " WHERE from_state = :f AND to_state = :t)"),
-            {"f": frm, "t": to, "g": trigger, "a": actor},
+            transitions.insert().from_select(
+                ["from_state", "to_state", "trigger", "actor_kind"],
+                sa.select(
+                    sa.literal(frm), sa.literal(to), sa.literal(trigger), sa.literal(actor)
+                ).where(
+                    ~sa.exists(
+                        sa.select(sa.literal(1)).select_from(transitions).where(
+                            sa.and_(
+                                transitions.c.from_state == frm,
+                                transitions.c.to_state == to,
+                            )
+                        )
+                    )
+                ),
+            )
         )
 
     bind.execute(sa.text(VIEW_REVIEW_LINES))
@@ -221,6 +265,28 @@ def downgrade() -> None:
             {"f": frm, "t": to},
         )
     bind.execute(sa.text("DELETE FROM change_states WHERE state = :s"), {"s": NEW_STATE})
+
+    # AMENDED 2026-09-23. `key_recap_label` was added with server_default="",
+    # which SQL Server materialises as an auto-named DEFAULT constraint
+    # (DF__proposed___key_r__..., a different name in every database). A column
+    # cannot be dropped while a constraint depends on it:
+    #   The object 'DF__proposed___key_r__34D55D77' is dependent on column
+    #   'key_recap_label'. ALTER TABLE DROP COLUMN ... failed.   (5074 / 4922)
+    # SQLite has no such object and batch mode rebuilds the table regardless, so
+    # this downgrade had never been exercised anywhere it could fail. The name is
+    # discovered, never written down -- 0009 hit the same trap on the way up.
+    if bind.dialect.name != "sqlite":
+        bind.execute(sa.text("""
+            DECLARE @n sysname;
+            SELECT @n = dc.name
+              FROM sys.default_constraints dc
+              JOIN sys.columns c ON c.object_id = dc.parent_object_id
+                                AND c.column_id = dc.parent_column_id
+             WHERE dc.parent_object_id = OBJECT_ID('proposed_changes')
+               AND c.name = 'key_recap_label';
+            IF @n IS NOT NULL
+                EXEC('ALTER TABLE [proposed_changes] DROP CONSTRAINT [' + @n + ']');
+        """))
 
     with op.batch_alter_table('proposed_changes', schema=None) as batch_op:
         batch_op.drop_index('ux_proposed_changes_one_line_per_shipment')

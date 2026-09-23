@@ -237,15 +237,28 @@ def test_migration_seed_matches_schema() -> None:
             }
             in_db_trans = {
                 (r[0], r[1], r[2], r[3])
-                for r in conn.execute(text(
-                    "SELECT from_state, to_state, trigger, actor_kind "
-                    "FROM change_state_transitions"))
+                # Core, not raw SQL: `trigger` is reserved in BOTH dialects and
+                # SQL Server rejects it unquoted. Letting the dialect quote it is
+                # the entire point -- RUNBOOK section 8.
+                for r in conn.execute(select(
+                    change_state_transitions.c.from_state,
+                    change_state_transitions.c.to_state,
+                    change_state_transitions.c.trigger,
+                    change_state_transitions.c.actor_kind))
             }
-            in_db_views = {
-                r[0]: norm(r[1])
-                for r in conn.execute(text(
+            # Each engine keeps view DDL in its own catalog, and neither name is
+            # portable: `sqlite_master` on SQLite, `sys.sql_modules` on SQL
+            # Server. The COMPARISON is the same either way -- normalised text
+            # against schema.VIEWS -- so only the lookup branches.
+            if dt_target.is_sqlite():
+                view_sql = conn.execute(text(
                     "SELECT name, sql FROM sqlite_master WHERE type = 'view'"))
-            }
+            else:
+                view_sql = conn.execute(text(
+                    "SELECT v.name, m.definition FROM sys.views v "
+                    "JOIN sys.sql_modules m ON m.object_id = v.object_id "
+                    "WHERE v.is_ms_shipped = 0"))
+            in_db_views = {r[0]: norm(r[1]) for r in view_sql}
         engine.dispose()
 
     want_states = {(s, bool(t), d) for s, t, d in sc.CHANGE_STATES}
@@ -953,7 +966,10 @@ def test_state_machine_is_data() -> None:
 
     with engine.connect() as conn:
         terminal = set(conn.execute(select(change_states.c.state).where(
-            change_states.c.is_terminal.is_(True))).scalars().all())
+            # `.is_(True)` renders `IS 1`, which SQLite accepts and SQL Server
+            # rejects -- there, IS pairs only with NULL. `== True` renders
+            # `= 1` on both. (`.is_(None)` stays correct everywhere.)
+            change_states.c.is_terminal == True)).scalars().all())  # noqa: E712
     check(terminal == {sc.STATE_DISCARDED, sc.STATE_SUPERSEDED},
           "only DISCARDED and SUPERSEDED are terminal", str(sorted(terminal)))
 
@@ -1081,11 +1097,23 @@ def test_scope_boundaries_in_the_schema() -> None:
 
 
 def test_foreign_keys_are_enforced() -> None:
-    section("SQLite foreign keys are actually on (they are off by default)")
+    section("foreign keys are actually enforced on whichever engine this is")
     engine = fresh_db()
-    with engine.begin() as conn:
-        enabled = conn.execute(text("PRAGMA foreign_keys")).scalar()
-    check(enabled == 1, "PRAGMA foreign_keys is ON for this connection", str(enabled))
+
+    # HOW they are enforced is dialect-specific; THAT they are enforced is not,
+    # and it is the only part worth asserting the same way on both. SQLite has
+    # them off by default and needs a per-connection PRAGMA (schema.py registers
+    # one); SQL Server has no such switch and no such pragma -- issuing it there
+    # gets "Could not find stored procedure 'PRAGMA'".
+    if dt_target.is_sqlite():
+        with engine.begin() as conn:
+            enabled = conn.execute(text("PRAGMA foreign_keys")).scalar()
+        check(enabled == 1, "PRAGMA foreign_keys is ON for this connection", str(enabled))
+    else:
+        with engine.begin() as conn:
+            n = conn.execute(text(
+                "SELECT COUNT(*) FROM sys.foreign_keys WHERE is_disabled = 0")).scalar()
+        check(n == 19, "all 19 foreign keys exist and none is disabled", str(n))
     with engine.begin() as conn:
         expect_integrity(
             lambda: conn.execute(shipment_pos.insert(), {
@@ -1188,6 +1216,110 @@ def test_partial_indexes_refuse_unsupported_dialects() -> None:
     # choose between.
     check(True, "(the silent-widening failure is now unrepresentable)")
 
+
+def test_migrations_touching_a_viewed_table_do_the_view_dance() -> None:
+    """
+    A migration that alters a table any view depends on must drop those views
+    first and recreate them after.
+
+    ## Why this is a TEST and not a helper
+
+    The obvious fix is a shared `view_dance()` helper. It is the wrong one here,
+    and for a reason this repo already enforces:
+    `test_migrations_import_no_application_code` forbids a migration importing
+    project code, because a migration's behaviour must be fixed at its revision
+    rather than following whatever the imported module holds when it runs. A
+    shared helper is precisely that -- every migration's behaviour would depend
+    on code that keeps changing. And a helper you forget to call is exactly as
+    broken as the DDL you forget to write; it lowers the cost of remembering
+    without removing the need to.
+
+    So the structural fix is a check that fails when the dance is missing. This is
+    the THIRD time the omission has bitten (0002 established the pattern, and it
+    was left out of 0010 by an author who knew about it and had written the note).
+    **When documentation has failed repeatedly at the same point, the answer is
+    not a louder note.**
+
+    Static, not runtime: the round-trip test already catches this by blowing up
+    with "error in view v_review_lines: no such table", but only after the
+    migration exists and only for the paths a run happens to take. This reads the
+    source, so it catches the omission in every migration including downgrade-only
+    paths.
+    """
+    section("a migration altering a viewed table must drop and recreate the views")
+    import ast
+    import pathlib as _pl
+    import re as _re
+
+    here = _pl.Path(__file__).resolve().parent
+
+    # Which tables the views depend on -- read from the view SQL, not hardcoded,
+    # so a view gaining a JOIN extends this automatically.
+    viewed = set()
+    for _name, ddl in sc.VIEWS:
+        for m in _re.finditer(r"\b(?:FROM|JOIN)\s+(\w+)", ddl, _re.I):
+            viewed.add(m.group(1).lower())
+    check(viewed >= {"proposed_changes", "shipment_pos", "shipments"},
+          "the tables the views depend on, derived from the view SQL",
+          str(sorted(viewed)))
+
+    offenders = []
+    checked = 0
+    for f in sorted((here / "migrations" / "versions").glob("*.py")):
+        src = f.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+
+        # Does it alter a viewed table? Either via batch_alter_table(...) or a
+        # raw ALTER TABLE naming one.
+        touched = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                fn = node.func
+                nm = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+                if nm == "batch_alter_table" and node.args:
+                    a = node.args[0]
+                    if isinstance(a, ast.Constant) and str(a.value).lower() in viewed:
+                        touched.add(str(a.value).lower())
+        for m in _re.finditer(r"ALTER\s+TABLE\s+\[?(\w+)\]?", src, _re.I):
+            if m.group(1).lower() in viewed:
+                touched.add(m.group(1).lower())
+        if not touched:
+            continue
+
+        checked += 1
+        drops = bool(_re.search(r"DROP\s+VIEW", src, _re.I))
+        creates = bool(_re.search(r"CREATE\s+VIEW", src, _re.I))
+        if not (drops and creates):
+            offenders.append(
+                f"{f.name}: alters {sorted(touched)} but "
+                f"{'never DROPs a view' if not drops else 'never re-CREATEs one'}")
+
+    check(checked >= 5,
+          "several migrations do alter a viewed table -- so this can actually fail",
+          f"{checked} migration(s) alter one")
+    check(not offenders,
+          "every one of them drops the views and puts them back",
+          str(offenders) if offenders else "all clean")
+
+    # The check must be able to fail, or it is decoration. Run the same logic over
+    # a synthetic migration that alters a viewed table and forgets the dance.
+    bad = ("def upgrade():\n"
+           "    with op.batch_alter_table('proposed_changes') as b:\n"
+           "        b.alter_column('key_size')\n")
+    bad_tree = ast.parse(bad)
+    bad_touched = {
+        str(n.args[0].value).lower()
+        for n in ast.walk(bad_tree)
+        if isinstance(n, ast.Call)
+        and (n.func.attr if isinstance(n.func, ast.Attribute) else "") == "batch_alter_table"
+        and n.args and isinstance(n.args[0], ast.Constant)
+        and str(n.args[0].value).lower() in viewed
+    }
+    would_flag = bool(bad_touched) and not _re.search(r"DROP\s+VIEW", bad, _re.I)
+    check(would_flag,
+          "and the check REJECTS a migration that omits it -- verified on a "
+          "synthetic one, not assumed")
+
 def main() -> int:
     print("=" * 78)
     print("SCHEMA TESTS -- migration 0001")
@@ -1215,6 +1347,7 @@ def main() -> int:
         test_scope_boundaries_in_the_schema,
         test_foreign_keys_are_enforced,
         test_partial_indexes_refuse_unsupported_dialects,
+        test_migrations_touching_a_viewed_table_do_the_view_dance,
     )
 
     # A test registered twice runs twice and its checks are counted twice. That

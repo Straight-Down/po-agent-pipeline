@@ -644,11 +644,23 @@ def test_transport_mode_recap_rows() -> None:
         double_write()
         check(False, "the DB refuses two changes selecting ONE line", "the update succeeded")
     except IntegrityError as exc:
-        # SQLite reports the offending COLUMNS rather than the index name.
-        check("proposed_changes.shipment_id" in str(exc)
-              and "proposed_changes.ns_line_id" in str(exc),
-              "the DB refuses two changes selecting ONE line",
-              str(exc).splitlines()[0][-58:])
+        # The two engines name the violation differently, and the ONLY portable
+        # part is that it was refused -- so check for either idiom rather than
+        # asserting on one engine's wording:
+        #   SQLite     reports the offending COLUMNS: "proposed_changes.ns_line_id"
+        #   SQL Server reports the INDEX: "ux_proposed_changes_one_line_per_shipment"
+        # This was the one failure of eight on the first SQL Server run that
+        # concerned BEHAVIOUR rather than syntax, and the behaviour turned out to
+        # be right on both: the constraint fired. Only the assertion was
+        # dialect-specific.
+        detail = str(exc)   # NOT `msg` -- that is this module's envelope helper
+        by_columns = ("proposed_changes.shipment_id" in detail
+                      and "proposed_changes.ns_line_id" in detail)
+        by_index = "ux_proposed_changes_one_line_per_shipment" in detail
+        check(by_columns or by_index,
+              "the DB refuses two changes selecting ONE line, naming that constraint",
+              ("columns" if by_columns else "index" if by_index else "NEITHER")
+              + ": " + detail.splitlines()[0][-58:])
 
     # But assigning them to DIFFERENT lines is exactly what should be allowed.
     with engine.begin() as conn:

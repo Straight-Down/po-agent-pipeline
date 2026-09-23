@@ -56,7 +56,20 @@ def pytest_configure(config):
     "I meant to test the production dialect" into something that can fail.
     """
     if not config.getoption("--mssql"):
+        # Deliberately do NOT read `.env` here. The connection string lives there,
+        # so loading it unconditionally would put PO_AGENT_TEST_DB_URL in the
+        # environment of EVERY run and quietly move the default loop onto Azure --
+        # ~25 schema teardowns over the network on every `pytest -q`. SQLite stays
+        # the default precisely because a slow loop is a loop people stop running.
         return
+
+    # `--mssql` is the explicit request, so now the file is read. Other entry
+    # points call `config.load_env_file` themselves; pytest is the one caller that
+    # never did, which made `--mssql` refuse a correctly-configured machine on the
+    # grounds that the variable was "unset" when it had simply never been read.
+    from config import load_env_file
+
+    load_env_file(".env")
 
     import dialect_target as dt_target
 

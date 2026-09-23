@@ -18,8 +18,22 @@ constraint this design exists to satisfy.
 - **Application-generated UTC timestamps**, never `datetime('now')`/`GETDATE()`.
 - **Explicit lengths on every string column.** Azure SQL cannot index
   `NVARCHAR(MAX)` and caps an index key at 1700 bytes, so an unbounded column
-  quietly becomes un-indexable there. JSON payload columns use `Text` precisely
-  because they are never indexed.
+  quietly becomes un-indexable there. JSON payload columns use `UNBOUNDED_TEXT`
+  (`NVARCHAR(MAX)`) precisely because they are never indexed -- note that plain
+  `UnicodeText` would render as the DEPRECATED `NTEXT` there, which is why that
+  type is declared once below rather than written at each column.
+- **`Unicode`, never `String`, for every text column** -- so Azure SQL gets
+  `NVARCHAR` rather than `VARCHAR`. Not a preference: under the Latin-1 collation
+  a `VARCHAR` column converts CJK to `?` **on write**, so the two real colours
+  `黑色` and `紅色` both become `??` and compare EQUAL -- and since the canonical
+  keys are uniquely indexed, the second one is rejected as a duplicate. The
+  conversion is lossy and irreversible; re-collating afterwards recovers nothing.
+  Applied to ALL 108 sized columns AND all 7 unbounded ones, rather than only
+  the 39 that can currently receive non-ASCII, because a rule requiring per-column classification is one more thing
+  to get wrong later, and this failure mode is silent. Lengths are unchanged and
+  still mean CHARACTERS -- which is why this is `NVARCHAR` and not a UTF-8
+  collation, where `VARCHAR(n)` means n BYTES and every length would silently
+  become a smaller character budget. See RUNBOOK section 6.
 - **`Numeric`, never `Float`, for quantities.** Binary floating point is the wrong
   tool for something a human will reconcile against a printed document.
 - **No NULLs in key columns.** `''` is the sentinel for "the document did not say"
@@ -50,12 +64,13 @@ from sqlalchemy import (
     Integer,
     MetaData,
     Numeric,
-    String,
     Table,
-    Text,
+    Unicode,
+    UnicodeText,
     UniqueConstraint,
     event,
 )
+from sqlalchemy.dialects import mssql
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.schema import CreateIndex
@@ -69,6 +84,19 @@ NAMING_CONVENTION = {
     "fk": "fk_%(table_name)s_%(column_0_name)s",
     "pk": "pk_%(table_name)s",
 }
+
+#: The unbounded text type for the JSON/free-text columns, spelled so BOTH
+#: engines get the right thing.
+#:
+#: `UnicodeText` alone renders as **NTEXT** on SQL Server, which is deprecated,
+#: cannot be indexed, and does not work with most string functions -- Microsoft
+#: has said it will be removed. The variant pins the modern `NVARCHAR(MAX)` for
+#: mssql while leaving SQLite exactly as it was (`TEXT`).
+#:
+#: Caught only by compiling it and reading the output. `UnicodeText` is the
+#: obvious name, it is Unicode-correct, and it is still the wrong type -- the
+#: kind of thing that is invisible until someone looks at the DDL.
+UNBOUNDED_TEXT = UnicodeText().with_variant(mssql.NVARCHAR(None), "mssql")
 
 metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
@@ -180,17 +208,17 @@ def text_clause(predicate: str):
 messages = Table(
     "messages",
     metadata,
-    Column("id", String(36), primary_key=True),
+    Column("id", Unicode(36), primary_key=True),
     # DEDUP AXIS 1. Graph cannot mark a message read or move it (Mail.Read is
     # read-only), so the mailbox is immutable to this app and cannot hold state.
     # "Have I seen this message?" has to be answerable from here.
-    Column("graph_message_id", String(512), nullable=False),
-    Column("internet_message_id", String(512)),
-    Column("mailbox", String(320), nullable=False),
-    Column("subject", String(1000)),
-    Column("from_address", String(320)),
+    Column("graph_message_id", Unicode(512), nullable=False),
+    Column("internet_message_id", Unicode(512)),
+    Column("mailbox", Unicode(320), nullable=False),
+    Column("subject", Unicode(1000)),
+    Column("from_address", Unicode(320)),
     # Set when Paula forwards rather than the vendor mailing the box directly.
-    Column("forwarded_by", String(320)),
+    Column("forwarded_by", Unicode(320)),
     Column("sent_at", DateTime),
     Column("received_at", DateTime, nullable=False),
     Column("ingested_at", DateTime, nullable=False),
@@ -201,21 +229,21 @@ messages = Table(
     # on: the mailbox is dedicated to this pipeline so everything in it is in
     # scope today, and a folder rule added later can be written against stored
     # rows instead of re-reading the mailbox.
-    Column("folder_id", String(512)),
+    Column("folder_id", Unicode(512)),
     # What the mailbox said it carried, before any of it was fetched. Lets a
     # message with zero attachments be a recorded fact rather than an absence,
     # and lets a partial fetch be detected.
     Column("attachment_count", Integer, nullable=False, default=0),
     # INTAKE failure, per message. One unreadable message must not stop a poll,
     # so the failure is recorded here and the loop continues.
-    Column("poll_error", String(1000)),
+    Column("poll_error", Unicode(1000)),
     # EXTRACTION progress, and deliberately NOT the same axis as poll_error.
     # The poller stores bytes; a separate driver extracts them. `extracted_at`
     # NULL means "landed, not yet parsed" -- which is exactly the work queue,
     # and is why a parser change can be re-run over everything already stored
     # without touching Graph.
     Column("extracted_at", DateTime),
-    Column("extraction_error", String(1000)),
+    Column("extraction_error", Unicode(1000)),
     UniqueConstraint("graph_message_id", name="uq_messages_graph_message_id"),
 )
 
@@ -225,21 +253,21 @@ attachments = Table(
     # DEDUP AXIS 2, and the reason this table is keyed by content rather than by
     # (message, filename): a re-forward arrives with a NEW message id carrying the
     # SAME bytes. Keying on content makes that one row, seen twice.
-    Column("content_sha256", String(64), primary_key=True),
+    Column("content_sha256", Unicode(64), primary_key=True),
     Column("byte_size", Integer, nullable=False),
     # The classifier's verdict belongs to the CONTENT. Filenames lie -- one real
     # vendor's customs invoice is named "...PACKING LIST.pdf" -- so the verdict
     # must not be stored per filename.
-    Column("doc_type", String(32), nullable=False),
-    Column("doc_type_reason", String(1000)),
+    Column("doc_type", Unicode(32), nullable=False),
+    Column("doc_type_reason", Unicode(1000)),
     # Set when the file could not be opened at all (truncated, encrypted, empty).
     # Distinct from "opened fine, has no size data".
-    Column("open_failure_reason", String(500)),
+    Column("open_failure_reason", Unicode(500)),
     # Inspection reports. Paula's ruling, permanent, not a tunable.
     Column("banned_as_data_source", Boolean, nullable=False, default=False),
     # Where the bytes live. NOT in the database -- see the retention section of the
     # rationale doc for what is stored, where, and the purge story.
-    Column("stored_uri", String(1000)),
+    Column("stored_uri", Unicode(1000)),
     Column("first_seen_at", DateTime, nullable=False),
     CheckConstraint(
         "doc_type IN ('PACKING_LIST','COMMERCIAL_INVOICE','SHIPPING_ADVICE',"
@@ -256,13 +284,13 @@ attachments = Table(
 message_attachments = Table(
     "message_attachments",
     metadata,
-    Column("id", String(36), primary_key=True),
-    Column("message_id", String(36), ForeignKey("messages.id"), nullable=False),
+    Column("id", Unicode(36), primary_key=True),
+    Column("message_id", Unicode(36), ForeignKey("messages.id"), nullable=False),
     Column(
-        "content_sha256", String(64), ForeignKey("attachments.content_sha256"), nullable=False
+        "content_sha256", Unicode(64), ForeignKey("attachments.content_sha256"), nullable=False
     ),
     # Per-message, not per-content: the same file can arrive under two names.
-    Column("filename", String(500), nullable=False),
+    Column("filename", Unicode(500), nullable=False),
     UniqueConstraint("message_id", "content_sha256", name="uq_message_attachments_pair"),
 )
 
@@ -274,36 +302,36 @@ message_attachments = Table(
 shipments = Table(
     "shipments",
     metadata,
-    Column("id", String(36), primary_key=True),
+    Column("id", Unicode(36), primary_key=True),
     # A shipment is "a batch of PO line updates arising from one real-world
     # shipment event, evidenced either by a vendor document or by Paula's
     # instruction". Both workflows live here; `origin` separates them. A
     # PAULA_DIRECTED row legitimately has no message, no attachment and often no
     # vendor name -- that is the shape, not missing data.
-    Column("origin", String(16), nullable=False),
-    Column("message_id", String(36), ForeignKey("messages.id")),
+    Column("origin", Unicode(16), nullable=False),
+    Column("message_id", Unicode(36), ForeignKey("messages.id")),
     # The attachment whose lines were actually parsed. NULL for PAULA_DIRECTED.
     Column(
-        "primary_attachment_sha", String(64), ForeignKey("attachments.content_sha256")
+        "primary_attachment_sha", Unicode(64), ForeignKey("attachments.content_sha256")
     ),
     # sha of the sorted source shas -- lets a re-forward of the same attachment
     # SET be recognised even before the primary is chosen.
-    Column("source_set_hash", String(64)),
-    Column("superseded_by_shipment_id", String(36), ForeignKey("shipments.id")),
-    Column("vendor_name", String(200)),
+    Column("source_set_hash", Unicode(64)),
+    Column("superseded_by_shipment_id", Unicode(36), ForeignKey("shipments.id")),
+    Column("vendor_name", Unicode(200)),
     # Vendor-stated dates: REFERENCE ONLY. Never written to NetSuite, never
     # promoted into a confirmed receipt date. They live here, on the shipment,
     # deliberately far from the line where a date could be written.
-    Column("vendor_etd", String(40)),
-    Column("vendor_eta", String(40)),
+    Column("vendor_etd", Unicode(40)),
+    Column("vendor_eta", Unicode(40)),
     # Calibration slicing: which parser and which model produced these lines.
-    Column("parser", String(64)),
-    Column("extractor_model", String(64)),
-    Column("extractor_prompt_version", String(64)),
+    Column("parser", Unicode(64)),
+    Column("extractor_model", Unicode(64)),
+    Column("extractor_prompt_version", Unicode(64)),
     Column("doc_needs_review", Boolean, nullable=False, default=False),
     Column("needs_manual_entry", Boolean, nullable=False, default=False),
-    Column("parse_warnings_json", Text),
-    Column("parse_notes_json", Text),
+    Column("parse_warnings_json", UNBOUNDED_TEXT),
+    Column("parse_notes_json", UNBOUNDED_TEXT),
     Column("line_count", Integer),
     Column("unit_total", Numeric(12, 3)),
     # WHAT THIS SHIPMENT COST, totalled across its primary and every cross-check.
@@ -314,7 +342,7 @@ shipments = Table(
     # run and has to be guessed from character counts (section 8 lesson 21).
     Column("extractor_input_tokens", Integer),
     Column("extractor_output_tokens", Integer),
-    Column("created_by", String(320), nullable=False),
+    Column("created_by", Unicode(320), nullable=False),
     Column("created_at", DateTime, nullable=False),
     CheckConstraint("origin IN ('VENDOR_EMAIL','PAULA_DIRECTED')", name="origin"),
     CheckConstraint(
@@ -339,18 +367,18 @@ Index("ix_shipments_source_set_hash", shipments.c.source_set_hash)
 shipment_sources = Table(
     "shipment_sources",
     metadata,
-    Column("id", String(36), primary_key=True),
-    Column("shipment_id", String(36), ForeignKey("shipments.id"), nullable=False),
+    Column("id", Unicode(36), primary_key=True),
+    Column("shipment_id", Unicode(36), ForeignKey("shipments.id"), nullable=False),
     Column(
-        "content_sha256", String(64), ForeignKey("attachments.content_sha256"), nullable=False
+        "content_sha256", Unicode(64), ForeignKey("attachments.content_sha256"), nullable=False
     ),
     # One email can carry several documents covering the same shipment -- a
     # style/colour/size rollup AND a carton-by-carton detail, which the pipeline
     # cross-checks against each other. Roles record which was parsed, which
     # corroborated it, and which was set aside.
-    Column("role", String(16), nullable=False),
-    Column("exclusion_reason", String(500)),
-    Column("agreement_json", Text),
+    Column("role", Unicode(16), nullable=False),
+    Column("exclusion_reason", Unicode(500)),
+    Column("agreement_json", UNBOUNDED_TEXT),
     # PER DOCUMENT, which is the grain the question is actually asked at: a
     # cross-check that costs a full extraction and is then discarded is invisible
     # in a per-shipment total. Same NULL/zero distinction as `shipments`.
@@ -363,17 +391,17 @@ shipment_sources = Table(
 shipment_pos = Table(
     "shipment_pos",
     metadata,
-    Column("id", String(36), primary_key=True),
-    Column("shipment_id", String(36), ForeignKey("shipments.id"), nullable=False),
+    Column("id", Unicode(36), primary_key=True),
+    Column("shipment_id", Unicode(36), ForeignKey("shipments.id"), nullable=False),
     # A shipment is NOT 1:1 with a PO -- one Inprotex sheet interleaves six. This
     # table is the fan-out, and it carries per-PO resolution state so PO #4 failing
     # to resolve does not stall the other five.
-    Column("po_number_printed", String(120), nullable=False),  # verbatim "PO NO : 1720"
-    Column("po_number_key", String(40), nullable=False),  # canonical digits "1720"
-    Column("ns_tranid", String(40)),  # "PO0001720", once resolved
-    Column("ns_internal_id", String(40)),
-    Column("resolution_status", String(16), nullable=False, default="UNRESOLVED"),
-    Column("resolution_strategy", String(64)),
+    Column("po_number_printed", Unicode(120), nullable=False),  # verbatim "PO NO : 1720"
+    Column("po_number_key", Unicode(40), nullable=False),  # canonical digits "1720"
+    Column("ns_tranid", Unicode(40)),  # "PO0001720", once resolved
+    Column("ns_internal_id", Unicode(40)),
+    Column("resolution_status", Unicode(16), nullable=False, default="UNRESOLVED"),
+    Column("resolution_strategy", Unicode(64)),
     Column("resolved_at", DateTime),
     UniqueConstraint("shipment_id", "po_number_key", name="uq_shipment_pos_key"),
     CheckConstraint(
@@ -390,18 +418,18 @@ shipment_pos = Table(
 change_states = Table(
     "change_states",
     metadata,
-    Column("state", String(32), primary_key=True),
+    Column("state", Unicode(32), primary_key=True),
     Column("is_terminal", Boolean, nullable=False),
-    Column("description", String(500), nullable=False),
+    Column("description", Unicode(500), nullable=False),
 )
 
 change_state_transitions = Table(
     "change_state_transitions",
     metadata,
-    Column("from_state", String(32), ForeignKey("change_states.state"), primary_key=True),
-    Column("to_state", String(32), ForeignKey("change_states.state"), primary_key=True),
-    Column("trigger", String(64), primary_key=True),
-    Column("actor_kind", String(8), nullable=False),
+    Column("from_state", Unicode(32), ForeignKey("change_states.state"), primary_key=True),
+    Column("to_state", Unicode(32), ForeignKey("change_states.state"), primary_key=True),
+    Column("trigger", Unicode(64), primary_key=True),
+    Column("actor_kind", Unicode(8), nullable=False),
     CheckConstraint("actor_kind IN ('HUMAN','SYSTEM')", name="actor_kind"),
 )
 
@@ -581,25 +609,25 @@ def assert_transition(conn, from_state: str, to_state: str) -> None:
 proposed_changes = Table(
     "proposed_changes",
     metadata,
-    Column("id", String(36), primary_key=True),
-    Column("shipment_id", String(36), ForeignKey("shipments.id"), nullable=False),
-    Column("shipment_po_id", String(36), ForeignKey("shipment_pos.id"), nullable=False),
-    Column("state", String(32), ForeignKey("change_states.state"), nullable=False),
+    Column("id", Unicode(36), primary_key=True),
+    Column("shipment_id", Unicode(36), ForeignKey("shipments.id"), nullable=False),
+    Column("shipment_po_id", Unicode(36), ForeignKey("shipment_pos.id"), nullable=False),
+    Column("state", Unicode(32), ForeignKey("change_states.state"), nullable=False),
     # -- the canonical key. Casefolded per canonical.py, NEVER NULL. '' means "the
     # -- document did not state it" (a sizeless row). Row identity is THIS, never a
     # -- digest of the whole row: verbatim display text varies between extraction
     # -- runs by design, so a row hash would see phantom changes on every re-parse.
-    Column("key_style", String(64), nullable=False),
-    Column("key_color", String(64), nullable=False),
-    Column("key_size", String(32), nullable=False),
+    Column("key_style", Unicode(64), nullable=False),
+    Column("key_color", Unicode(64), nullable=False),
+    Column("key_size", Unicode(32), nullable=False),
     # -- verbatim, as the vendor printed it. Preserved for audit and for showing
     # -- Paula what the document actually said. NEVER used for comparison.
-    Column("src_style_text", String(200), nullable=False),
-    Column("src_color_text", String(200), nullable=False),
-    Column("src_size_text", String(100), nullable=False),
-    Column("src_quantity_text", String(100)),
-    Column("source_hint", String(120)),  # 'PACKING!R42' / 'P2!R17'
-    Column("source_sha256", String(64), ForeignKey("attachments.content_sha256")),
+    Column("src_style_text", Unicode(200), nullable=False),
+    Column("src_color_text", Unicode(200), nullable=False),
+    Column("src_size_text", Unicode(100), nullable=False),
+    Column("src_quantity_text", Unicode(100)),
+    Column("source_hint", Unicode(120)),  # 'PACKING!R42' / 'P2!R17'
+    Column("source_sha256", Unicode(64), ForeignKey("attachments.content_sha256")),
     # -- how the colour was resolved (migration 0002). Persisted because it is NOT
     # -- reconstructable later: the item read is not stored, and a PO's colour set
     # -- changes as lines are added or received. "Why did NEW INDIGO become NIN"
@@ -608,11 +636,11 @@ proposed_changes = Table(
     # --   NAME       recovered from the item's long-form colour name
     # --   AMBIGUOUS  the name matched two colours on this PO; nothing was chosen
     # --   UNRESOLVED neither path matched
-    Column("colour_resolution_method", String(12)),
-    Column("colour_printed_key", String(64)),   # canonical value actually looked up
-    Column("colour_resolved_code", String(64)),  # the NetSuite code it resolved to
-    Column("colour_resolved_name", String(200)),  # the long name that supplied it
-    Column("colour_name_source_item_id", String(40)),  # whose item record said so
+    Column("colour_resolution_method", Unicode(12)),
+    Column("colour_printed_key", Unicode(64)),   # canonical value actually looked up
+    Column("colour_resolved_code", Unicode(64)),  # the NetSuite code it resolved to
+    Column("colour_resolved_name", Unicode(200)),  # the long name that supplied it
+    Column("colour_name_source_item_id", Unicode(40)),  # whose item record said so
     # -- how the SIZE was arrived at, when it was composed from two axes rather
     # -- than printed in one place (migration 0003). Tainan's sheet puts the waist
     # -- in a column header and the inseam in a row-block label several rows above,
@@ -624,9 +652,9 @@ proposed_changes = Table(
     # --   COMPOSITION_REJECTED  the result is not a value in the account's size
     # --                         list, so it was flagged and never treated as a
     # --                         matchable size
-    Column("size_composition_method", String(24)),
-    Column("src_size_axis_primary", String(60)),    # verbatim, e.g. '30'
-    Column("src_size_axis_secondary", String(60)),  # verbatim, e.g. 'INS 32'
+    Column("size_composition_method", Unicode(24)),
+    Column("src_size_axis_primary", Unicode(60)),    # verbatim, e.g. '30'
+    Column("src_size_axis_secondary", Unicode(60)),  # verbatim, e.g. 'INS 32'
     # -- the transport-mode recap row this shipment row came off (migration 0004).
     # -- `key_recap_label` is canonical and NEVER NULL -- '' means "the slip had a
     # -- single recap row", which is the normal case. It is part of the canonical
@@ -634,15 +662,15 @@ proposed_changes = Table(
     # -- exists in the source; contrast the NetSuite side, where no field
     # -- distinguishes a sea line from an air line and the key therefore cannot be
     # -- improved (RUNBOOK section 6 item 10).
-    Column("key_recap_label", String(40), nullable=False, server_default=""),
-    Column("src_recap_label", String(60)),  # verbatim, e.g. 'By Sea'
+    Column("key_recap_label", Unicode(40), nullable=False, server_default=""),
+    Column("src_recap_label", Unicode(60)),  # verbatim, e.g. 'By Sea'
     # -- the five figures the review screen needs, so a human can read the
     # -- situation directly: "ordered 300, received 0, this slip 128" makes a
     # -- partial delivery self-evident. `outstanding` is derived
     # -- (current_quantity - current_quantity_received), exposed by v_review_lines.
     # -- Nothing gates on any of them; see the rationale doc, constraint 10.
-    Column("ns_line_id", String(40)),  # NULL until a target is chosen
-    Column("ns_item_internal_id", String(40)),
+    Column("ns_line_id", Unicode(40)),  # NULL until a target is chosen
+    Column("ns_item_internal_id", Unicode(40)),
     Column("current_quantity", Numeric(12, 3)),
     Column("current_quantity_received", Numeric(12, 3)),
     Column("proposed_quantity", Numeric(12, 3)),
@@ -673,7 +701,13 @@ proposed_changes = Table(
     # -- quantity -- that is a field this tool writes, and feeding it back in would
     # -- let past output decide future output (lesson 13). See
     # -- `matcher._accumulated_quantity`.
-    Column("accumulation_basis", String(16)),
+    # Unicode(32), not (16). 0008 added PRE_EXISTING_RECEIPT -- 20 characters --
+    # to a column declared 16 wide and nothing complained, because SQLite does not
+    # enforce a VARCHAR length. SQL Server does: error 2628, "Truncated value:
+    # 'PRE_EXISTING_REC'". A declared length that contradicts the column's own
+    # CHECK constraint is valid on one engine and broken on the other; see
+    # RUNBOOK section 8.
+    Column("accumulation_basis", Unicode(32)),
     Column("accumulation_base_quantity", Numeric(12, 3)),
     # -- NetSuite's date state at proposal time, for display beside the reference dates
     Column("current_expected_receipt_date", Date),
@@ -682,27 +716,27 @@ proposed_changes = Table(
     Column("ns_line_is_open", Boolean),
     Column("ns_line_closed", Boolean),
     # -- calibration: the tool's claim...
-    Column("extraction_confidence", String(8), nullable=False),
-    Column("extraction_note", String(1000)),
+    Column("extraction_confidence", Unicode(8), nullable=False),
+    Column("extraction_note", Unicode(1000)),
     Column("needs_review", Boolean, nullable=False, default=False),
-    Column("attention_reason", Text),
+    Column("attention_reason", UNBOUNDED_TEXT),
     # -- ...paired with what turned out to be true. Without both halves,
     # -- needs_review can never be calibrated. See rationale constraint 8.
-    Column("human_verdict", String(20)),
-    Column("human_verdict_note", String(1000)),
-    Column("verdict_by", String(320)),
+    Column("human_verdict", Unicode(20)),
+    Column("human_verdict_note", Unicode(1000)),
+    Column("verdict_by", Unicode(320)),
     Column("verdict_at", DateTime),
     # -- approval, per scope. Quantity and date are independent, and the date is
     # -- optional forever: quantity is knowable from the slip on arrival, the
     # -- receipt date waits on the freight forwarder.
     Column("approved_quantity", Numeric(12, 3)),
-    Column("quantity_approved_by", String(320)),
+    Column("quantity_approved_by", Unicode(320)),
     Column("quantity_approved_at", DateTime),
-    Column("quantity_write_status", String(16), nullable=False, default="NONE"),
+    Column("quantity_write_status", Unicode(16), nullable=False, default="NONE"),
     Column("confirmed_receipt_date", Date),  # Paula's, never a vendor document's
-    Column("date_approved_by", String(320)),
+    Column("date_approved_by", Unicode(320)),
     Column("date_approved_at", DateTime),
-    Column("date_write_status", String(16), nullable=False, default="NONE"),
+    Column("date_write_status", Unicode(16), nullable=False, default="NONE"),
     Column("created_at", DateTime, nullable=False),
     Column("updated_at", DateTime, nullable=False),
     CheckConstraint(
@@ -833,9 +867,9 @@ Index(
 change_candidates = Table(
     "change_candidates",
     metadata,
-    Column("id", String(36), primary_key=True),
-    Column("change_id", String(36), ForeignKey("proposed_changes.id"), nullable=False),
-    Column("ns_line_id", String(40), nullable=False),
+    Column("id", Unicode(36), primary_key=True),
+    Column("change_id", Unicode(36), ForeignKey("proposed_changes.id"), nullable=False),
+    Column("ns_line_id", Unicode(40), nullable=False),
     # Everything a human needs to choose between lines that share a canonical key.
     Column("quantity", Numeric(12, 3)),
     Column("quantity_received", Numeric(12, 3)),
@@ -878,7 +912,7 @@ Index(
 poll_state = Table(
     "poll_state",
     metadata,
-    Column("mailbox", String(320), primary_key=True),
+    Column("mailbox", Unicode(320), primary_key=True),
     #: High-water mark: the newest `received_at` that has been durably stored.
     Column("last_received_at", DateTime, nullable=False),
     #: When the poll ran. Distinct from the watermark: a poll that finds nothing
@@ -893,26 +927,26 @@ poll_state = Table(
 write_attempts = Table(
     "write_attempts",
     metadata,
-    Column("id", String(36), primary_key=True),
-    Column("change_id", String(36), ForeignKey("proposed_changes.id"), nullable=False),
+    Column("id", Unicode(36), primary_key=True),
+    Column("change_id", Unicode(36), ForeignKey("proposed_changes.id"), nullable=False),
     # Per line AND per scope. One approval can fan out to writes across six POs and
     # the fourth can fail; recovery must not re-approve what already succeeded.
-    Column("scope", String(16), nullable=False),
+    Column("scope", Unicode(16), nullable=False),
     Column("attempt_no", Integer, nullable=False),
-    Column("ns_internal_id", String(40), nullable=False),
-    Column("ns_line_id", String(40), nullable=False),
+    Column("ns_internal_id", Unicode(40), nullable=False),
+    Column("ns_line_id", Unicode(40), nullable=False),
     # Exactly what was sent. For a date write that is all three fields with the
     # same value -- NetSuite does not derive expectedReceiptDate from the override
     # pair (tested 2026-08-12), so the payload proves what was actually asserted.
-    Column("payload_json", Text, nullable=False),
-    Column("idempotency_key", String(64), nullable=False),
-    Column("outcome", String(16), nullable=False),
+    Column("payload_json", UNBOUNDED_TEXT, nullable=False),
+    Column("idempotency_key", Unicode(64), nullable=False),
+    Column("outcome", Unicode(16), nullable=False),
     Column("http_status", Integer),
     # Retry policy hangs off this: TRANSIENT is retryable, PERMISSION and
     # LINE_CLOSED never are. NetSuite returns permission denials as 400s, so the
     # HTTP status alone cannot decide.
-    Column("error_kind", String(24)),
-    Column("error_detail", Text),
+    Column("error_kind", Unicode(24)),
+    Column("error_detail", UNBOUNDED_TEXT),
     Column("attempted_at", DateTime, nullable=False),
     UniqueConstraint("change_id", "scope", "attempt_no", name="uq_write_attempts_attempt"),
     CheckConstraint("scope IN ('QUANTITY','DATE')", name="scope"),
@@ -931,18 +965,18 @@ audit_log = Table(
     # "Why did this line change, six months ago" has to be answerable for both
     # workflows, so `workflow` and `actor_kind` are recorded on every row rather
     # than inferred later from whether a message id happens to be present.
-    Column("id", String(36), primary_key=True),
+    Column("id", Unicode(36), primary_key=True),
     Column("occurred_at", DateTime, nullable=False),
-    Column("workflow", String(20), nullable=False),
-    Column("actor", String(320), nullable=False),
-    Column("actor_kind", String(8), nullable=False),
-    Column("event", String(64), nullable=False),
-    Column("message_id", String(36), ForeignKey("messages.id")),
-    Column("shipment_id", String(36), ForeignKey("shipments.id")),
-    Column("change_id", String(36), ForeignKey("proposed_changes.id")),
-    Column("from_state", String(32)),
-    Column("to_state", String(32)),
-    Column("detail_json", Text),
+    Column("workflow", Unicode(20), nullable=False),
+    Column("actor", Unicode(320), nullable=False),
+    Column("actor_kind", Unicode(8), nullable=False),
+    Column("event", Unicode(64), nullable=False),
+    Column("message_id", Unicode(36), ForeignKey("messages.id")),
+    Column("shipment_id", Unicode(36), ForeignKey("shipments.id")),
+    Column("change_id", Unicode(36), ForeignKey("proposed_changes.id")),
+    Column("from_state", Unicode(32)),
+    Column("to_state", Unicode(32)),
+    Column("detail_json", UNBOUNDED_TEXT),
     CheckConstraint("workflow IN ('PACKING_SLIP','PAULA_DIRECTED')", name="workflow"),
     CheckConstraint("actor_kind IN ('HUMAN','SYSTEM')", name="actor_kind"),
 )

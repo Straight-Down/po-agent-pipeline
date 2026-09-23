@@ -516,6 +516,160 @@ def test_redaction_is_structural_and_fails_closed() -> None:
     check("admin" in out and "elsewhere.example" in out,
           "while the non-secret parts stay legible, or the error is useless", out)
 
+
+def test_harness_refuses_a_non_disposable_database() -> None:
+    section("the harness will only point at a database named disposable")
+    import os
+
+    import dialect_target as dt
+
+    saved = os.environ.get(dt.TARGET_ENV)
+    try:
+        # It DROPS EVERY TABLE on its target once per test. The only thing between
+        # it and a database that matters is the name it was handed -- so the name
+        # has to say so. Near-miss of 2026-09-23: this variable pointed at the
+        # production database while the instruction said the test one.
+        refused = (
+            ("the production database", "mssql+pyodbc://u:p@h/sqldb-po-agent?driver=X"),
+            ("a sqlite FILE", "sqlite:///po_agent.db"),
+            ("a name with no suffix", "mssql+pyodbc://u:p@h/anything?driver=X"),
+            ("a name merely CONTAINING test", "mssql+pyodbc://u:p@h/test-sqldb?driver=X"),
+        )
+        for label, url in refused:
+            os.environ[dt.TARGET_ENV] = url
+            try:
+                dt.connect()
+            except dt.NotADisposableDatabase as exc:
+                check(dt.TARGET_ENV in str(exc),
+                      f"refuses {label}, naming the variable it read", str(exc)[:60])
+            except Exception as exc:  # noqa: BLE001 -- anything else is a miss
+                check(False, f"refuses {label}", f"raised {type(exc).__name__} instead")
+            else:
+                check(False, f"refuses {label}", "NOT REFUSED")
+
+        # A guard that refuses everything would pass the half above and be useless.
+        allowed = (
+            ("the real test database", "mssql+pyodbc://u:p@h/sqldb-po-agent-test?driver=X"),
+            ("sqlite in memory", "sqlite://"),
+            ("a -test sqlite file", "sqlite:///po_agent-test.db"),
+        )
+        for label, url in allowed:
+            try:
+                dt._require_disposable(url)
+                check(True, f"allows {label}")
+            except dt.NotADisposableDatabase:
+                check(False, f"allows {label}", "WRONGLY REFUSED")
+
+        # The refusal must happen BEFORE connecting: reaching the network would
+        # already have proved the credentials work against something ring-fenced.
+        os.environ[dt.TARGET_ENV] = "mssql+pyodbc://u:p@nonexistent.invalid/sqldb-po-agent?driver=X"
+        try:
+            dt.connect()
+        except dt.NotADisposableDatabase:
+            check(True, "and refuses BEFORE attempting any connection")
+        except dt.TargetUnreachable:
+            check(False, "and refuses BEFORE attempting any connection",
+                  "it tried to connect first")
+    finally:
+        if saved is None:
+            os.environ.pop(dt.TARGET_ENV, None)
+        else:
+            os.environ[dt.TARGET_ENV] = saved
+
+
+def test_no_unquoted_reserved_identifiers_in_handwritten_sql() -> None:
+    section("hand-written SQL must not name a reserved word unquoted")
+    import ast
+    import pathlib as _pl
+    import re as _re
+
+    import schema as _sc
+    from sqlalchemy.dialects import mssql, sqlite
+
+    here = _pl.Path(__file__).resolve().parent
+    mssql_rw = mssql.dialect().identifier_preparer.reserved_words
+    sqlite_rw = sqlite.dialect().identifier_preparer.reserved_words
+
+    # Checkable precisely because the identifier set is OURS and finite: every
+    # table, column, index, constraint and view this schema declares. No SQL
+    # parsing required, and no false positives from SELECT/FROM/WHERE, which are
+    # reserved words that are legitimately keywords.
+    idents = set()
+    for tbl in _sc.metadata.tables.values():
+        idents.add(tbl.name)
+        idents.update(c.name for c in tbl.columns)
+        idents.update(i.name for i in tbl.indexes)
+        idents.update(k.name for k in tbl.constraints if k.name)
+    for name, _ddl in _sc.VIEWS:
+        idents.add(name)
+
+    risky = {i for i in idents if i.lower() in mssql_rw or i.lower() in sqlite_rw}
+    check(bool(risky), "the schema has at least one reserved identifier to check for",
+          str(sorted(risky)))
+    check("trigger" in risky,
+          "'trigger' among them -- reserved in BOTH dialects", str(sorted(risky)))
+
+    # WIDENED 2026-09-23. The first version scanned only `sa.text(...)` calls and
+    # module-level SQL constants inside `migrations/`, plus `schema.VIEWS`. It
+    # reported clean -- and the suite then failed on SQL Server with the SAME
+    # error, from `test_schema.py`, which the scan never looked at. A detector
+    # with an unmapped blind spot is worse than none: it converts "not checked"
+    # into "checked and clean".
+    #
+    # COVERED NOW: every .py file in the project, every string literal that looks
+    # like SQL, wherever it appears -- migrations, tests, application modules,
+    # scripts -- plus `schema.VIEWS`.
+    # STILL NOT COVERED, stated rather than left to be discovered:
+    #   * SQL assembled at run time from variables (only literal text is visible
+    #     to a static scan);
+    #   * the interpolated parts of f-strings, whose literal segments ARE scanned;
+    #   * SQL that never appears in this repository at all.
+    sources = []
+    for f in sorted(here.rglob("*.py")):
+        if ".venv" in f.parts or "__pycache__" in f.parts:
+            continue
+        try:
+            tree = ast.parse(f.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        rel = str(f.relative_to(here))
+        for node in ast.walk(tree):
+            lit = None
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                lit = node.value
+            elif isinstance(node, ast.JoinedStr):
+                lit = "".join(v.value for v in node.values
+                              if isinstance(v, ast.Constant) and isinstance(v.value, str))
+            if not lit:
+                continue
+            # Looks like SQL: contains a statement keyword as a whole word.
+            if _re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b",
+                          lit, _re.I):
+                sources.append((rel, lit))
+    for name, ddl in _sc.VIEWS:
+        sources.append((f"schema.VIEWS:{name}", ddl))
+
+    check(len(sources) > 60, "found the hand-written SQL to scan",
+          f"{len(sources)} fragments across the whole repo, not just migrations")
+
+    hits = []
+    for origin, sql in sources:
+        for name in risky:
+            # bare word: not [name], not "name", not a.name
+            if _re.search(rf'(?<![\[\"\w.]){_re.escape(name)}(?![\]\"\w])', sql):
+                hits.append(f"{origin}:{name}")
+    check(not hits,
+          "no reserved identifier appears unquoted in any hand-written SQL",
+          str(hits) if hits else "clean")
+
+    # WHY: migration 0004 wrote `INSERT INTO change_state_transitions (..., trigger,
+    # ...)` as raw sa.text() and could not run on SQL Server at all -- "Incorrect
+    # syntax near the keyword 'trigger'". It survived for weeks because SQLite's
+    # parser accepts a keyword as a column name in an unambiguous position. Core
+    # would have quoted it; dropping to raw SQL declined that service silently.
+    check(True, "(RUNBOOK section 8: raw SQL declines every service the library provides)")
+
+
 def main() -> int:
     print("=" * 78)
     print("CONFIGURATION TESTS")
@@ -529,6 +683,8 @@ def main() -> int:
         test_one_dotenv_loader,
         test_no_credentials_in_tracked_files,
         test_redaction_is_structural_and_fails_closed,
+        test_harness_refuses_a_non_disposable_database,
+        test_no_unquoted_reserved_identifiers_in_handwritten_sql,
     )
 
     # A test registered twice runs twice and its checks are counted twice. That

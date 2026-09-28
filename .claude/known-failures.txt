@@ -1,0 +1,3 @@
+# Tests that were already failing when this baseline was taken.
+# The Stop hook ignores these and blocks only on NEW failures.
+# This list is a ratchet: delete lines as you fix them, never add.

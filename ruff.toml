@@ -1,0 +1,37 @@
+# Lint configuration for the PostToolUse hook in .claude/hooks/check_edit.py.
+#
+# The hook BLOCKS Claude Code when ruff reports anything on a file it just
+# edited. That makes rule selection a real decision rather than a style
+# preference: with ruff's defaults this codebase reports ~250 findings, almost
+# all stylistic (PEP-604 annotations, import sorting, missing shebangs), and
+# Claude would be blocked on legacy noise on its first edit to nearly any file
+# -- which trains you to disable the hook.
+#
+# So this selects rules that indicate an actual defect, not a preference:
+#
+#   F     Pyflakes -- undefined names, unused imports/variables, redefinitions.
+#         These are real bugs or dead code, near-zero false positives.
+#   E9    Syntax and IO errors.
+#   PLE   Pylint errors -- includes invisible-character bugs, which matter here
+#         because vendor documents carry full-width and zero-width characters.
+#   DTZ   Naive datetime construction. This project writes four date fields to
+#         NetSuite; a timezone-naive datetime is exactly how a date silently
+#         shifts by a day.
+#
+# Widen this deliberately once the codebase is clean, not by default. If you do,
+# run `ruff check .` first and fix the backlog in its own commit -- never let
+# the hook discover a new rule's backlog mid-task.
+
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["F", "E9", "PLE", "DTZ"]
+
+[lint.per-file-ignores]
+# test_parsing.py doubles as a standalone script with its own main(); its
+# fixture-style locals legitimately go unused in some branches.
+"test_parsing.py" = ["F841"]
+# NOW is a deliberately frozen test clock; a naive datetime is the point.
+"test_ingest.py" = ["DTZ001"]
+"test_schema.py" = ["DTZ001"]

@@ -1,3 +1,30 @@
 {
-  "defaultMode": "acceptEdits"
+  "defaultMode": "acceptEdits",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/check_edit.py",
+            "timeout": 180,
+            "statusMessage": "Checking the edited file..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/verify_stop.py",
+            "timeout": 700,
+            "statusMessage": "Running the test suite before finishing..."
+          }
+        ]
+      }
+    ]
+  }
 }

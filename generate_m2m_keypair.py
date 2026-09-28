@@ -178,7 +178,7 @@ def generate(out_dir: Path, key_size: int, days: int, force: bool, passphrase: s
     print()
     print("  1. Follow NETSUITE-M2M-SETUP.md in this folder. It walks through creating")
     print("     the 'PO Update' role and Integration record, and uploading the")
-    print(f"     certificate above at Setup > Integration > OAuth 2.0 Client Credentials")
+    print("     certificate above at Setup > Integration > OAuth 2.0 Client Credentials")
     print("     (M2M) Setup.")
     print()
     print("  2. NetSuite will show you a Certificate ID after upload. Along with the")

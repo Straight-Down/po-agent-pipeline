@@ -47,7 +47,7 @@ mismatch the moment they appear.
 
 Zero-width handling is a judgement call worth stating: U+200B and friends are
 mapped to a space rather than deleted, because in PDF-extracted vendor text they
-appear where a visual gap exists, so `NEW​INDIGO`, `NEW INDIGO` and
+appear where a visual gap exists, so `NEW\u200bINDIGO`, `NEW INDIGO` and
 `NEW  INDIGO` all canonicalise alike. If the true source really had no gap, the
 result is a failed match, which routes to human review — the safe direction.
 
@@ -77,7 +77,7 @@ _DASHES = {
 #: Zero-width / invisible characters, mapped to a space. See the module docstring
 #: for why a space rather than deletion.
 _ZERO_WIDTH = {
-    "​": " ",  # zero width space
+    "\u200b": " ",  # zero width space
     "‌": " ",  # zero width non-joiner
     "‍": " ",  # zero width joiner
     "⁠": " ",  # word joiner

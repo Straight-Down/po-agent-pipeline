@@ -42,7 +42,6 @@ only — the pipeline itself does not import them.
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent

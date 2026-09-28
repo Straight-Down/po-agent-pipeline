@@ -43,12 +43,16 @@ Two hard rules, both from real mistakes rather than theory:
    a colour total proportionally across sizes.
 
 The classifier is deliberately conservative about what it promotes: a document
-is only selected as a shipment-data source if it is a packing list AND appears to
-carry per-size quantities.
+is only selected as a shipment-data source if it opens, is not banned, and its
+content carries per-size quantities. Its TYPE is recorded but does not gate
+(2026-09-23) -- a workbook typed as an invoice can still hold the only
+size-level sheets for a PO. Which sheets of it are read is decided per sheet.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -143,6 +147,44 @@ promoted to "size-level source" would feed wrong quantities into an ERP, whereas
 one wrongly held back just gets flagged for a human."""
 
 
+def classifier_prompt_hash() -> str:
+    """
+    SHA-256 of everything that defines the question the content check asks.
+
+    The system prompt AND the response schema, because the schema's field
+    descriptions are instructions too -- `has_size_breakdown`'s is the sentence
+    that decides the gate. Persisted beside every stored verdict so a verdict can
+    be traced to the exact wording that produced it.
+    """
+    payload = CLASSIFIER_SYSTEM_PROMPT + "\n" + json.dumps(
+        _ContentVerdicts.model_json_schema(), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class StoredVerdict:
+    """
+    A content verdict already on record for some bytes (`attachments` row).
+
+    **Why reuse rather than re-ask.** The content check is a model call, and a
+    model call is not a function: on 2026-09-23 the same workbook, with the same
+    code, came back `commercial_invoice` on one call and `packing_list` on
+    another -- in the SAME ingest, because the verdict was being asked for twice.
+    Once a verdict exists for a SHA-256 it is the verdict for those bytes, so a
+    re-extraction reproduces the original gate decision instead of re-rolling it.
+
+    Only the model's part is stored. The filename rules (including the
+    inspection-report ban) and the can-it-open check are deterministic and free,
+    so they are recomputed every time and never come from here.
+    """
+
+    doc_type: str  # a DocType value, e.g. "packing_list"
+    has_size_breakdown: bool
+    rationale: str  # the model's own sentence, verbatim
+    model: Optional[str]
+    prompt_hash: str
+
+
 @dataclass
 class AttachmentClassification:
     path: Path
@@ -164,39 +206,82 @@ class AttachmentClassification:
     #: Retained for two reasons: it is the audit trail for a disagreement (the
     #: reviewer sees that the name said invoice and the content said packing
     #: list), and it is the only thing a filename is now allowed to influence --
-    #: the ordering in `ClassificationResult.primary`.
+    #: the ordering in `ClassificationResult.primary` -- with ONE exception that
+    #: comes from a person rather than the data: a name that says inspection
+    #: report excludes the file outright (`is_banned`, Paula's ruling).
     filename_hint: Optional[DocType] = None
+    #: SHA-256 of the bytes -- the key a stored verdict is looked up by.
+    content_sha256: Optional[str] = None
+    #: Provenance of the CONTENT verdict, set only when one was applied.
+    #: `verdict_source` is "claude" (asked this run) or "stored" (reused from the
+    #: attachment row); None means no model verdict exists for this item -- banned
+    #: by filename, unreadable, no preview, or the call failed -- and such an item
+    #: must never be persisted as a reusable verdict.
+    content_rationale: Optional[str] = None
+    classifier_model: Optional[str] = None
+    classifier_prompt_hash: Optional[str] = None
+    verdict_source: Optional[str] = None
 
     @property
     def usable_as_shipment_data(self) -> bool:
         """
         Whether this attachment may be parsed for shipment quantities.
 
-        Requires: a packing list, carrying per-size quantities, and not a banned
-        document type. The ban is checked even though an inspection report would
-        normally fail the packing-list test anyway — belt and braces on a rule
-        that came from a person, not from the data.
+        Requires three things: it opens, it is not a banned document, and the
+        content check found **per-size quantities** in it. `doc_type` is NOT one
+        of them -- it is recorded as metadata and no longer gates.
+
+        Why the type stopped gating: a workbook is one file with one type but
+        several sheets. PO 1624's clearance workbook is a commercial invoice
+        sheet plus three size-level packing sheets; the classifier said so in its
+        own rationale ("per-PO 'Packing list' sheets whose row 28 headers list
+        footwear sizes 8-14"), set `has_size_breakdown`, typed the FILE
+        `commercial_invoice`, and the type check threw the packing sheets away.
+        Which sheets of an admitted workbook to read is decided per sheet, by
+        `SectionClassification.is_shipment_data`, inside the extractor.
+
+        **The ban now carries weight on its own.** It used to be belt and braces
+        behind the packing-list test; with that test gone it is the only thing
+        keeping an inspection report out. It fires on either signal -- the
+        filename's claim, or the content's -- because Paula's ruling is
+        "regardless of content", and an inspection report identified by what it
+        contains is still an inspection report.
         """
         return (
             self.unreadable_reason is None
-            and self.doc_type == DocType.PACKING_LIST
+            and not self.is_banned
             and self.has_size_breakdown
-            and self.doc_type not in BANNED_AS_DATA_SOURCE
         )
 
     @property
+    def is_banned(self) -> bool:
+        """Paula's permanent ban, by the filename's claim or by content."""
+        return (self.doc_type in BANNED_AS_DATA_SOURCE
+                or self.filename_hint in BANNED_AS_DATA_SOURCE)
+
+    @property
     def excluded_reason(self) -> str:
+        """
+        Why this attachment was not parsed. Empty for an admitted one.
+
+        Mirrors `usable_as_shipment_data` test for test, so the reason can only
+        fire for a file the gate actually refused. The old "not a packing list"
+        wording is gone with the type test it described: a commercial invoice
+        WITH per-size quantities is admitted now, and one without is excluded for
+        lacking sizes, which is the real reason -- its type is stated alongside as
+        context, not as the cause.
+        """
         if self.unreadable_reason:
             return f"could not open: {self.unreadable_reason}"
-        if self.doc_type in BANNED_AS_DATA_SOURCE:
+        if self.is_banned:
+            banned = (self.doc_type if self.doc_type in BANNED_AS_DATA_SOURCE
+                      else self.filename_hint)
             return (
-                f"{self.doc_type.value} — permanently excluded as a shipment-data source "
+                f"{banned.value} — permanently excluded as a shipment-data source "
                 f"(Paula's ruling 2026-08-11), regardless of content"
             )
-        if self.doc_type != DocType.PACKING_LIST:
-            return f"not a packing list ({self.doc_type.value}): {self.reason}"
         if not self.has_size_breakdown:
-            return f"packing list but no per-size quantities: {self.reason}"
+            return f"no per-size quantities ({self.doc_type.value}): {self.reason}"
         return ""
 
 
@@ -205,6 +290,11 @@ class ClassificationResult:
     selected: list[AttachmentClassification] = field(default_factory=list)
     excluded: list[AttachmentClassification] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Tokens the content-check call spent, as a delta. Carried on the result
+    #: because the caller that classifies is no longer the one that totals the
+    #: shipment's cost -- `parse_shipment_email` adds it back in. Empty when no
+    #: call was made (every verdict stored, or content check disabled).
+    usage: dict = field(default_factory=dict)
 
     @property
     def primary(self) -> Optional[AttachmentClassification]:
@@ -215,8 +305,8 @@ class ClassificationResult:
         target shape and costs far fewer tokens.
 
         This ordering is the whole of what a filename is allowed to do. Among
-        attachments that content has already confirmed as size-level packing
-        lists, one whose *name* also says packing list goes first, and one whose
+        attachments that content has already confirmed carry per-size
+        quantities, one whose *name* also says packing list goes first, and one whose
         name said invoice goes last. Deprioritising, never excluding: a
         misleadingly named file that content vouched for is still selected, still
         parsed, and still available as a cross-check.
@@ -491,14 +581,25 @@ class SectionClassification:
     doc_type: DocType
     has_size_breakdown: bool
     reason: str
+    #: "claude" (asked now), "stored" (replayed from `SheetVerdicts`), or "none"
+    #: for a placeholder the model never saw (an empty section). Only a model's
+    #: answer is ever stored as a verdict.
+    source: str = "claude"
 
     @property
     def is_shipment_data(self) -> bool:
         """
         Whether this section may be extracted for shipment quantities.
 
-        Deliberately the same test as `AttachmentClassification.usable_as_shipment_data`:
-        a packing list, carrying per-size quantities, and not a banned type.
+        A packing list, carrying per-size quantities, and not a banned type.
+
+        **No longer the same test as `usable_as_shipment_data`** (it was, until
+        2026-09-23). The file-level gate dropped its type check so a workbook
+        that is an invoice on its first sheet can still be admitted for its
+        packing sheets; THIS test, per sheet, keeps the type check, and is what
+        stops that workbook's invoice sheet being read as data. Changing it was
+        not part of that ruling -- an invoice view that repeats per-size figures
+        is exactly how Inprotex's workbook once produced a 4x-inflated total.
         """
         return (
             self.doc_type == DocType.PACKING_LIST
@@ -539,7 +640,8 @@ def classify_sections(
     usable = [(label, text) for label, text in sections if text.strip()]
     if not usable:
         return [
-            SectionClassification(label, DocType.OTHER, False, "no readable content")
+            SectionClassification(label, DocType.OTHER, False, "no readable content",
+                                  source="none")
             for label, _ in sections
         ]
 
@@ -588,9 +690,89 @@ def classify_sections(
             reason=verdict.reason,
         )
     return [
-        by_label.get(label, SectionClassification(label, DocType.OTHER, False, "no readable content"))
+        by_label.get(label, SectionClassification(label, DocType.OTHER, False,
+                                                  "no readable content", source="none"))
         for label, _ in sections
     ]
+
+
+@dataclass(frozen=True)
+class StoredSheetVerdict:
+    """
+    One worksheet's content verdict, keyed (bytes SHA-256, sheet, prompt hash, model).
+
+    The per-sheet counterpart of `StoredVerdict`, for the same reason: a model
+    call is not a function. Since the file gate stopped checking type
+    (2026-09-23), the per-sheet check is the ONLY thing keeping a workbook's
+    COMMERCIAL INVOICE sheet out of the quantities -- and until migration 0012 it
+    was re-rolled on every ingest. A verdict is reused only when all four key
+    parts match; a new prompt or a new model asks again.
+    """
+
+    sheet: str
+    doc_type: str  # a DocType value
+    has_size_breakdown: bool
+    rationale: str  # the model's own sentence, verbatim
+    model: Optional[str]
+    prompt_hash: str
+
+    def as_section(self) -> SectionClassification:
+        try:
+            doc_type = DocType(self.doc_type)
+        except ValueError:
+            doc_type = DocType.OTHER
+        return SectionClassification(self.sheet, doc_type, self.has_size_breakdown,
+                                     self.rationale, source="stored")
+
+    def to_json(self) -> dict:
+        return {"sheet": self.sheet, "doc_type": self.doc_type,
+                "has_size_breakdown": self.has_size_breakdown, "rationale": self.rationale,
+                "model": self.model, "prompt_hash": self.prompt_hash}
+
+    @classmethod
+    def from_json(cls, data: dict) -> "StoredSheetVerdict":
+        return cls(sheet=str(data["sheet"]), doc_type=str(data["doc_type"]),
+                   has_size_breakdown=bool(data["has_size_breakdown"]),
+                   rationale=str(data.get("rationale") or ""), model=data.get("model"),
+                   prompt_hash=str(data["prompt_hash"]))
+
+
+class SheetVerdicts:
+    """
+    Per-sheet verdicts on record for one ingest, plus the ones it makes.
+
+    `stored` is what the database held when the ingest began, by SHA-256.
+    `fresh` collects verdicts asked for during the ingest, for the caller to
+    persist. `lookup` consults both, so a second parse of the same bytes inside
+    one ingest (a cross-check) replays rather than re-asks too.
+    """
+
+    def __init__(self, stored: Optional[dict] = None):
+        self.stored: dict[str, list[StoredSheetVerdict]] = dict(stored or {})
+        self.fresh: dict[str, list[StoredSheetVerdict]] = {}
+
+    def lookup(self, sha: str, sheet: str, *, model: Optional[str],
+               prompt_hash: str) -> Optional[StoredSheetVerdict]:
+        for verdict in self.fresh.get(sha, []) + self.stored.get(sha, []):
+            if ((verdict.sheet, verdict.model or "", verdict.prompt_hash)
+                    == (sheet, model or "", prompt_hash)):
+                return verdict
+        return None
+
+    def record(self, sha: str, verdict: StoredSheetVerdict) -> None:
+        self.fresh.setdefault(sha, []).append(verdict)
+
+
+def merge_sheet_verdicts(existing: Sequence[StoredSheetVerdict],
+                         fresh: Sequence[StoredSheetVerdict]) -> list[StoredSheetVerdict]:
+    """`existing` with `fresh` added; a fresh verdict REPLACES one with the same key."""
+
+    def key(verdict: StoredSheetVerdict) -> tuple:
+        return (verdict.sheet, verdict.model or "", verdict.prompt_hash)
+
+    merged = {key(v): v for v in existing}
+    merged.update({key(v): v for v in fresh})
+    return sorted(merged.values(), key=key)
 
 
 def _preview(path: Path, max_chars: int = 9000) -> str:
@@ -690,6 +872,7 @@ def classify_attachments(
     extractor: Any = None,
     use_content_check: bool = True,
     display_names: Optional[dict] = None,
+    stored_verdicts: Optional[dict] = None,
 ) -> ClassificationResult:
     """
     Classify a shipment email's attachments and select which to parse.
@@ -710,8 +893,15 @@ def classify_attachments(
     Inprotex trap. Nothing failed; the classifier simply lost one of its two
     inputs and said nothing, which is why it survived a live run and was visible
     only in a warning string. Defaults to each path's own name.
+
+    `stored_verdicts` maps a content SHA-256 to a `StoredVerdict` already on
+    record. An attachment whose bytes have one is NOT sent to Claude: the stored
+    verdict is applied through the same code as a fresh one, so the gate decides
+    exactly as it did the first time. Only attachments with no stored verdict go
+    in the (single) content call.
     """
     names = {Path(k).resolve(): v for k, v in (display_names or {}).items()}
+    stored = stored_verdicts or {}
     result = ClassificationResult()
     candidates: list[AttachmentClassification] = []
     needs_content: list[AttachmentClassification] = []
@@ -739,6 +929,7 @@ def classify_attachments(
             display_name=shown,
             is_rollup=looks_like_rollup(shown),
             filename_hint=doc_type,
+            content_sha256=_sha256_file(path),
         )
 
         # An inspection report is settled: banned regardless of content, so don't
@@ -767,11 +958,22 @@ def classify_attachments(
         # skipped this step, and took three packing-list sheets down with it.
         # The name's only remaining jobs are to seed a prior (overridden below by
         # whatever the content says) and to order the survivors.
-        needs_content.append(item)
+        #
+        # ...unless these bytes already HAVE a content verdict. Then it is
+        # applied, not re-asked: asking twice is how one workbook came to be both
+        # a packing list and a commercial invoice in the same run.
+        prior = stored.get(item.content_sha256) if use_content_check else None
+        if prior is not None:
+            _apply_verdict(
+                item, prior.doc_type, prior.has_size_breakdown, prior.rationale,
+                model=prior.model, prompt_hash=prior.prompt_hash, source="stored",
+            )
+        else:
+            needs_content.append(item)
         candidates.append(item)
 
     if needs_content and use_content_check:
-        _apply_content_verdicts(needs_content, extractor, result.warnings)
+        _apply_content_verdicts(needs_content, extractor, result.warnings, result)
     elif needs_content:
         # No content check: trust the filename's type, and accept a size claim
         # only for names that clearly mean the real packing list.
@@ -803,8 +1005,57 @@ def classify_attachments(
     return result
 
 
+def _sha256_file(path: Path) -> str:
+    """Content hash of an attachment -- the key its stored verdict lives under."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _apply_verdict(
+    item: AttachmentClassification,
+    doc_type: str,
+    has_size_breakdown: bool,
+    rationale: str,
+    *,
+    model: Optional[str],
+    prompt_hash: Optional[str],
+    source: str,
+) -> None:
+    """
+    Apply one content verdict to an item. The ONLY place a verdict lands.
+
+    A fresh verdict and a stored one go through this same function, so replaying
+    a stored verdict cannot decide differently from the call that produced it:
+    same override of the filename's type, same size claim, same reason text.
+    """
+    try:
+        content_type = DocType(doc_type)
+    except ValueError:
+        content_type = DocType.OTHER
+    if content_type != item.doc_type:
+        item.reason = (
+            f"content says {content_type.value} (filename suggested {item.doc_type.value}): "
+            f"{rationale}"
+        )
+        item.doc_type = content_type
+    else:
+        item.reason = f"{item.reason}; content confirms: {rationale}"
+    item.has_size_breakdown = bool(has_size_breakdown)
+    item.method = "filename+content"
+    item.content_rationale = rationale
+    item.classifier_model = model
+    item.classifier_prompt_hash = prompt_hash
+    item.verdict_source = source
+
+
 def _apply_content_verdicts(
-    items: list[AttachmentClassification], extractor: Any, warnings: list[str]
+    items: list[AttachmentClassification],
+    extractor: Any,
+    warnings: list[str],
+    result: Optional[ClassificationResult] = None,
 ) -> None:
     """One Claude call over all previews; falls back to filename-only on failure."""
     previews = [(item, _preview(item.path)) for item in items]
@@ -847,6 +1098,7 @@ def _apply_content_verdicts(
             }
         )
 
+    usage_before = dict(getattr(extractor, "last_usage", {}) or {})
     try:
         verdicts = extractor._parse_with_retry(
             schema=_ContentVerdicts,
@@ -865,6 +1117,14 @@ def _apply_content_verdicts(
             f"filenames, which is unreliable — verify the selection before trusting it"
         )
         return
+    finally:
+        # A delta, not the extractor's running total (`last_usage` accumulates).
+        # Recorded even when the call raised: an attempt may have billed first.
+        if result is not None:
+            after = dict(getattr(extractor, "last_usage", {}) or {})
+            result.usage = {k: after.get(k, 0) - usage_before.get(k, 0)
+                            for k in set(after) | set(usage_before)
+                            if after.get(k, 0) - usage_before.get(k, 0) != 0}
 
     if len(verdicts.verdicts) != len(usable):
         warnings.append(
@@ -873,18 +1133,10 @@ def _apply_content_verdicts(
         )
         return
 
+    model = getattr(extractor, "model", None)
+    prompt_hash = classifier_prompt_hash()
     for (item, _text), verdict in zip(usable, verdicts.verdicts):
-        try:
-            content_type = DocType(verdict.doc_type)
-        except ValueError:
-            content_type = DocType.OTHER
-        if content_type != item.doc_type:
-            item.reason = (
-                f"content says {content_type.value} (filename suggested {item.doc_type.value}): "
-                f"{verdict.reason}"
-            )
-            item.doc_type = content_type
-        else:
-            item.reason = f"{item.reason}; content confirms: {verdict.reason}"
-        item.has_size_breakdown = verdict.has_size_breakdown
-        item.method = "filename+content"
+        _apply_verdict(
+            item, verdict.doc_type, verdict.has_size_breakdown, verdict.reason,
+            model=model, prompt_hash=prompt_hash, source="claude",
+        )

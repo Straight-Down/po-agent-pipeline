@@ -45,6 +45,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+import carton_backing
 from canonical import canonical_key
 from claude_extractor import (
     FORMAT_PDF,
@@ -295,7 +296,12 @@ def _try_deterministic_packing_slip(
     # produce comparable, retry-stable output.
     det_lines, det_warnings = aggregate_lines(
         [
-            deterministic_line_to_dict(l, source_hint=f"{INPROTEX_SHEET}!recap")
+            # A real row, not "recap": a row-less hint is UNVERIFIABLE to the
+            # carton-backing check, which would flag every line of the one
+            # hand-verified parser for review.
+            deterministic_line_to_dict(
+                l, source_hint=(f"{INPROTEX_SHEET}!R{l['sheet_row']}" if l.get("sheet_row")
+                                else f"{INPROTEX_SHEET}!recap"))
             for l in raw_lines
         ],
         document_label=path.name,
@@ -429,7 +435,12 @@ def build_source_documents(paths: Sequence[Union[str, Path]]) -> tuple[list, lis
     warnings rather than silently skipped -- a photo-only page could be the one
     holding the size table.
     """
-    from claude_extractor import SourceDocument, read_pdf_layouts, read_workbook_grids
+    from claude_extractor import (
+        SourceDocument,
+        read_pdf_layouts,
+        read_workbook_grids,
+        visible_grids,
+    )
 
     sources: list[SourceDocument] = []
     warnings: list[str] = []
@@ -445,9 +456,11 @@ def build_source_documents(paths: Sequence[Union[str, Path]]) -> tuple[list, lis
         fmt = sniff_format(path)
         try:
             if fmt in WORKBOOK_FORMATS:
-                grids = [g for g in read_workbook_grids(path) if not g.is_empty]
+                grids, hidden_notes = visible_grids(
+                    [g for g in read_workbook_grids(path) if not g.is_empty], path.name)
+                warnings.extend(f"{path.name}: {note}" for note in hidden_notes)
                 if not grids:
-                    warnings.append(f"{path.name}: no non-empty worksheets")
+                    warnings.append(f"{path.name}: no non-empty visible worksheets")
                 for grid in grids:
                     sources.append(
                         SourceDocument(
@@ -618,6 +631,8 @@ def parse_shipment_email(
     extractor: Optional[ClaudeExtractor] = None,
     cross_check: bool = False,
     display_names: Optional[dict] = None,
+    classification=None,
+    sheet_verdicts=None,
 ) -> ParseResult:
     """
     Process one shipment email's attachments end to end.
@@ -635,6 +650,17 @@ def parse_shipment_email(
 
     `cross_check=True` also parses any secondary packing list and reports whether
     the two agree — useful when a vendor sends both a rollup and carton detail.
+
+    `classification` is the caller's `ClassificationResult` for exactly these
+    attachments. **`ingest_shipment` always passes it, and must.** Classifying
+    here as well meant two independent model calls per ingest: one decided what
+    was recorded, the other what was parsed, and on 2026-09-23 they disagreed on
+    PO 1624 -- 44 lines parsed from a document the database said was excluded.
+    Omitted, this classifies itself, for standalone use (the CLI below).
+
+    `sheet_verdicts` (an `attachment_classifier.SheetVerdicts`) replays per-sheet
+    verdicts already on record and collects new ones -- see
+    `ClaudeExtractor._select_packing_sheets`. `ingest_shipment` always passes it.
     """
     from attachment_classifier import DocType, classify_attachments
 
@@ -646,10 +672,24 @@ def parse_shipment_email(
     # the shipment cost" understates it plausibly, which is the failure this
     # whole feature exists to stop.
     call_usage_before = dict(getattr(extractor, "last_usage", {}) or {})
-    # `display_names` carries the vendor's filenames when the bytes are stored
-    # content-addressed and the path is a hash -- see classify_attachments.
-    classification = classify_attachments(attachment_paths, extractor=extractor,
-                                          display_names=display_names)
+    # Spend that happened BEFORE this call and belongs in its total: the caller's
+    # classification pass. Zero when this function classifies for itself, because
+    # then `call_usage_before` already brackets that call.
+    prior_spend: dict = {}
+    if classification is None:
+        # `display_names` carries the vendor's filenames when the bytes are stored
+        # content-addressed and the path is a hash -- see classify_attachments.
+        classification = classify_attachments(attachment_paths, extractor=extractor,
+                                              display_names=display_names)
+    else:
+        prior_spend = dict(getattr(classification, "usage", {}) or {})
+
+    def spent_so_far() -> dict:
+        return _add_usage(
+            usage_delta(call_usage_before, getattr(extractor, "last_usage", {}) or {}),
+            prior_spend,
+        )
+
     shown = {Path(k).resolve(): v for k, v in (display_names or {}).items()}
 
     def named(path) -> str:
@@ -676,13 +716,15 @@ def parse_shipment_email(
         result.needs_manual_entry = True
         # Classification ran and billed even though nothing was parsed. No
         # primary exists to attribute it to, so it lands on the total only.
-        result.total_usage = usage_delta(
-            call_usage_before, getattr(extractor, "last_usage", {}) or {})
+        result.total_usage = spent_so_far()
         return result
 
     primary = classification.primary
+    # Only passed when given: a workbook routed to the deterministic parser or a
+    # PDF has no sheet selection to replay.
+    sheet_kwargs = {"sheet_verdicts": sheet_verdicts} if sheet_verdicts is not None else {}
     try:
-        result = parse_packing_slip(primary.path, extractor=extractor)
+        result = parse_packing_slip(primary.path, extractor=extractor, **sheet_kwargs)
     except NoPackingSheetFound as exc:
         # An email that produces no reviewable artifact is the one failure mode
         # this architecture exists to prevent -- everywhere else, uncertainty
@@ -724,11 +766,32 @@ def parse_shipment_email(
         # on the one path that had not been given the treatment the cross-check
         # failure path already had. Reachable on any multi-sheet workbook whose
         # sheets all classify as non-packing.
-        spent = usage_delta(call_usage_before, getattr(extractor, "last_usage", {}) or {})
-        result.source_usage[str(Path(primary.path).resolve())] = dict(spent)
-        result.total_usage = dict(spent)
+        # The per-document figure is THIS document's own spend (the section
+        # classification), so it excludes the caller's attachment triage; the
+        # total includes it.
+        result.source_usage[str(Path(primary.path).resolve())] = usage_delta(
+            call_usage_before, getattr(extractor, "last_usage", {}) or {})
+        result.total_usage = spent_so_far()
         return result
     result.notes = notes + result.notes
+
+    # CARTON BACKING (Paula, 2026-09-23): a quantity row is shipment data only if
+    # cartons in the same document back it. Unbacked rows leave the shipment here,
+    # named in the warnings; rows with nothing to check against stay, flagged.
+    # See carton_backing.py -- it reads no labels, only the grid's arithmetic.
+    result.extracted_line_count = len(result.lines)
+    # Evidence is the other SELECTED attachments only -- never an excluded one,
+    # so an inspection report can never back a quantity (Paula, 2026-08-11).
+    backing = carton_backing.check_lines(
+        result.lines, primary.path,
+        evidence=[(other.path, named(other.path)) for other in classification.cross_checks])
+    result.lines = backing.kept
+    result.removed_lines.extend(
+        # Reason text is keyed in `_REMOVAL_WORDING` -- change both together.
+        {"line": line, "reason": "NOT SHIPMENT DATA (no carton backing)"}
+        for line in backing.dropped)
+    result.warnings.extend(backing.warnings)
+    result.notes.extend(backing.notes)
     result.warnings = warnings + result.warnings
 
     # The PRIMARY's own spend, before any cross-check adds to it. `parse_packing_slip`
@@ -744,7 +807,7 @@ def parse_shipment_email(
             # and that is precisely the number worth seeing.
             before = dict(getattr(extractor, "last_usage", {}) or {}) if extractor else {}
             try:
-                secondary = parse_packing_slip(other.path, extractor=extractor)
+                secondary = parse_packing_slip(other.path, extractor=extractor, **sheet_kwargs)
             except ExtractionError as exc:
                 result.warnings.append(f"cross-check against {named(other.path)} failed: {exc}")
                 # Recorded even on failure: it was attempted, and an attempt that
@@ -757,14 +820,28 @@ def parse_shipment_email(
             # used directly. `before` exists for the failure path above, where no
             # ParseResult comes back to carry a figure.
             result.source_usage[str(Path(other.path).resolve())] = dict(secondary.usage)
-            result.warnings.extend(_compare_line_sets(result.lines, secondary.lines, named(other.path)))
+            # The same carton rule on the cross-check, so the comparison is between
+            # two documents' SHIPMENT data -- not the primary's shipment against
+            # the secondary's shipment-plus-order-plus-later-goods.
+            secondary_backing = carton_backing.check_lines(secondary.lines, other.path)
+            # Named even though a cross-check proposes nothing: rows removed from
+            # the comparison change what "agrees" means, and a removal nobody is
+            # told about is the thing this module promises never to do.
+            result.warnings.extend(f"cross-check {named(other.path)}: {w}"
+                                   for w in secondary_backing.warnings)
+            result.warnings.extend(_compare_line_sets(result.lines, secondary_backing.kept,
+                                                      named(other.path)))
 
     # Vendor dates: reference only. The diff engine never proposes a receipt date
     # from them (see matcher.py); they exist for Paula to read while she types the
     # actual date.
+    # Searched across SELECTED as well as excluded. Since the file gate stopped
+    # checking type (2026-09-23), a shipping advice that repeats per-size figures
+    # is admitted as a data source -- and looking only in `excluded` would then
+    # lose the one document that actually carries the dates.
     advice_sources = [
         c.path
-        for c in classification.excluded
+        for c in classification.selected + classification.excluded
         if c.doc_type == DocType.SHIPPING_ADVICE
     ]
     ship_paths = advice_sources or [primary.path]
@@ -787,37 +864,124 @@ def parse_shipment_email(
     # shipping-info extraction above. Set any earlier and it silently omits
     # whatever comes after -- which it did, missing the shipping-info call and
     # reporting a total that looked right and was short.
-    result.total_usage = usage_delta(call_usage_before,
-                                     getattr(extractor, "last_usage", {}) or {})
+    result.total_usage = spent_so_far()
     return result
 
 
-def _compare_line_sets(primary: list[dict], secondary: list[dict], label: str) -> list[str]:
-    """Aggregate both line sets by key and report any disagreement."""
+#: A shipment that loses MORE than this fraction of its extracted lines is
+#: escalated at the shipment level, not just warned about line by line.
+LOST_ROWS_ESCALATION_FRACTION = 1 / 3
 
-    def agg(lines: list[dict]) -> dict:
+
+def removal_escalation(extracted: int, removed: Sequence[dict]) -> Optional[str]:
+    """
+    The shipment-level escalation when too much of a document was removed, or None.
+
+    Each removal is already named, row by row, in the warnings. That is loud per
+    line and quiet in aggregate: fifteen `NOT SHIPMENT DATA` warnings read the
+    same as one. Losing more than a third of what was extracted says something
+    about the DOCUMENT -- a layout the carton rule misreads, the wrong sheet, a
+    slip that is mostly a later shipment -- so it is raised as its own headline.
+    """
+    if extracted <= 0 or len(removed) <= extracted * LOST_ROWS_ESCALATION_FRACTION:
+        return None
+    # The REASON leads, with the rows it removed: "16 of 44" alone says how much
+    # was lost and nothing about why, and the why is what a reviewer acts on.
+    by_reason: dict[str, list[dict]] = {}
+    for item in removed:
+        by_reason.setdefault(item["reason"], []).append(item["line"])
+    why = "; ".join(
+        f"{len(lines)} removed as {_REMOVAL_WORDING.get(reason, reason)}"
+        + (f" (rows: {', '.join(rows)})"
+           if (rows := sorted({str(ln.get('source_hint')) for ln in lines
+                               if ln.get("source_hint")})) else "")
+        for reason, lines in sorted(by_reason.items()))
+    return (
+        f"SHIPMENT ESCALATION -- more than a third of this shipment's extracted lines "
+        f"were REMOVED: {why}. That is {len(removed)} of {extracted} "
+        f"({len(removed) / extracted:.0%}). Check the source document before approving "
+        "anything on it: a loss this size can mean the document was misread rather than "
+        "that most of it was not this shipment. Each removed row is named in the "
+        "warnings below.")
+
+
+#: How each `removed_lines` reason reads in the escalation headline.
+_REMOVAL_WORDING = {
+    "NOT SHIPMENT DATA (no carton backing)":
+        "NOT SHIPMENT DATA -- quantity rows no carton in the document backs",
+    "no PO number": "having no PO number to attach them to",
+}
+
+
+def _add_usage(a: dict, b: dict) -> dict:
+    """Two usage deltas summed key by key. `b` empty returns `a` unchanged."""
+    if not b:
+        return a
+    return {k: a.get(k, 0) + b.get(k, 0) for k in set(a) | set(b)
+            if a.get(k, 0) + b.get(k, 0) != 0} or dict(FREE_USAGE)
+
+
+def _compare_line_sets(primary: list[dict], secondary: list[dict], label: str) -> list[str]:
+    """
+    Aggregate both line sets by key and report any disagreement -- on the
+    PRIMARY's POs only.
+
+    Two fixes (2026-09-28), both from comparisons that reported noise as findings:
+
+      - **PO numbers go through `po_number_key`**, as everywhere else that groups
+        by PO. Canonical text alone made `PO0001624` and `1624` different keys, and
+        PO 1624's cross-check "DISAGREED on 14 keys" that were the same lines.
+      - **Only the POs the primary covers are compared.** One email can carry
+        documents for unrelated POs (the 1720/1721 message also held Inprotex's
+        and Legendz's workbooks); comparing against those reported "DISAGREES on
+        102 keys" about lines neither document was ever meant to share. The lines
+        left out are COUNTED in the result, so the scoping is visible.
+    """
+    from netsuite_client import po_number_key
+
+    def key_of(ln: dict) -> tuple:
         # Canonical key: a cross-check between two documents must not report a
         # disagreement merely because one printed "NEW  INDIGO" and the other
-        # "NEW INDIGO".
+        # "NEW INDIGO", or one printed the PO padded and the other not.
+        return (po_number_key(str(ln.get("po_number") or "")),
+                *canonical_key(ln["style_number"], ln["color"], ln["size"]))
+
+    def agg(lines: list[dict]) -> dict:
         out: dict[tuple, int] = {}
         for ln in lines:
-            key = canonical_key(ln["po_number"], ln["style_number"], ln["color"], ln["size"])
+            key = key_of(ln)
             out[key] = out.get(key, 0) + (ln.get("quantity") or 0)
         return out
 
-    a, b = agg(primary), agg(secondary)
+    # A line with no resolvable PO keys to '' -- which is NOT a PO the primary
+    # covers. Letting '' into scope would pair two unrelated no-PO rows by
+    # style/colour/size alone and report agreement nobody established.
+    scope = {key_of(ln)[0] for ln in primary} - {""}
+    in_scope = [ln for ln in secondary if key_of(ln)[0] in scope]
+    outside = sorted({key_of(ln)[0] or "(no PO)" for ln in secondary
+                      if key_of(ln)[0] not in scope})
+    scoped = (f"; {len(secondary) - len(in_scope)} line(s) on PO(s) {', '.join(outside)} "
+              "not compared -- the primary does not cover them") if outside else ""
+    if not in_scope:
+        return [f"cross-check against {label}: NOT COMPARED -- it covers none of the "
+                f"primary's PO(s) ({', '.join(sorted(scope)) or 'none'}; it has "
+                f"{len(secondary)} line(s) on {', '.join(outside) or 'no PO'})"]
+
+    a = agg([ln for ln in primary if key_of(ln)[0] in scope])
+    b = agg(in_scope)
     if a == b:
         return [
             f"cross-check against {label}: agrees exactly "
-            f"({len(a)} style/colour/size keys, {sum(a.values())} units)"
+            f"({len(a)} style/colour/size keys, {sum(a.values())} units){scoped}"
         ]
-    diffs = {k: (a.get(k), b.get(k)) for k in set(a) | set(b) if a.get(k) != b.get(k)}
+    diffs = {k: (a.get(k), b.get(k)) for k in sorted(set(a) | set(b)) if a.get(k) != b.get(k)}
     return [
         f"cross-check against {label}: DISAGREES on {len(diffs)} key(s) — "
         f"{dict(list(diffs.items())[:5])}"
         + (" (first 5 shown)" if len(diffs) > 5 else "")
         + ". Totals "
-        f"{sum(a.values())} vs {sum(b.values())}. A human should decide which document is right."
+        f"{sum(a.values())} vs {sum(b.values())}. A human should decide which document is "
+        f"right{scoped}."
     ]
 
 

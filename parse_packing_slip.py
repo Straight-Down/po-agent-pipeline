@@ -155,6 +155,10 @@ def parse_packing_sheet(xlsx_path, sheet_name="PACKING"):
                                     "color": color_code,
                                     "size": size_label,
                                     "quantity": int(qty) if float(qty).is_integer() else qty,
+                                    # The spreadsheet row this figure was read
+                                    # from, so a source hint can name it and the
+                                    # carton-backing check can find it.
+                                    "sheet_row": cr + 1,
                                 }
                             )
                     cr += 1

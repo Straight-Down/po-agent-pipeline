@@ -1293,6 +1293,68 @@ def test_second_shipment_accumulates() -> None:
     check(hist.write_count == 1, "one successful write behind that total", str(hist.write_count))
 
 
+def test_po_1624_later_shipment_accumulates_onto_the_first() -> None:
+    section("PO 1624: the By UPS slip arrives later and ADDS to the By Sea write")
+    # Fixture = PO 1624's real figures, 20138 PAT sizes 8-13. The first slip is
+    # the carton-backed By Sea row; the second is the By UPS quantities Paula
+    # ruled a separate, later shipment -- arriving on their own slip, unlabelled.
+    # One NetSuite line per size, the shape the rule is about. (The live PO holds a
+    # line per transport mode, which routes the pair to NEEDS_ASSIGNMENT before
+    # accumulation is reached; that path is `test_transport_mode_recap_rows`.)
+    sizes = ["8", "9", "10", "11", "12", "13"]
+    ordered = [10, 40, 75, 85, 55, 25]
+    by_sea = [5, 30, 62, 74, 52, 23]
+    by_ups = [5, 10, 13, 11, 3, 2]
+    line_ids = {s: str(100 + i) for i, s in enumerate(sizes)}
+
+    def lines_for(qtys):
+        return [line(po="1624", style="20138", color="PAT", size=s, qty=q,
+                     hint="PO-1624 20138!R39") for s, q in zip(sizes, qtys)]
+
+    def ns(qtys, received):
+        return [ns_line(line_ids[s], style="20138", color="PAT", size=s, qty=q, recv=r)
+                for s, q, r in zip(sizes, qtys, received)]
+
+    def changes(shipment_id):
+        with engine.connect() as conn:
+            rows = conn.execute(select(proposed_changes).where(
+                proposed_changes.c.shipment_id == shipment_id)).all()
+        return {r.key_size: r for r in rows}
+
+    engine = fresh_db()
+    first = _ship(engine, po="1624", graph_id="AAMk-1624-sea",
+                  slip_lines=lines_for(by_sea), ns_lines=ns(ordered, [0.0] * 6))
+    first_changes = changes(first.shipment_id)
+    check(all(first_changes[s].accumulation_basis == "FIRST_SHIPMENT" for s in sizes),
+          "the By Sea slip is each line's first shipment")
+    for s, q in zip(sizes, by_sea):
+        _record_write(engine, first_changes[s], q, dt.datetime(2026, 5, 23, 10, 0, 0))
+
+    # NetSuite now holds what we wrote, and the sea goods have been received.
+    second = _ship(engine, po="1624", graph_id="AAMk-1624-ups",
+                   slip_lines=lines_for(by_ups),
+                   ns_lines=ns(by_sea, [float(q) for q in by_sea]),
+                   now=dt.datetime(2026, 9, 24, 9, 0, 0))
+    got = changes(second.shipment_id)
+
+    proposed = [float(got[s].proposed_quantity) for s in sizes]
+    check(proposed == [float(o) for o in ordered],
+          "each line proposes By Sea + By UPS -- which is exactly the ordered quantity",
+          str(proposed))
+    check(proposed != [float(q) for q in by_ups],
+          "NOT the By UPS figures alone, which is what replace semantics would write")
+    check(all(got[s].accumulation_basis == "ACCUMULATED" for s in sizes),
+          "basis ACCUMULATED on every line")
+    check([float(got[s].accumulation_base_quantity) for s in sizes] == [float(q) for q in by_sea],
+          "and the base each added to is the By Sea quantity this tool WROTE",
+          str([float(got[s].accumulation_base_quantity) for s in sizes]))
+    check(all(got[s].src_quantity_text == str(q) for s, q in zip(sizes, by_ups)),
+          "the later slip's own figures are preserved verbatim")
+    check(all(got[s].state == sc.STATE_PENDING_REVIEW for s in sizes),
+          "an ordinary proposal awaiting Paula's review",
+          str(sorted({got[s].state for s in sizes})))
+
+
 def test_netsuite_disagreeing_with_our_record_is_flagged() -> None:
     section("NetSuite disagrees with what we wrote: flag, do NOT compute")
     engine = fresh_db()
@@ -1491,6 +1553,634 @@ def test_unwritten_proposals_do_not_move_the_base() -> None:
               "edit made later would still be caught", str(hist.observed_quantity))
 
 
+class FlakyClassifierModel:
+    """
+    A model that answers the SAME question differently on alternate calls.
+
+    Odd-numbered calls say the packing workbook is a size-level packing list;
+    even-numbered calls say it is a commercial invoice. That is what the real
+    classifier did to PO 1624's clearance workbook on 2026-09-23, reproduced
+    offline so the test can prove the pipeline no longer depends on which answer
+    it happens to get. The invoice workbook is an invoice on every call.
+    """
+
+    model = "flaky-model-1"
+
+    def __init__(self, packing_name: str):
+        self.packing_name = packing_name
+        self.calls = 0
+        self.last_usage = {"input_tokens": 0, "output_tokens": 0}
+
+    def _parse_with_retry(self, schema, system, content):
+        self.calls += 1
+        self.last_usage = {"input_tokens": self.last_usage["input_tokens"] + 100,
+                           "output_tokens": self.last_usage["output_tokens"] + 10}
+        verdicts = []
+        for block in content[1:]:
+            header = block["text"].split("=====")[1]
+            if self.packing_name in header and self.calls % 2 == 1:
+                verdicts.append({"doc_type": "packing_list", "has_size_breakdown": True,
+                                 "reason": "size columns S/M/L with quantities"})
+            else:
+                verdicts.append({"doc_type": "commercial_invoice", "has_size_breakdown": False,
+                                 "reason": "headed COMMERCIAL INVOICE"})
+        return schema.model_validate({"verdicts": verdicts})
+
+
+def _workbook(path: Path, title: str, rows: list) -> Path:
+    from openpyxl import Workbook
+
+    book = Workbook()
+    sheet = book.active
+    sheet.title = title
+    for row in rows:
+        sheet.append(row)
+    book.save(path)
+    return path
+
+
+def _ingest_real_classifier(engine, docs, model, parsed):
+    """
+    Ingest through the REAL classifier and the REAL `parse_shipment_email`.
+
+    Only the packing-slip extraction and the ship-date read are stubbed -- they
+    are not what is under test, and they would otherwise need the API. Returns
+    the report and how many times the packing slip was parsed.
+    """
+    import document_parsers
+
+    keep = (document_parsers.parse_packing_slip,
+            document_parsers.parse_shipping_info_from_documents)
+    parses = []
+
+    def fake_parse(path, extractor=None, **kw):
+        import copy
+
+        parses.append(Path(path).name)
+        # A copy per call: a primary and a cross-check are separate parses, and
+        # `parse_shipment_email` mutates the primary's result in place.
+        return copy.deepcopy(parsed)
+
+    document_parsers.parse_packing_slip = fake_parse
+    document_parsers.parse_shipping_info_from_documents = lambda paths, extractor=None: ({}, [])
+    try:
+        report = ing.ingest_shipment(
+            engine, docs, message=msg(), client=NetSuiteClient(mock_data={"1662": [
+                ns_line("18", size="S"), ns_line("19", size="M", qty=71)]}),
+            extractor=model, now=NOW)
+    finally:
+        (document_parsers.parse_packing_slip,
+         document_parsers.parse_shipping_info_from_documents) = keep
+    return report, parses
+
+
+def _classification_snapshot(engine) -> dict:
+    with engine.connect() as conn:
+        attach = {r.content_sha256: (r.doc_type, r.has_size_breakdown,
+                                     r.classifier_rationale, r.classifier_model,
+                                     r.classifier_prompt_hash)
+                  for r in conn.execute(select(attachments)).all()}
+        keys = sorted(
+            (r.key_style, r.key_color, r.key_size, r.key_recap_label, r.source_sha256)
+            for r in conn.execute(select(proposed_changes)).all())
+        roles = sorted((r.content_sha256, r.role)
+                       for r in conn.execute(select(shipment_sources)).all())
+    return {"attachments": attach, "proposals": keys, "roles": roles}
+
+
+def test_classification_is_decided_once_and_replayed() -> None:
+    section("one classification per ingest, stored, and replayed on re-extraction")
+    from attachment_classifier import classifier_prompt_hash
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        packing = _workbook(tmp / "Clearance Invoice.xlsx", "PO-1662 M120246",
+                            [["STYLE", "COLOR", "S", "M", "L"], ["M120246", "TID", 9, 50, 0]])
+        invoice = _workbook(tmp / "Commercial Invoice.xlsx", "COMMERCIAL INVOICE",
+                            [["COMMERCIAL INVOICE"], ["Total", 59]])
+        docs = [packing, invoice]
+        parsed = ParseResult(lines=[line(size="S", qty=9), line(size="M", qty=50)],
+                             parser="claude-assisted", vendor_name="Test")
+        packing_sha = ing.sha256_file(packing)
+
+        # Run 1: a fresh scratch database, nothing on record.
+        first_db = fresh_db()
+        model = FlakyClassifierModel(packing.name)
+        first, parses_1 = _ingest_real_classifier(first_db, docs, model, parsed)
+        calls_after_first = model.calls
+        snap_1 = _classification_snapshot(first_db)
+
+        # Run 2: the SAME message into a SECOND scratch database that inherits run
+        # 1's attachment rows -- which is how `extract_pending --all` re-extracts
+        # into a fresh database. Same database would be a dedup no-op that parses
+        # nothing and so proves nothing about the decision.
+        second_db = fresh_db()
+        with first_db.connect() as src, second_db.begin() as dst:
+            for row in src.execute(select(attachments)).mappings().all():
+                dst.execute(attachments.insert(), dict(row))
+        second, parses_2 = _ingest_real_classifier(second_db, docs, model, parsed)
+        snap_2 = _classification_snapshot(second_db)
+
+        # Control: the same message into a database with NOTHING on record. The
+        # flaky model is now on an even call, so an un-stored classification
+        # disagrees. Proves run 2 matched run 1 because of the stored verdict and
+        # not because the fake happened to be consistent.
+        control_db = fresh_db()
+        control, parses_c = _ingest_real_classifier(control_db, docs, model, parsed)
+        snap_c = _classification_snapshot(control_db)
+
+    check(first.created and second.created, "both runs created a shipment",
+          f"{first.summary()} | {second.summary()}")
+    check(calls_after_first == 1,
+          "run 1 asked the model ONCE for the whole ingest (was twice: ingest + parse)",
+          f"{calls_after_first} call(s)")
+    check(parses_1 == [packing.name], "run 1 parsed the workbook its classification selected",
+          str(parses_1))
+    check(model.calls == calls_after_first + 1,
+          "run 2 asked the model NOTHING -- both verdicts came from the attachment rows "
+          "(the +1 is the control run)", f"{model.calls} call(s) in total")
+    check(snap_1["attachments"] == snap_2["attachments"],
+          "identical doc_type, size claim, rationale, model and prompt hash per SHA-256",
+          str(sorted(v[0] for v in snap_2["attachments"].values())))
+    check(snap_1["proposals"] == snap_2["proposals"] and len(snap_1["proposals"]) == 2,
+          "identical proposal keys AND identical source_sha256 across both runs",
+          str(snap_2["proposals"]))
+    check({p[4] for p in snap_1["proposals"]} == {packing_sha},
+          "every proposal names the packing workbook as its source", packing_sha[:12])
+    check(snap_1["roles"] == snap_2["roles"]
+          and (packing_sha, "PRIMARY") in snap_1["roles"],
+          "the RECORDED primary is the document that was PARSED", str(snap_1["roles"]))
+    stored = snap_1["attachments"][packing_sha]
+    check(stored[0] == "PACKING_LIST" and stored[1] is True
+          and stored[2] == "size columns S/M/L with quantities"
+          and stored[3] == "flaky-model-1" and stored[4] == classifier_prompt_hash(),
+          "the verdict is stored with its rationale, model and prompt hash", str(stored))
+    check(snap_c["proposals"] == [] and parses_c == [],
+          "control: WITHOUT the stored verdict the flaky model excludes the workbook -- "
+          "the stored verdict, not luck, is what made run 2 agree",
+          f"{len(snap_c['proposals'])} proposal(s), parsed {parses_c}")
+
+
+def _flaky_sheet_model():
+    """
+    A real `ClaudeExtractor` whose model answers the per-SHEET question differently
+    on alternate calls.
+
+    The workbook's COMMERCIAL INVOICE sheet comes back a size-level packing list on
+    odd-numbered sheet calls and an invoice on even ones -- the per-sheet version
+    of what the file-level classifier did to PO 1624 on 2026-09-23. The file-level
+    answer is steady (the workbook has sizes), so only the sheet choice can move.
+    Extraction calls return one line per sheet and record WHICH sheet was read.
+    """
+    from types import SimpleNamespace
+
+    import attachment_classifier as ac
+    import claude_extractor as ce
+    from extraction_schema import PackingSlipExtraction
+
+    packing = {"doc_type": "packing_list", "has_size_breakdown": True,
+               "reason": "size columns S/M with quantities"}
+    invoice = {"doc_type": "commercial_invoice", "has_size_breakdown": False,
+               "reason": "headed COMMERCIAL INVOICE"}
+
+    class FlakySheetModel(ce.ClaudeExtractor):
+        def __init__(self):
+            super().__init__(client=SimpleNamespace(), model="flaky-sheet-model-1")
+            self.sheet_calls = 0
+            self.extracted: list[str] = []
+            self.last_usage = {"input_tokens": 0, "output_tokens": 0}
+
+        def _parse_with_retry(self, schema, system, content):
+            head = content[0]["text"]
+            if schema is ac._ContentVerdicts and "section(s)" in head:
+                self.sheet_calls += 1
+                verdicts = []
+                for block in content[1:]:
+                    label = block["text"].split("=====")[1].split(":", 1)[1].strip()
+                    flip = "INVOICE" in label and self.sheet_calls % 2 == 1
+                    verdicts.append(packing if flip or "INVOICE" not in label else invoice)
+                return schema.model_validate({"verdicts": verdicts})
+            if schema is ac._ContentVerdicts:
+                return schema.model_validate({"verdicts": [packing for _ in content[1:]]})
+            sent = " ".join(block["text"] for block in content)
+            marker = next(m for m in ("MARK-INVOICE", "MARK-PACKING") if m in sent)
+            self.extracted.append(marker)
+            return PackingSlipExtraction.model_validate({
+                "vendor_name": "Test", "document_summary": marker,
+                "unparsed_regions": [], "warnings": [],
+                "lines": [{"po_number": "1662", "style_number": "M120246", "color": "TID",
+                           "size": "S" if marker == "MARK-PACKING" else "M",
+                           "quantity": 9, "confidence": "high", "note": "",
+                           "source_hint": f"{marker}!recap"}]})
+
+    return FlakySheetModel()
+
+
+def _ingest_real_parse(engine, docs, model):
+    """
+    Ingest through the real classifier, the real parse AND the real extractor sheet
+    selection. Only the ship-date read is stubbed.
+    """
+    import document_parsers
+
+    keep = document_parsers.parse_shipping_info_from_documents
+    document_parsers.parse_shipping_info_from_documents = lambda paths, extractor=None: ({}, [])
+    try:
+        return ing.ingest_shipment(
+            engine, docs, message=msg(), client=NetSuiteClient(mock_data={"1662": [
+                ns_line("18", size="S"), ns_line("19", size="M", qty=71)]}),
+            extractor=model, now=NOW)
+    finally:
+        document_parsers.parse_shipping_info_from_documents = keep
+
+
+def test_sheet_choice_is_decided_once_and_replayed() -> None:
+    section("per-sheet verdicts are stored and replayed: the same sheets, every ingest")
+    from openpyxl import Workbook
+
+    from attachment_classifier import classifier_prompt_hash
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "Clearance Invoice.xlsx"
+        book = Workbook()
+        book.active.title = "COMMERCIAL INVOICE"
+        book.active.append(["MARK-INVOICE", "COMMERCIAL INVOICE"])
+        book.active.append(["M120246", "TID", "S", 9, "M", 50])
+        packing = book.create_sheet("PO-1662 M120246")
+        packing.append(["MARK-PACKING", "STYLE", "COLOR", "S", "M"])
+        packing.append(["", "M120246", "TID", 9, 50])
+        book.save(path)
+        sha = ing.sha256_file(path)
+
+        model = _flaky_sheet_model()
+        first_db = fresh_db()
+        _ingest_real_parse(first_db, [path], model)
+        first = list(model.extracted)
+        calls_after_first = model.sheet_calls
+
+        # Run 2: the SAME message into a second database that inherits run 1's
+        # attachment rows -- how `extract_pending --all` re-extracts. The same
+        # database would be a dedup no-op that parses nothing.
+        second_db = fresh_db()
+        with first_db.connect() as src, second_db.begin() as dst:
+            for row in src.execute(select(attachments)).mappings().all():
+                dst.execute(attachments.insert(), dict(row))
+        model.extracted.clear()
+        _ingest_real_parse(second_db, [path], model)
+        second = list(model.extracted)
+        calls_after_second = model.sheet_calls
+
+        # Control: nothing on record, so the model's NEXT (flipped) answer decides.
+        model.extracted.clear()
+        _ingest_real_parse(fresh_db(), [path], model)
+        control = list(model.extracted)
+
+        with first_db.connect() as conn:
+            stored = json.loads(conn.execute(
+                select(attachments.c.sheet_verdicts_json)
+                .where(attachments.c.content_sha256 == sha)).scalar() or "[]")
+
+    check(calls_after_first == 1, "run 1 asked the sheet question once", str(calls_after_first))
+    check(bool(first) and first == second,
+          "run 2 extracted EXACTLY the sheets run 1 did", f"{first} vs {second}")
+    check(calls_after_second == calls_after_first,
+          "because run 2 asked NO sheet question -- every sheet verdict was replayed",
+          f"{calls_after_second - calls_after_first} new call(s)")
+    check(sorted(control) != sorted(first),
+          "control: without the stored verdicts the flaky model picks DIFFERENT sheets -- "
+          "the store, not luck, is what made run 2 agree", f"{first} vs control {control}")
+    by_sheet = {v["sheet"]: v for v in stored}
+    check(set(by_sheet) == {"COMMERCIAL INVOICE", "PO-1662 M120246"}
+          and all(v["model"] == "flaky-sheet-model-1"
+                  and v["prompt_hash"] == classifier_prompt_hash() for v in stored)
+          and by_sheet["PO-1662 M120246"]["rationale"] == "size columns S/M with quantities",
+          "each sheet's verdict is stored on the attachment with its rationale, model and "
+          "prompt hash", str(sorted(by_sheet)))
+
+
+def test_a_sheet_verdict_is_reused_only_when_all_four_keys_match() -> None:
+    section("a stored sheet verdict needs the same bytes, sheet, prompt AND model")
+    from attachment_classifier import SheetVerdicts, StoredSheetVerdict, merge_sheet_verdicts
+
+    v = StoredSheetVerdict("S1", "packing_list", True, "r", "model-a", "hash-1")
+    cache = SheetVerdicts({"sha-1": [v]})
+    check(cache.lookup("sha-1", "S1", model="model-a", prompt_hash="hash-1") == v,
+          "all four match: reused")
+    for what, (sha, sheet, model, prompt) in (
+            ("other bytes", ("sha-2", "S1", "model-a", "hash-1")),
+            ("other sheet", ("sha-1", "S2", "model-a", "hash-1")),
+            ("other model", ("sha-1", "S1", "model-b", "hash-1")),
+            ("other prompt", ("sha-1", "S1", "model-a", "hash-2"))):
+        check(cache.lookup(sha, sheet, model=model, prompt_hash=prompt) is None,
+              f"{what}: asked again")
+    newer = StoredSheetVerdict("S1", "commercial_invoice", False, "r2", "model-b", "hash-1")
+    merged = merge_sheet_verdicts([v], [newer])
+    check(len(merged) == 2, "a verdict under another model is ADDED, not overwritten")
+    again = StoredSheetVerdict("S1", "commercial_invoice", False, "r3", "model-a", "hash-1")
+    remerged = merge_sheet_verdicts(merged, [again])
+    check(len(remerged) == 2 and {x.rationale for x in remerged} == {"r2", "r3"},
+          "and a verdict under the same key is replaced")
+
+
+class InvoiceWithSizesModel:
+    """Types every workbook commercial_invoice AND says it carries sizes."""
+
+    model = "steady-model-1"
+
+    def __init__(self):
+        self.calls = 0
+        self.last_usage = {"input_tokens": 0, "output_tokens": 0}
+
+    def _parse_with_retry(self, schema, system, content):
+        self.calls += 1
+        return schema.model_validate({"verdicts": [
+            {"doc_type": "commercial_invoice", "has_size_breakdown": True,
+             "reason": "COMMERCIAL INVOICE sheet plus per-PO packing sheets with sizes"}
+            for _ in content[1:]]})
+
+
+def test_two_admitted_workbooks_with_the_same_sheets_do_not_double_propose() -> None:
+    section("PO 1624's shape: two invoice-typed workbooks, same packing sheets, one proposal set")
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        rows = [["STYLE", "COLOR", "S", "M"], ["M120246", "TID", 9, 50]]
+        clearance = _workbook(tmp / "Clearance Invoice.xlsx", "PO-1662 M120246", rows)
+        payment = _workbook(tmp / "Payment invoice - By Sea.xlsx", "PO-1662 M120246",
+                            rows + [["forwarder", "X"]])  # different bytes, same sheet data
+        parsed = ParseResult(lines=[line(size="S", qty=9), line(size="M", qty=50)],
+                             parser="claude-assisted", vendor_name="Test")
+        engine = fresh_db()
+        report, parses = _ingest_real_classifier(
+            engine, [clearance, payment], InvoiceWithSizesModel(), parsed)
+        clearance_sha = ing.sha256_file(clearance)
+        payment_sha = ing.sha256_file(payment)
+        snap = _classification_snapshot(engine)
+
+    check(report.created, "the shipment was created", report.summary())
+    check(sorted(parses) == sorted([clearance.name, payment.name]),
+          "BOTH workbooks were admitted by the new gate and read (primary + cross-check)",
+          str(parses))
+    check(len(snap["proposals"]) == 2,
+          "two slip lines -> two proposals, NOT four: the cross-check's lines are compared, "
+          "never proposed", f"{len(snap['proposals'])} proposal(s)")
+    check({p[4] for p in snap["proposals"]} == {clearance_sha},
+          "every proposal is sourced from the ONE primary workbook", clearance_sha[:12])
+    check(sorted(snap["roles"]) == sorted([(clearance_sha, "PRIMARY"),
+                                           (payment_sha, "CROSS_CHECK")]),
+          "one PRIMARY, one CROSS_CHECK recorded", str(snap["roles"]))
+    check(all(v[0] == "COMMERCIAL_INVOICE" for v in snap["attachments"].values()),
+          "doc_type is still recorded, as metadata", str([v[0] for v in snap["attachments"].values()]))
+
+
+def test_unbacked_rows_never_become_proposals() -> None:
+    section("end to end: PO 1624's real workbook, three quantity rows, ONE proposal")
+    footwear = HERE / "FW26 footwear PO-1624 packing sheets (invoice sheet removed).xlsx"
+    # What the extractor emitted from 20138 PAT size 10 on 2026-09-23: the By Sea
+    # row, the Ordered Qty row and the By UPS row (the order row was never emitted
+    # by the model, but the rule must hold if it is).
+    parsed = ParseResult(lines=[
+        line(po="1624", style="20138", color="PAT", size="10", qty=62,
+             hint="PO-1624 20138!R39"),
+        line(po="1624", style="20138", color="PAT", size="10", qty=75,
+             hint="PO-1624 20138!R40"),
+        line(po="1624", style="20138", color="PAT", size="10", qty=13,
+             hint="PO-1624 20138!R41"),
+    ], parser="claude-assisted", vendor_name="Test")
+    engine = fresh_db()
+    report, _parses = _ingest_real_classifier(engine, [footwear], InvoiceWithSizesModel(),
+                                              parsed)
+    with engine.connect() as conn:
+        rows = conn.execute(select(proposed_changes)).all()
+    check([(r.source_hint, r.src_quantity_text) for r in rows] == [("PO-1624 20138!R39", "62")],
+          "only the carton-backed row became a proposal", str([r.source_hint for r in rows]))
+    dropped = [w for w in report.parse_warnings if w.startswith("NOT SHIPMENT DATA")]
+    check(len(dropped) == 2 and any("row 40" in w for w in dropped)
+          and any("row 41" in w for w in dropped),
+          "and both unbacked rows are named on the shipment's warnings", str(len(dropped)))
+
+
+def test_lost_rows_escalate_at_the_shipment_level() -> None:
+    section("a shipment that loses more than a third of its lines says so on the SHIPMENT")
+    import document_parsers as dp
+
+    removed = [{"line": {}, "reason": "NOT SHIPMENT DATA (no carton backing)"}] * 5
+    check(dp.removal_escalation(15, removed) is None,
+          "exactly a third is not escalated (the rule is MORE than a third)")
+    six = dp.removal_escalation(15, removed + removed[:1]) or ""
+    check(six.startswith("SHIPMENT ESCALATION") and "6 of 15" in six, "one more line is")
+    check(dp.removal_escalation(0, []) is None, "nothing extracted, nothing to escalate")
+
+    footwear = HERE / "FW26 footwear PO-1624 packing sheets (invoice sheet removed).xlsx"
+    parsed = ParseResult(lines=[
+        line(po="1624", style="20138", color="PAT", size="10", qty=62,
+             hint="PO-1624 20138!R39"),
+        line(po="", style="20138", color="PAT", size="11", qty=72,
+             hint="PO-1624 20138!R39"),
+        line(po="1624", style="20138", color="PAT", size="10", qty=75,
+             hint="PO-1624 20138!R40"),
+        line(po="1624", style="20138", color="PAT", size="10", qty=13,
+             hint="PO-1624 20138!R41"),
+    ], parser="claude-assisted", vendor_name="Test")
+    engine = fresh_db()
+    report, _parses = _ingest_real_classifier(engine, [footwear], InvoiceWithSizesModel(),
+                                              parsed)
+    with engine.connect() as conn:
+        ship = conn.execute(select(shipments)).one()
+        events = {r.event: r for r in conn.execute(select(audit_log)).all()}
+    warnings = json.loads(ship.parse_warnings_json or "[]")
+    head = warnings[0] if warnings else ""
+    check(head.startswith("SHIPMENT ESCALATION") and "3 of 4" in head,
+          "the escalation HEADS the shipment's stored warnings: 2 unbacked + 1 with no PO "
+          "number, of 4 extracted", head[:70])
+    check(head.index("2 removed as NOT SHIPMENT DATA") < head.index("3 of 4")
+          and "rows: PO-1624 20138!R40, PO-1624 20138!R41" in head
+          and "1 removed as having no PO number" in head,
+          "and it says WHY before how many: each reason, with the rows it removed",
+          head[:160])
+    check(bool(ship.doc_needs_review), "and the shipment is marked for review")
+    rows_lost = events.get("SHIPMENT_ROWS_LOST")
+    detail = json.loads(rows_lost.detail_json) if rows_lost else {}
+    check(detail.get("lines_extracted") == 4 and detail.get("lines_removed") == 3
+          and {d["reason"] for d in detail.get("removed", [])}
+          == {"no PO number", "NOT SHIPMENT DATA (no carton backing)"},
+          "and a SHIPMENT_ROWS_LOST audit event carries the count and every removed line",
+          str(detail)[:120])
+    check(any(w.startswith("LINE NOT PERSISTED") and "20138/PAT/11=72" in w for w in warnings),
+          "the no-PO line -- once a report-only note -- is named on the shipment itself")
+    check(report.parse_warnings[:1] == warnings[:1], "the report leads with it too")
+
+
+def test_cross_check_compares_normalised_pos_the_primary_covers() -> None:
+    section("cross-check: PO numbers normalised, and only the primary's POs compared")
+    import document_parsers as dp
+
+    primary = [line(po="1624", style="20138", color="PAT", size="10", qty=62)]
+    padded = [line(po="PO0001624", style="20138", color="PAT", size="10", qty=62)]
+    got = dp._compare_line_sets(primary, padded, "copy")
+    check(len(got) == 1 and "agrees exactly" in got[0],
+          "'PO0001624' and '1624' are the same PO -- this read 'DISAGREES' before", got[0])
+
+    other_po = padded + [line(po="1662", style="M120246", color="TID", size="S", qty=9)]
+    got = dp._compare_line_sets(primary, other_po, "mixed")[0]
+    check("agrees exactly" in got and "1 line(s) on PO(s) 1662 not compared" in got,
+          "a line on a PO the primary does not cover is left out, and SAID to be", got)
+
+    unrelated = [line(po="1657", style="M630018", color="DFK", size="M", qty=148)]
+    got = dp._compare_line_sets(primary, unrelated, "Legendz")[0]
+    check("NOT COMPARED" in got and "DISAGREES" not in got,
+          "a document covering none of the primary's POs is not compared at all", got)
+
+    no_po = [line(po="", style="20138", color="PAT", size="10", qty=62)]
+    got = dp._compare_line_sets(no_po + primary, no_po, "copy")[0]
+    check("NOT COMPARED" in got and "agrees" not in got,
+          "two lines with NO PO number are never paired -- that would be agreement "
+          "manufactured from style/colour/size alone", got)
+
+    wrong = [line(po="PO0001624", style="20138", color="PAT", size="10", qty=60)]
+    got = dp._compare_line_sets(primary, wrong, "copy")[0]
+    check("DISAGREES on 1 key" in got, "a real difference on a shared PO still disagrees", got)
+
+
+def test_cross_check_removals_are_named() -> None:
+    section("carton backing on a cross-check names its removals too")
+    import attachment_classifier as ac
+    import document_parsers
+
+    footwear = HERE / "FW26 footwear PO-1624 packing sheets (invoice sheet removed).xlsx"
+    with tempfile.TemporaryDirectory() as td:
+        copy_path = Path(td) / "second copy.xlsx"
+        copy_path.write_bytes(footwear.read_bytes())
+
+        def verdict(path):
+            return ac.AttachmentClassification(
+                path=path, doc_type=ac.DocType.PACKING_LIST, has_size_breakdown=True,
+                reason="r", method="filename+content", filename_hint=ac.DocType.PACKING_LIST,
+                display_name=path.name)
+
+        classification = ac.ClassificationResult(
+            selected=[verdict(footwear), verdict(copy_path)])
+        lines = [line(po="1624", style="20138", color="PAT", size="10", qty=62,
+                      hint="PO-1624 20138!R39"),
+                 line(po="1624", style="20138", color="PAT", size="10", qty=13,
+                      hint="PO-1624 20138!R41")]
+        keep = (document_parsers.parse_packing_slip,
+                document_parsers.parse_shipping_info_from_documents)
+        document_parsers.parse_packing_slip = (
+            lambda path, extractor=None, **kw: ParseResult(
+                lines=[dict(x) for x in lines], parser="stub"))
+        document_parsers.parse_shipping_info_from_documents = lambda p, extractor=None: ({}, [])
+        try:
+            result = document_parsers.parse_shipment_email(
+                [footwear, copy_path], extractor=StubExtractor(), cross_check=True,
+                classification=classification)
+        finally:
+            (document_parsers.parse_packing_slip,
+             document_parsers.parse_shipping_info_from_documents) = keep
+    named = [w for w in result.warnings
+             if w.startswith("cross-check second copy.xlsx: NOT SHIPMENT DATA")]
+    check(len(named) == 1 and "row 41" in named[0],
+          "the cross-check's unbacked row is named, with the document it came from",
+          (named or ["none"])[0][:90])
+    check(result.extracted_line_count == 2 and len(result.removed_lines) == 1,
+          "and only the PRIMARY's removals count toward the shipment's lost rows",
+          f"{result.extracted_line_count}/{len(result.removed_lines)}")
+
+
+def test_admitted_shipping_advice_still_supplies_the_dates() -> None:
+    section("a shipping advice WITH sizes is now admitted -- and still read for ETD/ETA")
+    import attachment_classifier as ac
+    import document_parsers
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        packing, advice = make_docs(tmp, ("packing.xlsx", "Shipping Advice.xlsx"))
+
+        def verdict(path, doc_type):
+            return ac.AttachmentClassification(
+                path=path, doc_type=doc_type, has_size_breakdown=True, reason="r",
+                method="filename+content", filename_hint=doc_type,
+                display_name=path.name)
+
+        classification = ac.ClassificationResult(selected=[
+            verdict(packing, ac.DocType.PACKING_LIST),
+            verdict(advice, ac.DocType.SHIPPING_ADVICE)])
+        check(classification.selected[1].usable_as_shipment_data,
+              "premise: the advice passes the new gate, so it sits in SELECTED")
+
+        keep = (document_parsers.parse_packing_slip,
+                document_parsers.parse_shipping_info_from_documents)
+        date_paths = []
+
+        def ship_info(paths, extractor=None):
+            date_paths.extend(Path(p).name for p in paths)
+            return {"etd": "2026-05-22"}, []
+
+        document_parsers.parse_packing_slip = (
+            lambda path, extractor=None, **kw: ParseResult(lines=[line()], parser="stub"))
+        document_parsers.parse_shipping_info_from_documents = ship_info
+        try:
+            result = document_parsers.parse_shipment_email(
+                [packing, advice], extractor=StubExtractor(),
+                classification=classification)
+        finally:
+            (document_parsers.parse_packing_slip,
+             document_parsers.parse_shipping_info_from_documents) = keep
+
+    check(date_paths == [advice.name],
+          "ETD/ETA read from the ADMITTED shipping advice, not the packing list "
+          "(it used to be searched for in `excluded` only)", str(date_paths))
+    check(result.ship_info.get("etd") == "2026-05-22", "and the date arrives on the result")
+
+
+def test_proposals_without_a_primary_are_refused() -> None:
+    section("invariant: a proposed change with no source_sha256 raises, and writes nothing")
+    engine = fresh_db()
+    with tempfile.TemporaryDirectory() as td:
+        docs = make_docs(Path(td), ("Clearance Invoice.xlsx",))
+        # The shape of the 2026-09-23 defect: lines came back from the parse while
+        # the recorded classification selected nothing.
+        classification = FakeClassification(selected=[], excluded=[
+            FakeClassification.Item(docs[0], "commercial_invoice",
+                                    excluded_reason="not a packing list")])
+        parsed = ParseResult(lines=[line(size="S", qty=9)], parser="claude-assisted")
+        monkey = {}
+        install_stub_parse(monkey, parsed, classification)
+        raised = None
+        try:
+            ing.ingest_shipment(engine, docs, message=msg(), client=NetSuiteClient(
+                mock_data={"1662": [ns_line("18", size="S")]}), extractor=StubExtractor(),
+                now=NOW)
+        except ing.IngestInvariantError as exc:
+            raised = exc
+        finally:
+            restore(monkey)
+
+    check(raised is not None and "source_sha256" in str(raised),
+          "IngestInvariantError, naming source_sha256", str(raised)[:90])
+    got = counts(engine)
+    check(got["shipments"] == 0 and got["proposed_changes"] == 0
+          and got["shipment_sources"] == 0,
+          "and the whole shipment rolled back -- no partial rows",
+          f"shipments={got['shipments']} proposals={got['proposed_changes']}")
+
+
+def test_shipment_with_proposals_and_no_recorded_primary_raises() -> None:
+    section("invariant: proposals with no PRIMARY source recorded raises")
+    engine = fresh_db()
+    with engine.begin() as conn:
+        conn.execute(shipments.insert(), {
+            "id": "s-1", "origin": "PAULA_DIRECTED", "created_by": "test",
+            "created_at": NOW, "doc_needs_review": False, "needs_manual_entry": False})
+    raised = None
+    try:
+        with engine.begin() as conn:
+            ing._assert_primary_recorded(conn, "s-1", None)
+    except ing.IngestInvariantError as exc:
+        raised = exc
+    check(raised is not None and "0 PRIMARY" in str(raised),
+          "a shipment with no PRIMARY shipment_sources row is refused", str(raised)[:90])
+
+
 def main() -> int:
     print("=" * 78)
     print("INGEST TESTS -- parser output -> database rows")
@@ -1514,11 +2204,23 @@ def main() -> int:
         test_gaps_are_reported_not_defaulted,
         test_first_shipment_proposes_the_slip,
         test_second_shipment_accumulates,
+        test_po_1624_later_shipment_accumulates_onto_the_first,
         test_netsuite_disagreeing_with_our_record_is_flagged,
         test_untracked_line_with_receipts_is_flagged,
         test_pre_existing_receipt_retires_itself,
         test_the_two_no_proposal_cases_do_not_share_a_label,
         test_unwritten_proposals_do_not_move_the_base,
+        test_classification_is_decided_once_and_replayed,
+        test_sheet_choice_is_decided_once_and_replayed,
+        test_a_sheet_verdict_is_reused_only_when_all_four_keys_match,
+        test_two_admitted_workbooks_with_the_same_sheets_do_not_double_propose,
+        test_admitted_shipping_advice_still_supplies_the_dates,
+        test_unbacked_rows_never_become_proposals,
+        test_lost_rows_escalate_at_the_shipment_level,
+        test_cross_check_removals_are_named,
+        test_cross_check_compares_normalised_pos_the_primary_covers,
+        test_proposals_without_a_primary_are_refused,
+        test_shipment_with_proposals_and_no_recorded_primary_raises,
     )
 
     # A test registered twice runs twice and its checks are counted twice. That

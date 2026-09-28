@@ -128,6 +128,17 @@ class IngestReport:
         )
 
 
+class IngestInvariantError(RuntimeError):
+    """
+    A shipment is about to be persisted in a shape that must never exist.
+
+    RAISED, never warned: the ingest's transaction rolls back and nothing is
+    written. Both invariants guard provenance -- a proposed quantity whose source
+    document is not recorded cannot be traced back to what the vendor sent, and
+    that is the one thing a human reviewing it needs to be able to do.
+    """
+
+
 def sha256_file(path: Union[str, Path]) -> str:
     """Content hash -- the dedup axis that survives a re-forward."""
     digest = hashlib.sha256()
@@ -260,12 +271,21 @@ def _upsert_attachment(conn, path: Path, classification, now: dt.datetime) -> st
     """
     sha = sha256_file(path)
     existing = conn.execute(
-        attachments.select().with_only_columns(attachments.c.content_sha256)
+        attachments.select().with_only_columns(
+            attachments.c.content_sha256, attachments.c.classifier_prompt_hash)
         .where(attachments.c.content_sha256 == sha)
-    ).scalar()
+    ).first()
+    has_verdict = bool(getattr(classification, "verdict_source", None))
     if existing:
         verdict = _doc_type_value(classification)
-        if classification is not None and verdict != "UNCLASSIFIED":
+        # A stored model verdict is never overwritten by a classification that
+        # carries none (a filename-banned or unreadable reading of the same
+        # bytes): the row's doc_type would then contradict the verdict columns
+        # beside it, and the next reuse would replay a doc_type the model never
+        # gave. A classification WITH a verdict -- fresh, or the stored one
+        # replayed -- always writes, and replaying writes the same values.
+        keep_stored = existing.classifier_prompt_hash is not None and not has_verdict
+        if classification is not None and verdict != "UNCLASSIFIED" and not keep_stored:
             conn.execute(
                 attachments.update()
                 .where(attachments.c.content_sha256 == sha)
@@ -275,6 +295,7 @@ def _upsert_attachment(conn, path: Path, classification, now: dt.datetime) -> st
                     open_failure_reason=classification.unreadable_reason,
                     banned_as_data_source=bool(
                         classification.doc_type.value == "inspection_report"),
+                    **_verdict_columns(classification),
                 )
             )
         return sha
@@ -290,12 +311,150 @@ def _upsert_attachment(conn, path: Path, classification, now: dt.datetime) -> st
             classification is not None
             and classification.doc_type.value == "inspection_report"
         ),
+        **_verdict_columns(classification),
         # Where the bytes live TODAY: the local corpus path. Azure Blob at Phase 4
         # (rationale section 13). Not a placeholder -- this is the real location.
         "stored_uri": str(path.resolve()),
         "first_seen_at": now,
     })
     return sha
+
+
+def _verdict_columns(classification) -> dict:
+    """
+    The stored-verdict columns for one attachment (migration 0011).
+
+    All four are written only when a MODEL verdict was applied. Otherwise all
+    four are NULL, which is what marks the row as not reusable -- a filename-ban,
+    an unreadable file or a failed call is not a verdict about the content.
+    """
+    if not getattr(classification, "verdict_source", None):
+        return {"has_size_breakdown": None, "classifier_rationale": None,
+                "classifier_model": None, "classifier_prompt_hash": None}
+    return {
+        "has_size_breakdown": bool(classification.has_size_breakdown),
+        "classifier_rationale": (classification.content_rationale or "")[:1000],
+        "classifier_model": (classification.classifier_model or None),
+        "classifier_prompt_hash": classification.classifier_prompt_hash,
+    }
+
+
+def _stored_verdicts(engine, paths: Sequence[Path]) -> dict:
+    """
+    Content verdicts already on record for these attachments, keyed by SHA-256.
+
+    Only rows carrying a prompt hash count: that is the mark of a model verdict
+    written since 0011. A row with a doc_type but no hash -- the poller's
+    UNCLASSIFIED, a filename ban, or anything classified under the old
+    two-call ingest -- is not a verdict and is classified afresh.
+    """
+    from sqlalchemy import select
+
+    from attachment_classifier import StoredVerdict
+
+    shas = {sha256_file(p) for p in paths if Path(p).exists()}
+    if not shas:
+        return {}
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(attachments.c.content_sha256, attachments.c.doc_type,
+                   attachments.c.has_size_breakdown, attachments.c.classifier_rationale,
+                   attachments.c.classifier_model, attachments.c.classifier_prompt_hash)
+            .where(attachments.c.content_sha256.in_(sorted(shas)))
+            .where(attachments.c.classifier_prompt_hash.is_not(None))
+        ).all()
+    return {
+        row.content_sha256: StoredVerdict(
+            # The column holds `_doc_type_value`'s upper-case mapping, which is the
+            # classifier's own value upper-cased for every type a verdict can be.
+            doc_type=str(row.doc_type).lower(),
+            has_size_breakdown=bool(row.has_size_breakdown),
+            rationale=row.classifier_rationale or "",
+            model=row.classifier_model,
+            prompt_hash=row.classifier_prompt_hash,
+        )
+        for row in rows
+    }
+
+
+def _stored_sheet_verdicts(engine, shas):
+    """Per-sheet verdicts on record for these attachments (migration 0012)."""
+    from sqlalchemy import select
+
+    from attachment_classifier import SheetVerdicts, StoredSheetVerdict
+
+    shas = sorted(set(shas))
+    if not shas:
+        return SheetVerdicts()
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(attachments.c.content_sha256, attachments.c.sheet_verdicts_json)
+            .where(attachments.c.content_sha256.in_(shas))
+            .where(attachments.c.sheet_verdicts_json.is_not(None))
+        ).all()
+    return SheetVerdicts({
+        row.content_sha256: [StoredSheetVerdict.from_json(item)
+                             for item in json.loads(row.sheet_verdicts_json)]
+        for row in rows
+    })
+
+
+def _save_sheet_verdicts(engine, sheet_verdicts) -> None:
+    """
+    Persist the per-sheet verdicts this ingest asked for, merged into the row.
+
+    A verdict with the same (sheet, model, prompt hash) replaces the stored one;
+    any other key already on the row is kept, so switching model and back does
+    not lose the first model's answers.
+    """
+    from sqlalchemy import select
+
+    from attachment_classifier import StoredSheetVerdict, merge_sheet_verdicts
+
+    if not sheet_verdicts.fresh:
+        return
+    with engine.begin() as conn:
+        for sha, fresh in sheet_verdicts.fresh.items():
+            current = conn.execute(
+                select(attachments.c.sheet_verdicts_json)
+                .where(attachments.c.content_sha256 == sha)
+            ).scalar()
+            existing = [StoredSheetVerdict.from_json(item)
+                        for item in json.loads(current or "[]")]
+            merged = merge_sheet_verdicts(existing, fresh)
+            conn.execute(
+                attachments.update().where(attachments.c.content_sha256 == sha)
+                .values(sheet_verdicts_json=json.dumps([v.to_json() for v in merged]))
+            )
+
+
+def _assert_primary_recorded(conn, shipment_id: str, message_id: Optional[str]) -> None:
+    """
+    Invariant: a shipment with proposals has its primary attachment recorded.
+
+    "Recorded" is exactly one `shipment_sources` row with role PRIMARY and, for a
+    VENDOR_EMAIL shipment, `shipments.primary_attachment_sha` set too.
+    PAULA_DIRECTED rows keep that column NULL by the `provenance` CHECK, so for
+    them the sources row is the record. Read back from the database, not from
+    Python state, so it checks what was actually written.
+    """
+    from sqlalchemy import func, select
+
+    primaries = conn.execute(
+        select(func.count()).select_from(shipment_sources)
+        .where(shipment_sources.c.shipment_id == shipment_id)
+        .where(shipment_sources.c.role == "PRIMARY")
+    ).scalar()
+    primary_sha = conn.execute(
+        select(shipments.c.primary_attachment_sha).where(shipments.c.id == shipment_id)
+    ).scalar()
+    if primaries != 1 or (message_id is not None and primary_sha is None):
+        raise IngestInvariantError(
+            f"shipment {shipment_id} has proposed changes but its primary attachment is "
+            f"not recorded ({primaries} PRIMARY source row(s), "
+            f"primary_attachment_sha={primary_sha!r}). Refusing to persist lines whose "
+            "source document cannot be traced."
+        )
 
 
 def _shipment_tokens(parsed, key: str) -> int:
@@ -663,14 +822,19 @@ def ingest_shipment(
             "allow_no_netsuite=True to choose this mode deliberately."
         )
     from attachment_classifier import classify_attachments
-    from document_parsers import parse_shipment_email
+    from document_parsers import parse_shipment_email, removal_escalation
 
     now = now or _utcnow()
     paths = [Path(p) for p in attachment_paths]
     report = IngestReport()
 
+    # THE classification for this ingest -- the only one. It decides what is
+    # recorded AND, passed into `parse_shipment_email` below, what is parsed.
+    # Bytes that already carry a stored verdict are not re-asked: the verdict on
+    # record is replayed, so a re-extraction reaches the same gate decision.
     classification = classify_attachments(paths, extractor=extractor,
-                                          display_names=display_names)
+                                          display_names=display_names,
+                                          stored_verdicts=_stored_verdicts(engine, paths))
     primary = classification.primary
     by_path = {c.path.resolve(): c for c in classification.selected + classification.excluded}
 
@@ -713,8 +877,18 @@ def ingest_shipment(
     # Parsing happens outside the transaction: it makes network calls to the
     # Anthropic API and can take tens of seconds, and holding a write transaction
     # open across that is a bad habit even on SQLite.
-    parsed = parse_shipment_email(paths, extractor=extractor, cross_check=cross_check,
-                                  display_names=display_names)
+    #
+    # Per-SHEET verdicts on record are replayed the same way as the file-level
+    # ones above; any new ones are saved even if the parse then fails, so a retry
+    # of this message reaches the same sheet selection rather than re-rolling it.
+    sheet_verdicts = _stored_sheet_verdicts(engine, shas.values())
+    try:
+        parsed = parse_shipment_email(paths, extractor=extractor, cross_check=cross_check,
+                                      display_names=display_names,
+                                      classification=classification,
+                                      sheet_verdicts=sheet_verdicts)
+    finally:
+        _save_sheet_verdicts(engine, sheet_verdicts)
     report.parse_warnings = list(parsed.warnings)
 
     # ONE canonical key per PO, however the extractor rendered it on each line.
@@ -785,6 +959,26 @@ def ingest_shipment(
     report.sheet_selection = mt.describe_sheet_selection(report.source_sheets)
     if report.sheet_selection:
         report.parse_warnings.append(report.sheet_selection)
+
+    # Lines that will not persist because they carry no PO number: nothing to hang
+    # them on. Named ON THE SHIPMENT here, before it is written -- the report-only
+    # note below it was the one removal path that never reached the record.
+    for line in parsed.lines:
+        if not str(line.get("po_number") or "").strip():
+            # Reason text is keyed in `document_parsers._REMOVAL_WORDING`.
+            parsed.removed_lines.append({"line": line, "reason": "no PO number"})
+            lost = (f"LINE NOT PERSISTED -- {line.get('style_number')}/{line.get('color')}/"
+                    f"{line.get('size')}={line.get('quantity')} (source "
+                    f"{line.get('source_hint')!r}) has no PO number, so there is no PO on "
+                    "this shipment to attach it to.")
+            parsed.warnings.append(lost)
+            report.parse_warnings.append(lost)
+    escalation = removal_escalation(parsed.extracted_line_count, parsed.removed_lines)
+    if escalation:
+        # FIRST, so it heads the shipment's warnings rather than trailing them.
+        parsed.warnings.insert(0, escalation)
+        report.parse_warnings.insert(0, escalation)
+        logger.warning("%s", escalation)
 
     counts = {k: 0 for k in ("shipments", "shipment_sources", "shipment_pos",
                              "proposed_changes", "change_candidates", "audit_log")}
@@ -928,6 +1122,16 @@ def ingest_shipment(
             sc.assert_transition(conn, sc.STATE_INSERT, change.status)
             row = _change_row(change, line, shipment_id, po_id, shas.get(
                 primary.path.resolve()) if primary else None, now)
+            if row["source_sha256"] is None:
+                # Invariant 1. Every proposed quantity names the document it came
+                # from; a NULL here is how 44 PO 1624 lines were persisted with no
+                # traceable source. Raising rolls the whole shipment back.
+                raise IngestInvariantError(
+                    f"proposed change {line.get('style_number')}/{line.get('color')}/"
+                    f"{line.get('size')} on PO {key} has no source_sha256: no primary "
+                    "attachment was selected for a shipment that produced lines. "
+                    "Refusing to persist an untraceable proposal."
+                )
             conn.execute(proposed_changes.insert(), row)
             counts["proposed_changes"] += 1
             states[change.status] = states.get(change.status, 0) + 1
@@ -957,14 +1161,37 @@ def ingest_shipment(
                 })
                 counts["change_candidates"] += 1
 
+        if counts["proposed_changes"]:
+            # Invariant 2, checked against what was WRITTEN, inside the same
+            # transaction so a failure leaves nothing behind.
+            _assert_primary_recorded(conn, shipment_id, message_id)
+
         _audit(conn, workflow="PACKING_SLIP", actor=actor, actor_kind="SYSTEM",
                event="SHIPMENT_INGESTED", now=now, message_id=message_id,
                shipment_id=shipment_id,
                detail={"parser": parsed.parser, "lines": len(parsed.lines),
                        "states": states, "po_keys": po_keys,
                        "source_sheets": report.source_sheets,
-                       "sheet_selection": report.sheet_selection or None})
+                       "sheet_selection": report.sheet_selection or None,
+                       "lines_extracted": parsed.extracted_line_count,
+                       "lines_removed": len(parsed.removed_lines)})
         counts["audit_log"] = 1
+        if escalation:
+            # A queryable event, not only prose: "which shipments lost over a
+            # third of their lines" is one filter on `event`.
+            _audit(conn, workflow="PACKING_SLIP", actor=actor, actor_kind="SYSTEM",
+                   event="SHIPMENT_ROWS_LOST", now=now, message_id=message_id,
+                   shipment_id=shipment_id,
+                   detail={"lines_extracted": parsed.extracted_line_count,
+                           "lines_removed": len(parsed.removed_lines),
+                           "removed": [
+                               {"reason": item["reason"],
+                                "source_hint": item["line"].get("source_hint"),
+                                "key": f"{item['line'].get('style_number')}/"
+                                       f"{item['line'].get('color')}/{item['line'].get('size')}",
+                                "quantity": item["line"].get("quantity")}
+                               for item in parsed.removed_lines]})
+            counts["audit_log"] += 1
 
     report.shipment_id = shipment_id
     report.created = True

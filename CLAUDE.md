@@ -174,7 +174,8 @@ heavily than the code it can read. Known drift as of 2026-09-14:
 - The file table lists only the Phase 0 prototypes. The repo now also contains
   `ingest.py`, `schema.py`, `extraction_schema.py`, `claude_extractor.py`,
   `document_parsers.py`, `attachment_classifier.py`, `size_vocabulary.py`,
-  `canonical.py`, `config.py`, alembic migrations 0001-0006, and seven test
+  `canonical.py`, `config.py`, `carton_backing.py`, alembic migrations
+  0001-0012, and eight test
   modules — plus, since Phase 2 closed on 2026-09-14, the mailbox intake:
   `graph_client.py` (a four-method Graph interface with a mock and a real
   client), `poller.py` (the polling job and the content-addressed attachment
@@ -344,4 +345,94 @@ not as history - a rule without its failure mode gets rationalised away.
   0010's was not (SQLite records and reflects a LENGTH). Write down the property
   you are claiming both cases share - if that sentence is hard to write, the
   analogy is doing more work than it can carry. RUNBOOK section 8 lesson 29.
+- **Classify an attachment ONCE per ingest, and pass that result on - never
+  call `classify_attachments` a second time downstream.** The content check is
+  a model call and is not deterministic. Two calls in one ingest (one deciding
+  what was recorded, one what was parsed) disagreed on PO 1624 on 2026-09-23:
+  44 lines parsed from a workbook the database recorded as EXCLUDED, every one
+  with a NULL `source_sha256`. `ingest_shipment` passes its classification into
+  `parse_shipment_email(classification=...)`, and a verdict stored on the
+  `attachments` row (migration 0011, marked by `classifier_prompt_hash`) is
+  replayed, not re-asked. `IngestInvariantError` now refuses the NULL-source
+  shape outright; `test_classification_is_decided_once_and_replayed` fails on
+  the two-call code.
+- **The file gate is per-size content, not document type.**
+  `usable_as_shipment_data` = opens, not banned, `has_size_breakdown`. A type
+  check there threw away PO 1624's only size-level sheets because the WORKBOOK
+  was typed commercial invoice while the classifier's own rationale described
+  the packing sheets. Do not reintroduce `doc_type == PACKING_LIST` at file
+  level; the per-SHEET test (`SectionClassification.is_shipment_data`) keeps
+  its type check deliberately, and is what stops an invoice sheet being read.
+  Only the primary's lines are proposed - an admitted second workbook is a
+  cross-check, never a second proposal set.
+- **A quantity row is shipment data only if cartons in the same document back
+  it** (Paula, 2026-09-23; `carton_backing.py`). PO 1624's slip printed a
+  carton-backed row, an order row and a row of goods going LATER, and the tool
+  proposed two of the three as this shipment. Never implement this by matching
+  labels ("By Sea", "ORDER", "sub total") - the next vendor words it
+  differently; the test is grid arithmetic. Three outcomes: BACKED (kept),
+  UNBACKED (removed, named in a `NOT SHIPMENT DATA` warning), UNVERIFIABLE
+  (PDF, no carton rows, row-less hint - KEPT and flagged, never dropped).
+  A "weak" carton row (total + count, per-carton figure wrong) exists because
+  511/533 has a vendor typo that strict-only turned into five dropped lines.
+  **The weak test alone admits SUBTOTALS** - its "count" is any other integer
+  on the row, never checked - so `_admit_weak` also requires (a) the row is
+  not the sum of 2+ contiguous carton rows directly above it, and (b) on a
+  sheet whose layout is carton arithmetic (strong rows the majority), every
+  other member of its run is strong. Do not drop (a) to "simplify" (b): 511/533's
+  subtotal R35 touches the R39 run, and (b) alone refuses R39 itself. Do not
+  switch (b) to "sheet has any strong row": Inprotex has two strong rows by
+  coincidence (C/NO. 5 x N.W. 10 = 50) and all 77 lines would go.
+  **Do not "simplify" its header resolution to a label-count floor.**
+  `size_header_rows` proposes data rows as headers (Inprotex carton #4 reads
+  `4 | 7 | 9 | 10`); a numeric candidate is rejected because it is itself a
+  carton row. Without that, 67 of Inprotex's 77 hand-verified lines were
+  dropped; with a 4-label floor instead, 6 were.
+- **A hidden worksheet is not part of the document** (Kiko, 2026-09-28).
+  `SheetGrid.state` comes from openpyxl `sheet_state` / xlrd `visibility`, and
+  `visible_grids` skips hidden and very-hidden sheets with a named note, in BOTH
+  extraction paths (`extract_workbook`, `build_source_documents`). Tainan's PO
+  1725 hides `REV`, its 8% plan; reading it proposed 56 lines for a 28-line PO.
+  `REV` is NOT kept out by carton backing - it has its own 26 carton rows
+  (same row numbers as `ACT`, 22 differ) summing to its own 860. The file-level
+  classifier PREVIEW still reads hidden sheets, deliberately: changing that input
+  would change what stored verdicts were asked about. That is also why a lone
+  visible sheet is still CLASSIFIED when siblings were hidden (`siblings_hidden`):
+  the file was admitted partly on content that is now skipped.
+- **Per-sheet verdicts are stored and replayed, like file-level ones**
+  (migration 0012, `attachments.sheet_verdicts_json`, keyed sha256 + sheet +
+  model + prompt hash). Never call `classify_sections` for a sheet whose verdict
+  is on record: it is the only thing keeping a COMMERCIAL INVOICE sheet out of
+  the quantities. `ingest_shipment` passes a `SheetVerdicts` down to
+  `_select_packing_sheets` and saves new ones even if the parse fails;
+  `test_sheet_choice_is_decided_once_and_replayed` fails without the store.
+- **Every removal is named on the SHIPMENT, and losing more than a third is an
+  escalation.** `ParseResult.extracted_line_count` / `removed_lines` count them;
+  `removal_escalation` heads `parse_warnings_json` and writes a
+  `SHIPMENT_ROWS_LOST` audit event. A line with no PO number used to reach only
+  `IngestReport.unpopulated` - in memory, never the record. A new removal path
+  must append to `removed_lines` AND warn, or the escalation undercounts.
+- **A cross-check compares only the primary's POs, keyed through
+  `po_number_key`.** Canonical text alone made `PO0001624` and `1624` differ, so
+  PO 1624's identical copy "DISAGREED on 14 keys"; comparing unrelated POs in the
+  same email reported "DISAGREES on 102 keys". Both were noise that read as
+  findings. A line with no PO (`''`) is never in scope.
+- **The summary walk-up passes THROUGH a refused summary** (rule (a) in
+  `_admit_weak`, 2026-09-28). Stopping at it let a total-of-subtotals count as a
+  carton: the 1720/1721 carton PDF's `PO TOTAL` sits under its colour subtotal,
+  and PO 1720's then "backed" the M650022 recap on its own. Measured before
+  applying: 0 of 924 stored verdicts moved. Known residue: `G.TOTAL` there still
+  counts - header rows separate it from PO 1720's block and the walk stops at
+  non-candidate rows.
+- **Carton backing spans attachments, and only ever UPGRADES** (Kiko,
+  2026-09-28; `check_lines(evidence=...)`). A recap its own document cannot check
+  is BACKED if a run of cartons in ANOTHER selected attachment sums to it
+  exactly - the 1720/1721 covering PDF by the carton-detail PDF, all 25 lines.
+  Never let a failed cross-document search drop or downgrade a line (the same
+  email carried other POs' workbooks); never pass an EXCLUDED attachment as
+  evidence (an inspection report is not a data source); never count the
+  primary's own bytes; never let a run cross a size header (PO 1720's last
+  carton + PO 1721's first are neighbours in the carton list). PDFs are gridded
+  by `pdf_carton_grid` from word positions, anchored on a LETTER size header -
+  a numeric carton row like `17 10 2 4 16 1` otherwise reads as a header.
 - <add the next one here>

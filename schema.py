@@ -260,6 +260,31 @@ attachments = Table(
     # must not be stored per filename.
     Column("doc_type", Unicode(32), nullable=False),
     Column("doc_type_reason", Unicode(1000)),
+    # -- the CONTENT verdict itself, stored so it is asked for once (migration
+    # -- 0011). A model call is not a function: the same workbook came back a
+    # -- packing list on one call and a commercial invoice on another, in one
+    # -- ingest. With these set, the row IS the verdict for these bytes and a
+    # -- re-extraction reuses it rather than re-rolling the gate.
+    # --   has_size_breakdown     the other half of the gate; without it a stored
+    # --                          doc_type cannot reproduce the decision
+    # --   classifier_rationale   the model's own sentence, verbatim (doc_type_reason
+    # --                          is that sentence wrapped in the filename's claim)
+    # --   classifier_model       which model said so
+    # --   classifier_prompt_hash attachment_classifier.classifier_prompt_hash()
+    # -- All NULL means no model verdict exists: a row the poller wrote, a
+    # -- filename-banned inspection report, an unreadable file, a failed call, or
+    # -- a row classified before 0011. Such a row is never reused as a verdict.
+    Column("has_size_breakdown", Boolean),
+    Column("classifier_rationale", Unicode(1000)),
+    Column("classifier_model", Unicode(64)),
+    Column("classifier_prompt_hash", Unicode(64)),
+    # -- the PER-SHEET verdicts for a workbook, stored for the same reason
+    # -- (migration 0012). A JSON list of {sheet, doc_type, has_size_breakdown,
+    # -- rationale, model, prompt_hash}; one is replayed only when sheet, model
+    # -- AND prompt hash all match (the row's SHA-256 is the fourth key part). The
+    # -- per-sheet check is what keeps a COMMERCIAL INVOICE sheet out of the
+    # -- quantities, and it was re-rolled every ingest. NULL: none on record.
+    Column("sheet_verdicts_json", UNBOUNDED_TEXT),
     # Set when the file could not be opened at all (truncated, encrypted, empty).
     # Distinct from "opened fine, has no size data".
     Column("open_failure_reason", Unicode(500)),

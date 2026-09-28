@@ -1312,6 +1312,42 @@ def test_sheet_selection(tmp: Path) -> None:
     check("not a packing list" in sc_drop.skip_reason, "invoice skip reason is specific")
     check("no per-size quantities" in sc_sizeless.skip_reason, "sizeless skip reason is specific")
 
+    # --- the FILE gate: sizes decide, the type is metadata (2026-09-23) ---------
+    def attachment(doc_type, sizes, hint=None, unreadable=None):
+        return ac.AttachmentClassification(
+            path=tmp / "x.xlsx", doc_type=doc_type, has_size_breakdown=sizes,
+            reason="r", method="filename+content", unreadable_reason=unreadable,
+            filename_hint=hint or doc_type)
+
+    invoice_with_sizes = attachment(ac.DocType.COMMERCIAL_INVOICE, True)
+    invoice_no_sizes = attachment(ac.DocType.COMMERCIAL_INVOICE, False)
+    packing_no_sizes = attachment(ac.DocType.PACKING_LIST, False)
+    named_inspection = attachment(ac.DocType.INSPECTION_REPORT, False,
+                                  hint=ac.DocType.INSPECTION_REPORT)
+    content_inspection = attachment(ac.DocType.INSPECTION_REPORT, True,
+                                    hint=ac.DocType.PACKING_LIST)
+    unreadable = attachment(ac.DocType.PACKING_LIST, True, unreadable="truncated")
+    check(invoice_with_sizes.usable_as_shipment_data and invoice_with_sizes.excluded_reason == "",
+          "a workbook TYPED commercial_invoice but carrying per-size quantities is admitted "
+          "(PO 1624's clearance workbook) -- and no exclusion reason fires for it")
+    check(not invoice_no_sizes.usable_as_shipment_data
+          and invoice_no_sizes.excluded_reason.startswith("no per-size quantities (commercial_invoice)"),
+          "an invoice without sizes is excluded FOR LACKING SIZES, type given as context",
+          invoice_no_sizes.excluded_reason[:60])
+    check("not a packing list" not in invoice_no_sizes.excluded_reason,
+          "the old type-based wording is gone from the file gate")
+    check(not packing_no_sizes.usable_as_shipment_data,
+          "a packing list without sizes is still excluded -- sizes are required either way")
+    check(not named_inspection.usable_as_shipment_data
+          and "Paula" in named_inspection.excluded_reason,
+          "a filename-banned inspection report is excluded")
+    check(not content_inspection.usable_as_shipment_data
+          and "Paula" in content_inspection.excluded_reason,
+          "and so is one identified by CONTENT, even with sizes -- the ban now stands alone")
+    check(not unreadable.usable_as_shipment_data
+          and unreadable.excluded_reason.startswith("could not open"),
+          "an unreadable file is excluded whatever its verdict")
+
     # sheet_preview is shared with the whole-file preview, not a second implementation
     pk = next(g for g in grids if g.name == "PACKING")
     prev = ac.sheet_preview(pk)
@@ -1938,6 +1974,60 @@ def test_transport_mode_recap_rows(tmp: Path) -> None:
     for phrase in ("custcol_override_expected_receipt", "custcol_sd_updatedreceiptdate",
                    "echo", "rate", "leadTime", "shipMethod"):
         check(phrase in doc, f"the docstring records why {phrase!r} is not a discriminator")
+
+
+def test_hidden_sheets_not_extracted(tmp: Path) -> None:
+    section("hidden worksheets are not extracted, and each skip is named")
+    grids = {g.name: g for g in ce.read_workbook_grids(TAINAN_XLS)}
+    check(grids["REV"].hidden and not grids["ACT"].hidden,
+          "Tainan's .xls: REV (the 8% plan) is hidden, ACT (the packing record) is not",
+          f"ACT={grids['ACT'].state} REV={grids['REV'].state}")
+
+    import attachment_classifier as ac
+
+    sheet_verdict = response(ac._ContentVerdicts(verdicts=[ac._ContentVerdict(
+        doc_type="packing_list", has_size_breakdown=True, reason="waist sizes per carton")]))
+    client, parse = fake_client([sheet_verdict, response(packing(lines=[line(hint="ACT!R47")]))])
+    result = ce.ClaudeExtractor(client=client).extract_workbook(TAINAN_XLS)
+    check(len(parse.calls) == 2,
+          "TWO calls: ACT's own sheet verdict, then ACT's extraction -- REV never sent",
+          str(len(parse.calls)))
+    asked = " ".join(block["text"] for block in parse.calls[0]["messages"][0]["content"])
+    check("1 section(s)" in asked and "SECTION 1: ACT" in asked and "REV" not in asked,
+          "the lone visible sheet is still CLASSIFIED when a sibling was hidden: the file "
+          "preview read the hidden sheet, so ACT itself was never vetted", asked[:60])
+    sent = " ".join(block["text"] for block in parse.calls[1]["messages"][0]["content"])
+    check("17.28" not in sent,
+          "and what was extracted is ACT: REV's fractional plan row (17.28, R45) is absent")
+    skip = [w for w in result.warnings if "'REV'" in w and "hidden" in w]
+    check(len(skip) == 1 and "state: hidden" in skip[0],
+          "the skip is recorded on the extraction, naming the sheet and the reason",
+          (skip or ["none"])[0][:90])
+
+    from openpyxl import Workbook
+
+    book = Workbook()
+    book.active.title = "PACKING"
+    book.active.append(["S", "M", "L"])
+    book.create_sheet("OLD PLAN").sheet_state = "hidden"
+    book.create_sheet("MACRO").sheet_state = "veryHidden"
+    for name in ("OLD PLAN", "MACRO"):
+        book[name].append(["S", "M", "L"])
+    path = tmp / "hidden_sheets.xlsx"
+    book.save(path)
+    states = {g.name: g.state for g in ce.read_workbook_grids(path)}
+    check(states == {"PACKING": "visible", "OLD PLAN": "hidden", "MACRO": "veryHidden"},
+          ".xlsx sheet states read through", str(states))
+    kept, notes = ce.visible_grids(ce.read_workbook_grids(path), path.name)
+    check([g.name for g in kept] == ["PACKING"] and len(notes) == 2
+          and any("'OLD PLAN'" in n for n in notes) and any("'MACRO'" in n for n in notes),
+          "hidden AND very-hidden sheets are skipped, one note per sheet", str(notes))
+
+    sources, warnings = dp.build_source_documents([path])
+    check([s.label for s in sources] == [f"{path.name} (sheet 'PACKING')"],
+          "the multi-document path skips them too", str([s.label for s in sources]))
+    check(sum("hidden worksheet" in w for w in warnings) == 2,
+          "and records each skip", str(warnings))
 
 
 def test_legacy_xls_reader(tmp: Path) -> None:
@@ -4078,7 +4168,7 @@ def main() -> int:
             test_filename_never_excludes, test_numeric_size_headers,
             test_size_composition, test_plan_vs_count_signals,
             test_transport_mode_recap_rows,
-            test_legacy_xls_reader,
+            test_legacy_xls_reader, test_hidden_sheets_not_extracted,
             test_canonical_form, test_size_header_canonical,
             test_verbatim_source_preserved,
             test_matcher_canonical_both_sides,

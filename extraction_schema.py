@@ -227,6 +227,14 @@ class ParseResult:
     #: colour total across sizes — this is a full stop, not a degraded mode.
     needs_manual_entry: bool = False
 
+    #: How many lines the PRIMARY produced before anything removed any. The
+    #: denominator of the lost-rows escalation (see `removal_escalation`); zero
+    #: when nothing was extracted.
+    extracted_line_count: int = 0
+    #: Every line removed after extraction, as `{"line": dict, "reason": str}`.
+    #: Each removal is ALSO named in `warnings`; this is the countable form.
+    removed_lines: list[dict] = field(default_factory=list)
+
     @property
     def low_confidence_lines(self) -> list[dict]:
         return [ln for ln in self.lines if ln.get("confidence", "high") in REVIEW_CONFIDENCE]

@@ -1226,6 +1226,12 @@ def build_proposed_changes(
             )
         if confidence in REVIEW_CONFIDENCES:
             reasons.append(f"extraction confidence {confidence}" + (f": {note}" if note else ""))
+        backing = vl.get("carton_backing") or {}
+        if backing.get("status") == "UNVERIFIABLE":
+            # Kept rather than dropped (Paula, 2026-09-23): a rule that cannot be
+            # checked must not discard a shipment -- but it must not pass one as
+            # checked either. See carton_backing.py.
+            reasons.append(f"carton backing unverifiable: {backing.get('reason', '')}")
         if not po_number:
             reasons.append("vendor line has no PO number")
         if change.proposed_quantity is None and not accumulation_problem:

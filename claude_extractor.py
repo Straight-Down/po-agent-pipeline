@@ -360,6 +360,13 @@ class SheetGrid:
     name: str
     rows: list[list[str]]  # rows[0] is spreadsheet row 1
     first_col: int  # 1-indexed spreadsheet column of rows[*][0]
+    #: "visible", "hidden" or "veryHidden" -- openpyxl's words; xlrd's 0/1/2 are
+    #: mapped onto them. See `visible_grids` for why this is read at all.
+    state: str = "visible"
+
+    @property
+    def hidden(self) -> bool:
+        return self.state != "visible"
 
     @property
     def n_rows(self) -> int:
@@ -420,15 +427,43 @@ def read_workbook_grids(xlsx_path: Union[str, Path]) -> list[SheetGrid]:
             "(.xlsx) or an OLE2 signature (.xls). A truncated or half-transferred "
             "attachment looks exactly like this.",
         )
-    return [_trim_to_grid(name, raw) for name, raw in raw_sheets]
+    return [_trim_to_grid(name, raw, state) for name, raw, state in raw_sheets]
 
 
-def _read_xlsx_sheets(path: Path) -> list[tuple[str, list[list[str]]]]:
+def visible_grids(grids: Sequence[SheetGrid], source: str = "") -> tuple[list[SheetGrid], list[str]]:
+    """
+    Split worksheets into the ones to extract and a note for each hidden one.
+
+    **A hidden worksheet is not part of the document the vendor sent** (Kiko,
+    2026-09-28). Tainan's PO 1725 workbook shows one sheet, `ACT` -- the packing
+    record -- and hides `REV`, the 8% planning sheet (RUNBOOK section 6 item 20).
+    Reading every sheet proposed both, 56 lines for a 28-line PO, and left the
+    choice between a count and a plan to whichever style code happened to match.
+
+    Every skipped sheet is NAMED in the returned notes, with the reason, so the
+    skip is on the shipment's record rather than silent. Very-hidden sheets
+    (reachable only from VBA) are skipped the same way.
+    """
+    keep: list[SheetGrid] = []
+    notes: list[str] = []
+    for grid in grids:
+        if not grid.hidden:
+            keep.append(grid)
+            continue
+        note = (f"sheet '{grid.name}' NOT extracted — hidden worksheet (state: {grid.state}); "
+                "a sheet the vendor hid is not part of the document they sent")
+        notes.append(note)
+        logger.warning("%s: %s", source or "workbook", note)
+    return keep, notes
+
+
+def _read_xlsx_sheets(path: Path) -> list[tuple[str, list[list[str]], str]]:
     """Every sheet of a modern (zip/OOXML) workbook, as formatted strings."""
     wb = open_workbook(path, data_only=True)
     try:
         return [
-            (name, [[_fmt(c) for c in row] for row in wb[name].iter_rows(values_only=True)])
+            (name, [[_fmt(c) for c in row] for row in wb[name].iter_rows(values_only=True)],
+             wb[name].sheet_state or "visible")
             for name in wb.sheetnames
         ]
     finally:
@@ -438,7 +473,7 @@ def _read_xlsx_sheets(path: Path) -> list[tuple[str, list[list[str]]]]:
             logger.debug("Ignoring error while closing %s", path.name)
 
 
-def _read_xls_sheets(path: Path) -> list[tuple[str, list[list[str]]]]:
+def _read_xls_sheets(path: Path) -> list[tuple[str, list[list[str]], str]]:
     """
     Every sheet of a legacy OLE2/BIFF workbook, as formatted strings.
 
@@ -462,7 +497,7 @@ def _read_xls_sheets(path: Path) -> list[tuple[str, list[list[str]]]]:
     except Exception as exc:  # noqa: BLE001 -- deliberately broad; classified below
         raise DocumentUnreadable(path, _describe_open_failure(exc, path), exc) from exc
 
-    out: list[tuple[str, list[list[str]]]] = []
+    out: list[tuple[str, list[list[str]], str]] = []
     try:
         for name in book.sheet_names():
             sheet = book.sheet_by_name(name)
@@ -473,13 +508,18 @@ def _read_xls_sheets(path: Path) -> list[tuple[str, list[list[str]]]]:
                 ]
                 for r in range(sheet.nrows)
             ]
-            out.append((name, rows))
+            out.append((name, rows, _XLS_VISIBILITY.get(sheet.visibility, "hidden")))
     finally:
         try:
             book.release_resources()
         except Exception:  # noqa: BLE001
             logger.debug("Ignoring error while releasing %s", path.name)
     return out
+
+
+#: xlrd's `Sheet.visibility` in openpyxl's `sheet_state` words. An unknown code
+#: is treated as hidden: a sheet not positively known to be visible is not read.
+_XLS_VISIBILITY = {0: "visible", 1: "hidden", 2: "veryHidden"}
 
 
 def _xls_cell_value(cell: Any, datemode: int) -> Any:
@@ -644,10 +684,10 @@ def derived_quantity_notes(grid: SheetGrid) -> list[str]:
     return notes
 
 
-def _trim_to_grid(name: str, raw: list[list[str]]) -> SheetGrid:
+def _trim_to_grid(name: str, raw: list[list[str]], state: str = "visible") -> SheetGrid:
     """Trim a raw string matrix's empty edges into a SheetGrid."""
     if not raw:
-        return SheetGrid(name=name, rows=[], first_col=1)
+        return SheetGrid(name=name, rows=[], first_col=1, state=state)
 
     # Trim trailing empty columns; find the first non-empty column so a sheet
     # whose data starts at column F doesn't waste tokens on A-E.
@@ -655,7 +695,7 @@ def _trim_to_grid(name: str, raw: list[list[str]]) -> SheetGrid:
     padded = [r + [""] * (width - len(r)) for r in raw]
     non_empty_cols = [c for c in range(width) if any(r[c] for r in padded)]
     if not non_empty_cols:
-        return SheetGrid(name=name, rows=[], first_col=1)
+        return SheetGrid(name=name, rows=[], first_col=1, state=state)
     lo, hi = non_empty_cols[0], non_empty_cols[-1]
     trimmed = [r[lo : hi + 1] for r in padded]
 
@@ -664,7 +704,7 @@ def _trim_to_grid(name: str, raw: list[list[str]]) -> SheetGrid:
     while trimmed and not any(trimmed[-1]):
         trimmed.pop()
 
-    return SheetGrid(name=name, rows=trimmed, first_col=lo + 1)
+    return SheetGrid(name=name, rows=trimmed, first_col=lo + 1, state=state)
 
 
 def plan_windows(
@@ -1228,7 +1268,8 @@ class ClaudeExtractor:
         )
 
     def _select_packing_sheets(
-        self, path: Path, grids: list[SheetGrid]
+        self, path: Path, grids: list[SheetGrid], sheet_verdicts: Any = None,
+        siblings_hidden: bool = False,
     ) -> tuple[list[SheetGrid], list[str]]:
         """
         Choose which worksheets of a workbook actually hold packing-list data.
@@ -1251,21 +1292,48 @@ class ClaudeExtractor:
         Classification is skipped when there is only one non-empty sheet: there is
         no selection to make, the file-level triage has already vetted the
         document, and it keeps single-sheet workbooks at zero extra API cost.
+        **Not when other sheets were hidden** (`siblings_hidden`): the file-level
+        preview still reads hidden sheets, so a workbook could be admitted on a
+        hidden sheet's sizes while its one visible sheet is an invoice. That sheet
+        was never vetted on its own, so it is classified like any other.
+
+        `sheet_verdicts` (an `attachment_classifier.SheetVerdicts`) makes the
+        choice DETERMINISTIC across ingests: a sheet whose verdict is on record for
+        these bytes, this prompt and this model is replayed, not re-asked, and
+        every new verdict is recorded into it for the caller to persist. Without
+        it every call re-rolls the one check that keeps an invoice sheet out of
+        the quantities.
 
         Returns (sheets_to_extract, skip_notes). Raises NoPackingSheetFound if a
         multi-sheet workbook yields no packing-list sheet at all -- silently
         returning zero lines is the worst available outcome here.
         """
-        if len(grids) <= 1:
+        if len(grids) <= 1 and not siblings_hidden:
             return grids, []
 
-        from attachment_classifier import classify_sections
+        import attachment_classifier as ac
 
-        verdicts = classify_sections(
-            [(g.name, __import__("attachment_classifier").sheet_preview(g)) for g in grids],
-            extractor=self,
-        )
-        by_name = {v.label: v for v in verdicts}
+        by_name: dict[str, Any] = {}
+        sha = prompt_hash = ""
+        if sheet_verdicts is not None:
+            sha, prompt_hash = ac._sha256_file(path), ac.classifier_prompt_hash()
+            for grid in grids:
+                stored = sheet_verdicts.lookup(sha, grid.name, model=self.model,
+                                               prompt_hash=prompt_hash)
+                if stored is not None:
+                    by_name[grid.name] = stored.as_section()
+        unasked = [g for g in grids if g.name not in by_name]
+        if unasked:
+            for verdict in ac.classify_sections(
+                    [(g.name, ac.sheet_preview(g)) for g in unasked], extractor=self):
+                by_name[verdict.label] = verdict
+                if sheet_verdicts is not None and verdict.source == "claude":
+                    sheet_verdicts.record(sha, ac.StoredSheetVerdict(
+                        sheet=verdict.label, doc_type=verdict.doc_type.value,
+                        has_size_breakdown=bool(verdict.has_size_breakdown),
+                        rationale=verdict.reason, model=self.model,
+                        prompt_hash=prompt_hash))
+        verdicts = [by_name[g.name] for g in grids if g.name in by_name]
 
         keep: list[SheetGrid] = []
         skip_notes: list[str] = []
@@ -1274,8 +1342,9 @@ class ClaudeExtractor:
             if verdict is not None and verdict.is_shipment_data:
                 keep.append(grid)
                 logger.info(
-                    "%s: extracting sheet '%s' (%s, sizes=%s)",
+                    "%s: extracting sheet '%s' (%s, sizes=%s, verdict %s)",
                     path.name, grid.name, verdict.doc_type.value, verdict.has_size_breakdown,
+                    verdict.source,
                 )
                 continue
             doc_type = verdict.doc_type.value if verdict else "unclassified"
@@ -1301,16 +1370,20 @@ class ClaudeExtractor:
         max_rows_per_call: int = DEFAULT_MAX_ROWS_PER_CALL,
         max_chars_per_call: int = DEFAULT_MAX_CHARS_PER_CALL,
         sheet_names: Optional[Sequence[str]] = None,
+        sheet_verdicts: Any = None,
     ) -> PackingSlipExtraction:
         """
         Extract every (or selected) worksheet and merge the results.
+
+        `sheet_verdicts`: see `_select_packing_sheets`.
 
         Merging is a concatenation, not a dedup: two sheets legitimately holding
         the same PO/style/colour/size is a real condition a human should see, so
         it surfaces as a warning rather than being silently collapsed.
         """
         path = Path(xlsx_path)
-        grids = [g for g in read_workbook_grids(path) if not g.is_empty]
+        grids, hidden_notes = visible_grids(
+            [g for g in read_workbook_grids(path) if not g.is_empty], path.name)
         if sheet_names is not None:
             wanted = {n.lower() for n in sheet_names}
             grids = [g for g in grids if g.name.lower() in wanted]
@@ -1318,14 +1391,17 @@ class ClaudeExtractor:
             raise ExtractionError(
                 f"{path.name}: no non-empty worksheets to extract"
                 + (f" (looked for {list(sheet_names)})" if sheet_names else "")
+                + (f"; {len(hidden_notes)} hidden sheet(s) skipped" if hidden_notes else "")
             )
 
         # Extract only the sheets that actually hold packing-list data. An explicit
         # sheet_names filter means the caller already made that decision, so
         # classification is not second-guessed in that case.
-        skip_notes: list[str] = []
+        skip_notes: list[str] = list(hidden_notes)
         if sheet_names is None:
-            grids, skip_notes = self._select_packing_sheets(path, grids)
+            grids, selection_notes = self._select_packing_sheets(
+                path, grids, sheet_verdicts, siblings_hidden=bool(hidden_notes))
+            skip_notes.extend(selection_notes)
 
         merged = PackingSlipExtraction(
             vendor_name="", document_summary="", lines=[], unparsed_regions=[], warnings=[]

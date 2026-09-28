@@ -106,9 +106,34 @@ def downgrade() -> None:
         batch_op.drop_constraint("doc_type", type_="check")
         batch_op.create_check_constraint("doc_type", _doc_type_check(DOC_TYPES_BEFORE))
 
+    # AMENDED 2026-09-23. `attachment_count` was added NOT NULL, which requires a
+    # server_default, which SQL Server materialises as an auto-named constraint
+    # (DF__messages__attach__..., different in every database). A column cannot be
+    # dropped while one depends on it:
+    #   The object 'DF__messages__attach__10111A78' is dependent on column
+    #   'attachment_count'. ALTER TABLE DROP COLUMN failed.   (5074 / 4922)
+    # Written generically rather than for the one column that has a default today:
+    # the next NOT NULL column added here will need a server_default too, and the
+    # IF guard makes the loop a no-op for columns that have none.
+    _MESSAGES_COLUMNS = ("extraction_error", "extracted_at", "poll_error",
+                         "attachment_count", "folder_id")
+    bind = op.get_bind()
+    if bind.dialect.name != "sqlite":
+        for column in _MESSAGES_COLUMNS:
+            bind.execute(sa.text(f"""
+                DECLARE @n sysname;
+                SELECT @n = dc.name
+                  FROM sys.default_constraints dc
+                  JOIN sys.columns c ON c.object_id = dc.parent_object_id
+                                    AND c.column_id = dc.parent_column_id
+                 WHERE dc.parent_object_id = OBJECT_ID('messages')
+                   AND c.name = '{column}';
+                IF @n IS NOT NULL
+                    EXEC('ALTER TABLE [messages] DROP CONSTRAINT [' + @n + ']');
+            """))
+
     with op.batch_alter_table("messages", schema=None) as batch_op:
-        for column in ("extraction_error", "extracted_at", "poll_error",
-                       "attachment_count", "folder_id"):
+        for column in _MESSAGES_COLUMNS:
             batch_op.drop_column(column)
 
     op.drop_table("poll_state")

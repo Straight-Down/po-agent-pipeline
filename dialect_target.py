@@ -56,6 +56,29 @@ class TargetUnreachable(Exception):
     """A target was configured explicitly and could not be connected to."""
 
 
+class NotADisposableDatabase(Exception):
+    """The harness was pointed at a database it is not allowed to destroy."""
+
+
+#: Every database this harness may be pointed at must be named to end in this.
+#:
+#: NOT a convention -- a refusal, with no override and no escape hatch. The
+#: harness calls `_drop_everything()` on its target once per test, roughly 25
+#: times a run: it is a destructive tool by design, and the only thing standing
+#: between it and a database that matters is the name it was handed.
+#:
+#: This exists because of a near-miss on 2026-09-23. `PO_AGENT_TEST_DB_URL` was
+#: set to `sqldb-po-agent` -- the production database, explicitly ring-fenced in
+#: the same breath -- while the instruction said `sqldb-po-agent-test`. The two
+#: names differ by five characters. Nothing in the code could tell them apart,
+#: because a URL is just a string and the harness had no opinion about which one
+#: it deserved.
+#:
+#: If the harness is ever genuinely needed against something else, rename the
+#: database. That is deliberately more work than editing a variable.
+TEST_DATABASE_SUFFIX = "-test"
+
+
 def target_url() -> str:
     """The configured target, or in-memory SQLite."""
     return (os.environ.get(TARGET_ENV) or "").strip() or SQLITE_MEMORY
@@ -125,6 +148,37 @@ def _redacted(url: str) -> str:
     return url[:start + 1] + "***" + url[end:]
 
 
+def _require_disposable(url) -> None:
+    """
+    Refuse a target this harness is not allowed to destroy.
+
+    In-memory SQLite is exempt: there is nothing there to lose. Everything else
+    -- a server database or a SQLite FILE -- must be named to end in
+    `TEST_DATABASE_SUFFIX`, checked on the name alone with any extension
+    stripped, so `po_agent-test.db` passes and `po_agent.db` does not.
+    """
+    from sqlalchemy.engine import make_url
+
+    parsed = make_url(url)
+    name = parsed.database
+    if not name:
+        return  # sqlite:// in memory -- nothing to destroy
+
+    stem = name.rsplit(".", 1)[0] if name.rsplit(".", 1)[-1] in ("db", "sqlite", "sqlite3") else name
+    if stem.endswith(TEST_DATABASE_SUFFIX):
+        return
+
+    raise NotADisposableDatabase(
+        f"{TARGET_ENV} names the database {name!r}, which does not end in "
+        f"{TEST_DATABASE_SUFFIX!r}.\n"
+        "This harness DROPS EVERY TABLE on its target once per test -- about 25 times "
+        "a run -- so it will only point at a database whose name says it is disposable. "
+        "There is no override: if you genuinely need it here, rename the database.\n"
+        f"(The variable is {TARGET_ENV}. Alembic reads a DIFFERENT one, PO_AGENT_DB_URL, "
+        "precisely so that migrating a real database stays a separate, deliberate act.)"
+    )
+
+
 def connect():
     """
     An engine on the configured target, with the connection actually tested.
@@ -139,6 +193,9 @@ def connect():
     the module docstring for why that matters more here than anywhere else.
     """
     url = target_url()
+    # Checked BEFORE any connection: refusing after connecting would already have
+    # proved the credentials work against something that must not be touched.
+    _require_disposable(url)
     if is_sqlite():
         return sc.connect(url)
 
@@ -172,13 +229,24 @@ def connect():
 
 
 def _drop_everything(engine) -> None:
-    """Tear the schema down on a persistent server. Views first."""
+    """
+    Tear the schema down on a persistent server. Views first.
+
+    `alembic_version` goes too. It is not in `sc.metadata`, so `drop_all` leaves
+    it -- and a stale revision row is worse than no schema: Alembic reads it,
+    concludes the database is already at head, and builds nothing, so the next
+    thing to run finds `Invalid object name 'change_states'`. "Tear the schema
+    down" has to mean the bookkeeping as well, or the database is left claiming
+    to be something it is not.
+    """
     from sqlalchemy import text
 
     with engine.begin() as conn:
         for view, _ddl in sc.VIEWS:
             conn.execute(text(f"DROP VIEW IF EXISTS {view}"))
     sc.metadata.drop_all(engine)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
 
 
 def fresh_engine():

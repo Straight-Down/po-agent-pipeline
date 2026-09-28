@@ -226,6 +226,11 @@ def test_migration_seed_matches_schema() -> None:
         cfg.set_main_option("script_location", str(HERE / "migrations"))
         seed_url = dt_target.migration_url(db)
         cfg.set_main_option("sqlalchemy.url", seed_url)
+        # Same clean slate as the round-trip test, and for the same reason: on a
+        # server this is a shared database other tests have built with
+        # `create_all`, and this test is about what the MIGRATIONS produce.
+        if not dt_target.is_sqlite():
+            dt_target._drop_everything(sc.connect(seed_url))
         command.upgrade(cfg, "head")
 
         engine = sc.connect(seed_url)
@@ -358,6 +363,19 @@ def test_migration_round_trip() -> None:
         # live only in migrations and never in metadata.create_all.
         url = dt_target.migration_url(db)
         config.set_main_option("sqlalchemy.url", url)
+
+        # START FROM NOTHING, always. On a server this URL is a shared database
+        # that other tests have been building with `create_all`, and a schema
+        # built that way is NOT the schema the migrations build: schema.py gives
+        # `messages.attachment_count` a client-side `default=0` (no DDL default),
+        # while migration 0005 adds it with `server_default="0"` -- a real, auto-
+        # named constraint that then blocks DROP COLUMN on the way back down.
+        # Without this reset the test passed against create_all state while a
+        # genuine migration-built database could not downgrade at all. A test
+        # whose result depends on what ran before it is not a test of the thing
+        # it names.
+        if not dt_target.is_sqlite():
+            dt_target._drop_everything(sc.connect(url))
 
         command.upgrade(config, "head")
         check(db.exists() or not dt_target.is_sqlite(),

@@ -55,7 +55,7 @@ In short: the hard, uncertain part (can this reliably read messy vendor document
 
 **One vendor line can match several NetSuite lines**, because `(PO, style, colour, size)` is not unique per PO line. One open line among them is targeted normally; several open lines produce `NEEDS_RESOLUTION` with every candidate's figures attached and **no** automatic choice. Full evidence and reasoning in §6 item 10 — including why NetSuite-side duplicates must never be summed while extraction-side duplicates must.
 
-**Dates are written as all three fields together**, same value: `expectedReceiptDate`, `custcol_override_expected_receipt = true`, `custcol_sd_updatedreceiptdate`. Tested 2026-08-12 — NetSuite does **not** derive `expectedReceiptDate` from the override pair (architecture doc §6), so omitting it would leave the field NetSuite actually schedules against stale.
+**Dates are written as all three fields together**, same value: `expectedReceiptDate`, `custcol_override_expected_receipt = true`, `custcol_sd_updatedreceiptdate`. Tested 2026-08-12 — NetSuite does **not** derive `expectedReceiptDate` from the override pair (architecture doc §6), so omitting it would leave the field NetSuite actually schedules against stale. **Except over a human override (2026-09-30):** a line that already has the override ticked or an updated receipt date set keeps them. The date write is refused in code, twice (`ProposedChange.to_netsuite_fields` from the matcher's read, and `update_po_line` from a fresh read, raising `HumanOverrideProtected`), and the quantity can still be written alone. Production PO 1624's UPS lines 29-44 carry exactly such overrides, set by hand.
 
 ## 5. Where everything lives
 

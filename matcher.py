@@ -58,6 +58,7 @@ from netsuite_client import (
     NS_OVERRIDE_EXPECTED_RECEIPT,
     NS_QUANTITY,
     NS_UPDATED_RECEIPT_DATE,
+    HumanOverrideProtected,
     NetSuiteClient,
     POLine,
     po_number_key,
@@ -440,6 +441,23 @@ class ProposedChange:
             fields[NS_QUANTITY] = self.proposed_quantity
 
         if include_dates:
+            # A line whose receipt date a PERSON already overrode keeps it (Kiko,
+            # 2026-09-30): PO 1624's UPS lines 29-44 carry the override flag and
+            # 2026-06-01, set by hand. Checked BEFORE the confirmed-date test, so
+            # Paula is never asked to confirm a date that would then be refused.
+            # These values are the matcher's read -- a SNAPSHOT from match time.
+            # The authority is `update_po_line`, which re-reads the line just
+            # before the PATCH; this check is defence in depth, not a substitute.
+            # Quantity-only writes (include_dates=False) are untouched.
+            if self.current_override_flag or self.current_updated_receipt_date:
+                raise HumanOverrideProtected(
+                    f"PO {self.po_number} {self.style_number} {self.color}-{self.size} (line "
+                    f"{self.line_id}) already carries a human receipt-date override "
+                    f"(override={self.current_override_flag}, updated receipt date="
+                    f"{self.current_updated_receipt_date}). Refusing to build a write to "
+                    f"{NS_OVERRIDE_EXPECTED_RECEIPT} / {NS_UPDATED_RECEIPT_DATE} over it. "
+                    "Use include_dates=False to write the quantity alone."
+                )
             if self.receipt_date_pending:
                 raise DateNotConfirmed(
                     f"PO {self.po_number} {self.style_number} {self.color}-{self.size}: refusing to "

@@ -33,6 +33,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 
 import netsuite_client as nc
 from netsuite_client import (
@@ -334,6 +335,14 @@ def test_update_payload_shape() -> None:
         return FakeResponse()
 
     client._request = fake_request  # bypass HTTP only; payload construction is real
+    # The override guard reads the line before a date write; this one is clean.
+    reads: list = []
+
+    def clean_line(po, line, by_internal_id=False):
+        reads.append((po, line))
+        return SimpleNamespace(override_expected_receipt=False, updated_receipt_date=None)
+
+    client.get_po_line = clean_line
 
     result = client.update_po_line(
         "8489541",
@@ -373,6 +382,31 @@ def test_update_payload_shape() -> None:
         lambda: client.update_po_line("8489541", 18, {"amount": 1}, by_internal_id=True),
         "unsupported field rejected before any HTTP call",
     )
+    check(reads == [("8489541", 18)], "a date write reads the line first (override guard)",
+          str(reads))
+
+    # A line a PERSON already overrode -- PO 1624's UPS lines 29-44 in production.
+    section("a human receipt-date override is never overwritten")
+    captured.clear()
+    client.get_po_line = lambda po, line, by_internal_id=False: SimpleNamespace(
+        override_expected_receipt=True, updated_receipt_date=dt.date(2026, 6, 1))
+    for fields, what in (({"override_expected_receipt": False}, "the override flag"),
+                         ({"updated_receipt_date": dt.date(2026, 6, 19)},
+                          "the updated receipt date")):
+        expect_raises(
+            nc.HumanOverrideProtected,
+            lambda fields=fields: client.update_po_line("8309219", 29, fields,
+                                                        by_internal_id=True),
+            f"writing {what} over a human override is refused")
+    check(not captured, "and nothing was sent", str(captured.get("method")))
+    client.update_po_line("8309219", 29, {"quantity": 1}, by_internal_id=True)
+    check(captured.get("method") == "PATCH",
+          "a quantity-only write to the same line is unaffected")
+    captured.clear()
+    client.update_po_line("8309219", 29, {"override_expected_receipt": False},
+                          by_internal_id=True, overwrite_human_override=True)
+    check(captured.get("method") == "PATCH",
+          "overwrite_human_override=True (the Phase 1 revert only) is the one way through")
 
 
 def test_error_translation() -> None:

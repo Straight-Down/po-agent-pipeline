@@ -357,6 +357,18 @@ with the same value** — `expectedReceiptDate`, `custcol_override_expected_rece
 `custcol_sd_updatedreceiptdate`. *"Writing only the override pair leaves the effective scheduling
 date stale."*
 
+**And never over a human's override (Kiko, 2026-09-30) — BUILT AND TESTED.** If the line already
+has `custcol_override_expected_receipt` ticked or `custcol_sd_updatedreceiptdate` set, the date
+write is refused with `HumanOverrideProtected`, even with a date Paula confirmed. It is checked
+twice in code: `to_netsuite_fields` (from the matcher's read) and `update_po_line` (from a fresh read
+just before the PATCH, for every caller). The quantity can still be written alone. Found on
+production PO 1624: its sixteen UPS lines (29–44) carry the override and 2026-06-01, set by hand.
+**The fresh read in `update_po_line` is the authority.** The matcher-level check reads values
+captured at match time. When the approval/write driver is built it may hold a `ProposedChange` for
+days before Paula approves, so do not "fix" that staleness by trusting the matcher check alone. The
+read-then-PATCH pair is not atomic (see the `update_po_line` docstring); whether NetSuite offers a
+conditional write that could close the gap is unverified.
+
 ---
 
 ## 12. A second shipment ADDS to the first — it does not replace it

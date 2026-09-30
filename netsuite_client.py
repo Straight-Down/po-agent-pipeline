@@ -127,6 +127,17 @@ class NetSuiteError(Exception):
     """Base for every NetSuite failure."""
 
 
+class HumanOverrideProtected(NetSuiteError):
+    """
+    A write would overwrite a receipt-date override a HUMAN already set on a line.
+
+    PO 1624's sixteen UPS lines (29-44) carry `custcol_override_expected_receipt
+    = True` and `custcol_sd_updatedreceiptdate = 2026-06-01`, set by hand, on
+    exactly the lines that split the UPS portion off. Overwriting that is
+    destroying someone's deliberate decision, so it is refused in code.
+    """
+
+
 class NetSuiteConfigError(NetSuiteError):
     """Missing/contradictory local configuration -- never reached NetSuite."""
 
@@ -1117,9 +1128,27 @@ class NetSuiteClient:
         fields: dict,
         by_internal_id: bool = False,
         idempotency_key: Optional[str] = None,
+        overwrite_human_override: bool = False,
     ) -> dict:
         """
         PATCH one item-sublist line.
+
+        **Refuses to overwrite a human's receipt-date override** (Kiko,
+        2026-09-30). A write touching `custcol_override_expected_receipt` or
+        `custcol_sd_updatedreceiptdate` first reads the line, and raises
+        `HumanOverrideProtected` if it already has the override ticked or an
+        updated receipt date set. Enforced HERE, for every caller, not only for
+        proposals (`ProposedChange.to_netsuite_fields` refuses too).
+        `overwrite_human_override=True` exists for one caller only: the Phase 1
+        write/verify/revert test, restoring a line's own prior values after its
+        own test write. Nothing on the proposal path may pass it.
+
+        **Best-effort, not atomic.** The read and the PATCH are two requests, so a
+        person ticking the override in the gap between them would still be
+        overwritten. At this tool's volume (Paula-approved, a few writes a week)
+        that window is small; whether NetSuite's REST record API offers a
+        conditional write (If-Match / a revision check) that could close it is
+        UNVERIFIED. This fresh read, not the matcher's snapshot, is the authority.
 
         Confirmed working shape (live sandbox test, architecture doc section 6):
         target the line by its `line` number inside `item.items[]` and send all
@@ -1144,6 +1173,18 @@ class NetSuiteClient:
         body_fields = normalize_line_fields(fields)
         internal_id = str(po_number) if by_internal_id else self.resolve_po_internal_id(str(po_number))
         line_number = int(line_id)
+
+        touches_override = {NS_OVERRIDE_EXPECTED_RECEIPT, NS_UPDATED_RECEIPT_DATE} & set(body_fields)
+        if touches_override and not overwrite_human_override:
+            current = self.get_po_line(internal_id, line_number, by_internal_id=True)
+            if current.override_expected_receipt or current.updated_receipt_date:
+                raise HumanOverrideProtected(
+                    f"PO {internal_id} line {line_number} already carries a receipt-date "
+                    f"override set by a person ({NS_OVERRIDE_EXPECTED_RECEIPT}="
+                    f"{current.override_expected_receipt}, {NS_UPDATED_RECEIPT_DATE}="
+                    f"{current.updated_receipt_date}). Refusing to write "
+                    f"{', '.join(sorted(touches_override))} over it. Nothing was sent."
+                )
 
         payload = {"item": {"items": [{"line": line_number, **body_fields}]}}
         logger.info("PATCH purchaseOrder/%s line %s: %s", internal_id, line_number, body_fields)

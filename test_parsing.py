@@ -2451,6 +2451,30 @@ def test_matcher_paula_rulings(tmp: Path) -> None:
     )
     expect_raises(ValueError, lambda: c.confirm_receipt_date("09/10/2026"), "non-ISO confirmed date rejected")
 
+    # A line a PERSON already overrode keeps its date (Kiko, 2026-09-30): PO 1624's
+    # UPS lines 29-44 carry the override flag and 2026-06-01, set by hand.
+    import copy
+
+    from netsuite_client import HumanOverrideProtected
+
+    for flag, date, what in ((True, None, "the override flag ticked"),
+                             (False, "2026-06-01", "an updated receipt date set")):
+        overridden = copy.deepcopy(c)
+        overridden.current_override_flag, overridden.current_updated_receipt_date = flag, date
+        expect_raises(HumanOverrideProtected,
+                      lambda o=overridden: o.to_netsuite_fields(include_dates=True),
+                      f"a date write over a line with {what} RAISES, even with Paula's date")
+        check(overridden.to_netsuite_fields(include_dates=False) == {"quantity": 110},
+              f"and the quantity-only write on that line is unaffected ({what})")
+    unconfirmed = copy.deepcopy(c)
+    unconfirmed.confirmed_receipt_date = None
+    unconfirmed.current_override_flag = True
+    check(unconfirmed.receipt_date_pending, "premise: no date confirmed on this copy")
+    expect_raises(HumanOverrideProtected,
+                  lambda: unconfirmed.to_netsuite_fields(include_dates=True),
+                  "the override refusal comes FIRST -- Paula is not asked to confirm a date "
+                  "the tool would then refuse to write")
+
     # RULING 6 -- over-shipment is normal and must not be flagged.
     over = mt.build_proposed_changes(
         [{**vendor[0], "quantity": 500}], client, eta="2026/8/16"

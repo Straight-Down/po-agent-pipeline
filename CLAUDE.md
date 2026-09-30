@@ -435,6 +435,14 @@ not as history - a rule without its failure mode gets rationalised away.
   carton + PO 1721's first are neighbours in the carton list). PDFs are gridded
   by `pdf_carton_grid` from word positions, anchored on a LETTER size header -
   a numeric carton row like `17 10 2 4 16 1` otherwise reads as a header.
+- **Never write a receipt date over a HUMAN override** (Kiko, 2026-09-30).
+  Production PO 1624's UPS lines 29-44 carry `custcol_override_expected_receipt`
+  and `custcol_sd_updatedreceiptdate = 2026-06-01`, set by hand. Both
+  `to_netsuite_fields(include_dates=True)` and `update_po_line` raise
+  `HumanOverrideProtected` on a line that already has either; quantity-only
+  writes are unaffected. `overwrite_human_override=True` exists ONLY for
+  `test_phase1_writeback.py`'s revert of its own test write - never pass it on
+  the proposal path.
 - **Grade the tool against PRODUCTION, read-only, never sandbox** (RUNBOOK §8
   lesson 31). Sandbox reads PO 1624 lines 5/6 as 44/44 and 22/22; production
   reads 44/52 and 22/23. The tool's 52 and 23 are right, and would have scored

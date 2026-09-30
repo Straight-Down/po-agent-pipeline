@@ -61,6 +61,7 @@ from netsuite_client import (
     NS_OVERRIDE_EXPECTED_RECEIPT,
     NS_QUANTITY,
     NS_UPDATED_RECEIPT_DATE,
+    HumanOverrideProtected,
     NetSuiteAPIError,
     NetSuiteClient,
     NetSuiteConfig,
@@ -337,6 +338,15 @@ def run(args: argparse.Namespace) -> int:
             print("      (Customization > Lists,Records,&Fields > Transaction Line Fields >")
             print("      [field] > Access tab) that exclude this role?\n")
             return 3
+        except HumanOverrideProtected as exc:
+            # The guard working, not a harness bug: this line already carries a
+            # receipt-date override a person set. Nothing was written, so there is
+            # nothing to revert.
+            section("REFUSED: THIS LINE ALREADY CARRIES A HUMAN OVERRIDE")
+            print(f"\n{exc}\n")
+            print("  Nothing was written. Pick a test line whose override is unticked and")
+            print("  whose Updated Receipt Date is empty, and re-run.\n")
+            return 4
 
         print()
         readback = client.get_po_line(args.po_internal_id, args.line, by_internal_id=True)
@@ -377,7 +387,12 @@ def run(args: argparse.Namespace) -> int:
         if write_succeeded:
             section("STEP 4 -- Revert to the original values (always runs)")
             try:
-                client.update_po_line(args.po_internal_id, args.line, original, by_internal_id=True)
+                # The ONE sanctioned overwrite of an override: this restores the
+                # line's own prior values over THIS script's test write, which set
+                # the override moments ago. The guard would otherwise (correctly)
+                # refuse and leave the sandbox line dirty.
+                client.update_po_line(args.po_internal_id, args.line, original,
+                                      by_internal_id=True, overwrite_human_override=True)
                 reverted = client.get_po_line(args.po_internal_id, args.line, by_internal_id=True)
                 print()
                 leftover = compare(original, snapshot(reverted), phase="revert")

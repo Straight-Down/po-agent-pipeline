@@ -22,6 +22,7 @@ a mismatch refuses before any request is made.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -85,6 +86,23 @@ def main(argv=None) -> int:
     from netsuite_client import NetSuiteClient, NetSuiteConfig, po_number_key
 
     config = NetSuiteConfig.from_env(args.env_file)
+    # `load_env_file` never overrides a variable already in the environment, so a
+    # value exported in the shell (or loaded earlier from another file) silently
+    # beats --env-file. The account check below would catch a sandbox ACCOUNT, but
+    # not a production account paired with another account's client or key. So:
+    # every required value must be the one the named file holds. Names only are
+    # printed -- never a value.
+    from dotenv import dotenv_values
+
+    in_file = dotenv_values(args.env_file)
+    overridden = [name for name in ("NS_ACCOUNT_ID", "NS_CLIENT_ID", "NS_CERTIFICATE_ID",
+                                    "NS_PRIVATE_KEY_PATH")
+                  if (os.environ.get(name) or "") != (in_file.get(name) or "")]
+    if overridden:
+        print(f"REFUSED: {', '.join(overridden)} in the environment differ from "
+              f"{args.env_file} -- an exported variable is overriding the file. Unset "
+              "it and re-run. No request made.")
+        return 2
     actual = "sandbox" if config.is_sandbox else "production"
     if actual != args.expect:
         print(f"REFUSED: --expect {args.expect} but {args.env_file} names account "
@@ -113,22 +131,30 @@ def main(argv=None) -> int:
     changes = mt.build_proposed_changes(
         lines, NetSuiteClient(mock_data=ns_lines), colour_lookups=colour_lookups,
         line_history={})
-    by_id = {ln.line_id: ln for ln in ns_lines.get(key, [])}
-
     counts: dict[str, int] = {}
     print(f"{'style/colour/size':24} {'recap':7} {'slip':>5} {'line':>4} {'ns qty':>6} "
           f"{'recv':>5} {'open':>5} {'closed':>6} {'proposed':>8}  state / reason")
     for line, change in zip(lines, changes):
-        ns = by_id.get(change.line_id)
         counts[change.status] = counts.get(change.status, 0) + 1
-        figures = ((f"{ns.quantity:g}", f"{ns.quantity_received or 0:g}", str(ns.is_open),
-                    str(ns.closed)) if ns else ("-", "-", "-", "-"))
         proposed = "-" if change.proposed_quantity is None else f"{change.proposed_quantity:g}"
-        print(f"{line['style_number'] + '/' + line['color'] + '/' + line['size']:24} "
-              f"{line['recap_label'][:7]:7} {line['quantity']:>5g} {change.line_id or '-':>4} "
-              f"{figures[0]:>6} {figures[1]:>5} {figures[2]:>5} {figures[3]:>6} {proposed:>8}"
-              f"  {change.status}"
-              + (f" -- {change.attention_reason}" if change.attention_reason else ""))
+        # EVERY NetSuite line matching this key, open or not -- the matcher's own
+        # lookup. Showing only the line it chose printed "-" whenever no line was
+        # open, and a closed line still has a quantity and a received quantity.
+        # The line the matcher targeted, if any, is marked `*`.
+        matches, *_ = mt._find_matching_lines(line, ns_lines.get(key, []),
+                                              colour_lookups.get(key))
+        rows = [(f"{m.line_id}{'*' if m.line_id == change.line_id else ''}",
+                 f"{m.quantity:g}", f"{m.quantity_received or 0:g}", str(m.is_open),
+                 str(m.closed)) for m in matches] or [("-", "-", "-", "-", "-")]
+        for i, (line_id, qty, recv, is_open, closed) in enumerate(rows):
+            first = i == 0
+            label = line['style_number'] + '/' + line['color'] + '/' + line['size']
+            print(f"{label if first else '':24} {line['recap_label'][:7] if first else '':7} "
+                  f"{line['quantity'] if first else '':>5} {line_id:>4} {qty:>6} {recv:>5} "
+                  f"{is_open:>5} {closed:>6} {proposed if first else '':>8}"
+                  + (f"  {change.status}"
+                     + (f" -- {change.attention_reason}" if change.attention_reason else "")
+                     if first else ""))
     print(f"\n{len(lines)} line(s): " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     return 0
 

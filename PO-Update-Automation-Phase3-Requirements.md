@@ -48,6 +48,7 @@ The column that matters is the second-to-last: **six of these the build plan doe
 | 11 | Override flag only when a date is written | Build plan item 1 · `Architecture.md` §6.3 · `matcher.to_netsuite_fields` | **yes** | BUILT AND TESTED |
 | 12 | Multi-batch quantities ACCUMULATE | `Architecture.md` §6.1 · `matcher._accumulated_quantity` · migration 0007 | no | **BUILT AND TESTED** |
 | 13 | Paula is the only approver | `Architecture.md` §7 | no | **CONFIRMED** 2026-09-16 |
+| 14 | Re-read open state at write time; plain WRITE_FAILED if closed | Build plan Phase 4 item 10 | **yes** | DECIDED BUT UNBUILT |
 
 ---
 
@@ -500,6 +501,22 @@ name — and because this ruling can change.
 
 ---
 
+## 14. The write path re-reads every line and confirms it is still OPEN
+
+**DECIDED BUT UNBUILT, 2026-09-30.** Build plan Phase 4 item 10 carries it with the full reasoning.
+
+Before writing any line, re-read it from NetSuite and confirm it is still open — never trust the
+open state stored at processing time. A write refused because the line is no longer open becomes
+`WRITE_FAILED` with a message saying exactly that, in plain words, so Paula understands what
+happened rather than seeing a generic failure.
+
+**The case it covers:** a PO closed after its slip was processed does NOT silently disappear from
+the review queue. It stays, and looks approvable — the review app shows only what was true at
+processing time, and nothing re-reads NetSuite before review (a refresh job was considered and
+not built). The write-time check is what catches it. Revisit if POs closing mid-queue proves common.
+
+---
+
 ## What is NOT a Phase 3 requirement
 
 Recorded so nobody adds it back:
@@ -535,8 +552,9 @@ the last of them**, including the two this document had raised as proposals:
 
 **What is left is work, not decisions.** Entries 1, 4 and 5 are built in review_app v1 (2026-09-30).
 Entry 3 (assignment groups) is still DECIDED BUT UNBUILT: v1 REFUSES to render a PO holding one,
-and NEEDS_RESOLUTION, rather than guess at a picker no real data has exercised. Entry 12 is the only one of the four rulings that needed
-code, and it has it.
+and NEEDS_RESOLUTION, rather than guess at a picker no real data has exercised. Entry 14 (re-read
+open state at write time) is DECIDED BUT UNBUILT and belongs to the write path. Entry 12 is the only
+one of the four rulings that needed code, and it has it.
 
 **One thing to carry into the build rather than rediscover:** §13 means the queue has no drain while
 Paula is away, and §12 means a line can now sit in `DISPUTED` indefinitely with nothing proposed.

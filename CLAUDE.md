@@ -464,4 +464,10 @@ not as history - a rule without its failure mode gets rationalised away.
 - **A verdict names a decision-maker, and nothing defaults one.** `review_app`
   will not start without `PO_AGENT_REVIEWER`; with no login, a default would
   put a real person's name on clicks they never made.
+- **The write path must re-read each line and confirm it is still OPEN before
+  writing** (Phase 4 item 10, 2026-09-30). The review app shows open state as
+  of processing and nothing refreshes it, so a PO closed mid-queue stays in the
+  queue looking approvable - by decision, not oversight. The write-time check is
+  the guard; a refusal is a WRITE_FAILED whose message says the line was closed,
+  in plain words. Do not "fix" the queue with a refresh job without revisiting that.
 - <add the next one here>

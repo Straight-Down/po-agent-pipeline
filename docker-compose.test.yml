@@ -1,3 +1,8 @@
+# SUPERSEDED 2026-10-01 -- use the Azure SQL test database instead (CLAUDE.md,
+# "Dual-dialect runs"). As written below this route is REFUSED by the harness:
+# its database `po_agent_test` does not end in `-test`, and `sa` connects as
+# `dbo`, which the harness no longer runs as. Kept for reference only.
+#
 # A real SQL Server for the dual-dialect test run.
 #
 #   set MSSQL_SA_PASSWORD=<something long enough>

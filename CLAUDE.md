@@ -254,14 +254,22 @@ not hypothetical: four filtered unique indexes compiled to FULL unique indexes o
 a non-SQLite dialect for four migrations, silently, because SQLAlchemy ignores
 dialect kwargs it does not recognise (RUNBOOK section 8 lesson 22).
 
-```
-# one-off: a real SQL Server, no Azure and no IT involved
-set MSSQL_SA_PASSWORD=<something long>
-docker compose -f docker-compose.test.yml up -d --wait
+The server target is the **Azure SQL test database, `sqldb-po-agent-test`**,
+connected as a **contained user of that database only** -- never the server
+admin. Both are enforced: the harness refuses a database not named `*-test`,
+and refuses to run connected as `dbo` (the server admin is `dbo` in every
+database on the server, production's included). RUNBOOK section 8 lesson 25.
 
-set PO_AGENT_TEST_DB_URL=mssql+pyodbc://sa:%MSSQL_SA_PASSWORD%@localhost:11433/po_agent_test?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes
+```
+set PO_AGENT_TEST_DB_URL=mssql+pyodbc://po_agent_test_runner:<URL-encoded pw>@sql-po-agent-prod.database.windows.net/sqldb-po-agent-test?driver=ODBC+Driver+18+for+SQL+Server
 .venv\Scripts\python -m pytest -q --mssql
 ```
+
+**SUPERSEDED 2026-10-01: the local Docker route** (`docker-compose.test.yml`).
+It named its database `po_agent_test` and logged in as `sa`, and both guards
+now refuse both. Reviving it would take a `*-test` database name AND a
+non-`sa` login mapped to a user in that database -- more setup than the Azure
+test database it was a stand-in for. Left in the repo, marked, not deleted.
 
 `--mssql` does not arrange the run; it *asserts* one. Without
 `PO_AGENT_TEST_DB_URL` set it fails rather than quietly running on SQLite,
@@ -341,6 +349,9 @@ not as history - a rule without its failure mode gets rationalised away.
   unless `PO_AGENT_MIGRATE_CONFIRM` equals THAT database's name for the run
   (`sqldb-po-agent`, `po_agent.db`, a run file's name). No generic force flag.
   Set it for ONE command and clear it: left in a shell it re-authorises later runs.
+  **The harness also refuses to run as `dbo`** (`dialect_target._refuse_server_admin`):
+  connect as a contained user of the test database, never the server admin, or
+  `--mssql` stops at startup naming the login it found.
   Name throwaway migration files `*-test.db` or they are refused too.
 - **A migration that alters a table any VIEW depends on must DROP those views
   first and recreate them after.** Documented since 0002 and forgotten anyway,

@@ -5,7 +5,10 @@ SQLite in memory by default -- the fast loop, and what every run has used until
 now. Set `PO_AGENT_TEST_DB_URL` (or pass pytest's `--mssql`) to point the same
 suites at a real SQL Server instead.
 
-    set PO_AGENT_TEST_DB_URL=mssql+pyodbc://sa:<pw>@localhost:1433/po_agent_test?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes
+    set PO_AGENT_TEST_DB_URL=mssql+pyodbc://po_agent_test_runner:<pw>@sql-po-agent-prod.database.windows.net/sqldb-po-agent-test?driver=ODBC+Driver+18+for+SQL+Server
+
+The target must be named `*-test` and the login must NOT be `dbo` there (a
+contained user of the test database only); both are refused otherwise.
     .venv\\Scripts\\python -m pytest -q
     .venv\\Scripts\\python test_schema.py
 
@@ -225,7 +228,49 @@ def connect():
             "on the dialect you were NOT testing reports green and proves nothing. "
             "Start the server, or unset the variable to run on SQLite deliberately."
         ) from exc
+    _refuse_server_admin(engine)
     return engine
+
+
+class RunningAsServerAdmin(Exception):
+    """The harness is connected as `dbo` -- an identity that owns more than the test DB."""
+
+
+def _refuse_server_admin(engine) -> None:
+    """
+    Refuse to run the harness as `dbo` (2026-10-01).
+
+    `dbo` in the test database means the connection is the database owner by
+    virtue of a SERVER-level identity -- on Azure SQL the server admin, which is
+    `dbo` in EVERY database on the server, production's included. The test and
+    production databases share a server, so a destructive suite connected that
+    way is one mistyped name away from dropping production's tables. The fix is a
+    contained user that exists only in the test database (RUNBOOK section 8
+    lesson 25); this catches that fix being undone later -- the admin credential
+    pasted back into `.env` because it was to hand.
+
+    Called in two places, deliberately: at the end of `connect()` (so a run fails
+    at startup), and at the top of `_drop_everything` (so NO teardown runs as dbo,
+    whatever built the engine -- the migration tests build theirs with
+    `sc.connect(url)` and never pass through `connect()`). On Azure SQL the
+    Microsoft Entra admin is also mapped to `dbo`, per Microsoft's documentation --
+    not verified against this server. Names the database user and the login it
+    found; never the password.
+    """
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        user, login = conn.execute(text("SELECT USER_NAME(), SUSER_SNAME()")).one()
+    if str(user).lower() == "dbo":
+        engine.dispose()
+        raise RunningAsServerAdmin(
+            f"Refusing to run the test harness: {TARGET_ENV} connects as login {login!r}, "
+            f"which is database user {user!r} -- the owner through a server-level identity, "
+            "which on Azure SQL is dbo in EVERY database on the server, production's too. "
+            "Connect as a contained user of the test database instead (CREATE USER ... WITH "
+            "PASSWORD, in the test database only, added to db_owner there). See RUNBOOK "
+            "section 8 lesson 25."
+        )
 
 
 def _drop_everything(engine) -> None:
@@ -241,6 +286,11 @@ def _drop_everything(engine) -> None:
     """
     from sqlalchemy import text
 
+    # THE destructive operation checks the identity itself: callers reach it with
+    # engines from `connect()` AND straight from `sc.connect(url)` (the migration
+    # tests), so a check only in `connect()` left those paths unguarded.
+    if engine.dialect.name != "sqlite":
+        _refuse_server_admin(engine)
     with engine.begin() as conn:
         for view, _ddl in sc.VIEWS:
             conn.execute(text(f"DROP VIEW IF EXISTS {view}"))

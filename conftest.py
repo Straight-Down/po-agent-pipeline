@@ -79,16 +79,19 @@ def pytest_configure(config):
             f"so this run would have used {dt_target.target_url()!r} and proved nothing "
             "about the deployment dialect.\n"
             "Set it first, e.g.\n"
-            "  set PO_AGENT_TEST_DB_URL=mssql+pyodbc://sa:<pw>@localhost:1433/po_agent_test"
-            "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes\n"
-            "See dialect_target's docstring for standing up a server."
+            "  set PO_AGENT_TEST_DB_URL=mssql+pyodbc://po_agent_test_runner:<pw>"
+            "@sql-po-agent-prod.database.windows.net/sqldb-po-agent-test"
+            "?driver=ODBC+Driver+18+for+SQL+Server\n"
+            "as a contained user of the test database -- never the server admin.\n"
+            "See CLAUDE.md, 'Dual-dialect runs'."
         )
     # Fail here, once, rather than inside the first test that opens a connection --
     # and as a UsageError, so pytest prints the message instead of an INTERNALERROR
     # traceback that buries it.
     try:
         dt_target.connect().dispose()
-    except dt_target.TargetUnreachable as exc:
+    except (dt_target.TargetUnreachable, dt_target.RunningAsServerAdmin) as exc:
+        # RunningAsServerAdmin: the suite refuses to run as dbo, naming who it found.
         raise pytest.UsageError(str(exc)) from exc
 
 

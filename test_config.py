@@ -517,6 +517,73 @@ def test_redaction_is_structural_and_fails_closed() -> None:
           "while the non-secret parts stay legible, or the error is useless", out)
 
 
+def test_harness_refuses_to_run_as_dbo() -> None:
+    section("the harness will not run connected as dbo (a server-level owner)")
+    import dialect_target as dt
+
+    class FakeEngine:
+        """Answers SELECT USER_NAME(), SUSER_SNAME() as the given identity."""
+
+        def __init__(self, user, login):
+            self.row, self.disposed = (user, login), False
+
+        def connect(self):
+            engine = self
+
+            class Conn:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def execute(self, _sql):
+                    return type("R", (), {"one": lambda _s: engine.row})()
+
+            return Conn()
+
+        def dispose(self):
+            self.disposed = True
+
+    admin = FakeEngine("dbo", "poagentadmin")
+    try:
+        dt._refuse_server_admin(admin)
+        check(False, "dbo is refused", "NOT REFUSED")
+    except dt.RunningAsServerAdmin as exc:
+        check("'poagentadmin'" in str(exc) and "'dbo'" in str(exc) and admin.disposed,
+              "connected as dbo: refused, naming the login and user it found, engine "
+              "disposed before anything is dropped", str(exc)[:90])
+    for user in ("po_agent_test_runner", "DBO_lookalike"):
+        try:
+            dt._refuse_server_admin(FakeEngine(user, user))
+            check(True, f"a contained user ({user!r}) is allowed")
+        except dt.RunningAsServerAdmin:
+            check(False, f"a contained user ({user!r}) is allowed", "REFUSED")
+    try:
+        dt._refuse_server_admin(FakeEngine("DBO", "x"))
+        check(False, "the check is not fooled by case", "NOT REFUSED")
+    except dt.RunningAsServerAdmin:
+        check(True, "the check is not fooled by case ('DBO')")
+
+    # The teardown itself checks, so an engine built WITHOUT connect() -- the
+    # migration tests use sc.connect(url) -- is refused before anything drops.
+    server = FakeEngine("dbo", "poagentadmin")
+    server.dialect = type("D", (), {"name": "mssql"})()
+    server.began = False
+
+    def begin():
+        server.began = True
+        raise AssertionError("a transaction was opened on a dbo connection")
+
+    server.begin = begin
+    try:
+        dt._drop_everything(server)
+        check(False, "_drop_everything refuses a dbo engine", "NOT REFUSED")
+    except dt.RunningAsServerAdmin:
+        check(not server.began, "_drop_everything refuses a dbo engine before opening any "
+              "transaction, whatever built the engine")
+
+
 def test_harness_refuses_a_non_disposable_database() -> None:
     section("the harness will only point at a database named disposable")
     import os
@@ -683,6 +750,7 @@ def main() -> int:
         test_one_dotenv_loader,
         test_no_credentials_in_tracked_files,
         test_redaction_is_structural_and_fails_closed,
+        test_harness_refuses_to_run_as_dbo,
         test_harness_refuses_a_non_disposable_database,
         test_no_unquoted_reserved_identifiers_in_handwritten_sql,
     )

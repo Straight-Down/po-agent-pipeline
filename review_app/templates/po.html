@@ -42,6 +42,7 @@
           <div class="muted">
             State: {{ ln.state }}{% if ln.accumulation_basis %} · basis: {{ ln.accumulation_basis }}{% endif %}
             · extraction confidence: {{ ln.extraction_confidence }}{% if ln.source_hint %} · source: {{ ln.source_hint }}{% endif %}
+            {% if ln.confidence_discharge %}<br>What proved it: {{ ln.confidence_discharge }}{% endif %}
             {% if ln.extraction_note %}<br>Extractor's note: {{ ln.extraction_note }}{% endif %}
             {% if ln.attention_reason %}<br>Tool's reason: {{ ln.attention_reason }}{% endif %}
             {% if ln.block_reason %}<br>Why it can't be approved: {{ ln.block_reason }}{% endif %}

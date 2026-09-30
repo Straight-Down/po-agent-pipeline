@@ -153,6 +153,9 @@ class _Sheet:
                     self.strong.add(row)
         #: Weak candidates refused as carton rows, with why. See `_admit_weak`.
         self.rejected_weak: dict[int, str] = {}
+        #: summary row -> (first, last) row of the carton span it is PROVEN to sum.
+        #: A proven group: `prove_attribution` reads what such a block names.
+        self.summary_spans: dict[int, tuple[int, int]] = {}
         admitted = self._admit_weak(candidates)
         self.cartons = [(r, c) for r, c in candidates if r in admitted]
 
@@ -217,6 +220,7 @@ class _Sheet:
                         self.rejected_weak[row] = (
                             f"row {row} is the sum of the {counted} carton rows in "
                             f"{above}-{row - 1}: a summary, not a carton")
+                        self.summary_spans[row] = (above, row - 1)
                         break
                 above -= 1
             else:
@@ -516,8 +520,219 @@ def _runs_summing_to(sheet: _Sheet, target: dict[str, float]) -> list[tuple[int,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Attribution proof: every field of a line proven from the grid, or no discharge
+# ---------------------------------------------------------------------------
+
+#: An inseam block label ("INS 32", "INSEAM 34"). Read the way a size header is:
+#: a size-axis value in a cell, located by position -- never a row-type label.
+_INSEAM = re.compile(r"^\s*INS(?:EAM)?\s*[:#.]?\s*(\d{2})\s*$", re.IGNORECASE)
+
+
+@dataclass
+class _Candidates:
+    """The values this shipment's lines carry -- the only ones a document can "name"."""
+
+    pos: set
+    styles: set
+    colours: set
+
+
+def _candidates(lines: Sequence[dict]) -> _Candidates:
+    from canonical import canonical
+    from netsuite_client import po_number_key
+
+    return _Candidates(
+        pos={po_number_key(str(ln.get("po_number") or "")) for ln in lines} - {""},
+        styles={canonical(ln.get("style_number")) for ln in lines} - {""},
+        colours={canonical(ln.get("color")) for ln in lines} - {""},
+    )
+
+
+def _table_bounds(sheet: _Sheet, first: int) -> tuple[int, int, int]:
+    """(header row, first row, last row) of the size table holding row `first`."""
+    headers = [r for r, _labels in sheet.headers]
+    above = [h for h in headers if h < first]
+    header = above[-1] if above else 0
+    below = [h for h in headers if h > header]
+    return header, header + 1, (below[0] - 1 if below else sheet.grid.n_rows)
+
+
+def _groups(sheet: _Sheet, run: tuple[int, ...]) -> list[tuple[int, int, str]]:
+    """
+    Proven row groups around a carton run, smallest first: the run itself, each
+    block a subtotal row is PROVEN to sum (smallest first), the run's size table,
+    the whole document.
+    """
+    first, last = run[0], run[-1]
+    out = [(first, last, f"the run of carton rows {first}-{last}")]
+    spans = sorted((hi - lo, lo, hi, srow) for srow, (lo, hi) in sheet.summary_spans.items()
+                   if lo <= first and last <= hi)
+    out += [(lo, hi, f"the block of rows {lo}-{hi} (which the subtotal on row {srow} sums "
+                     "exactly)") for _size, lo, hi, srow in spans]
+    header, lo, hi = _table_bounds(sheet, first)
+    out.append((lo, hi, f"the table under the size header on row {header}"))
+    out.append((1, sheet.grid.n_rows, "the whole document"))
+    return out
+
+
+def _names(sheet: _Sheet, lo: int, hi: int, field: str, cands: _Candidates) -> set:
+    """
+    Which candidate values of `field` rows lo..hi print, size columns excluded.
+
+    **Unique among KNOWN candidates, not unique in the document.** Candidates are
+    the values this shipment's own lines carry; a value printed in scope that no
+    line carries (another product's colour, a PO nobody extracted) is invisible
+    here, so it cannot make a group ambiguous. The smallest group is tried first,
+    and on the documents seen the run itself or its subtotal block carries the
+    value, so a wider scope is rarely reached -- but that is a property of those
+    layouts, not something this function enforces.
+    """
+    from canonical import canonical
+    from netsuite_client import po_number_key
+
+    found: set = set()
+    for row in range(lo, hi + 1):
+        skip = set(sheet._labels_for(row))
+        for col, text in enumerate(sheet.grid.rows[row - 1]):
+            if col in skip or not text:
+                continue
+            if field == "po":
+                for token in re.findall(r"[0-9A-Za-z]+", text):
+                    key = po_number_key(token)
+                    if key in cands.pos:
+                        found.add(key)
+                continue
+            # EXACT match on the normalised cell (Kiko, 2026-10-01): the cell names
+            # a colour or style only if the WHOLE cell is that value. A compound
+            # like `BLACK/WHITE`, `BLACK WHITE` or `NAVY / BLACK` is a different
+            # colour, not a cell naming BLACK -- a bounded substring, then whole
+            # words, both let it "prove" a BLACK line. `canonical` still absorbs
+            # case, doubled spaces and dash forms, so `NEW  INDIGO` = `NEW INDIGO`.
+            flat = canonical(text)
+            if flat in (cands.styles if field == "style" else cands.colours):
+                found.add(flat)
+    return found
+
+
+def _prove_named(sheet, run, field, value, cands, label) -> tuple[bool, str]:
+    for lo, hi, where in _groups(sheet, run):
+        found = _names(sheet, lo, hi, field, cands)
+        if not found:
+            continue
+        if found == {value}:
+            return True, f"{label} {value.upper()}: {where} names only {value.upper()}."
+        named = ", ".join(sorted(v.upper() for v in found))
+        if value not in found:
+            return False, (f"{label}: {where} names {named}, not {value.upper()} as this line "
+                           "says.")
+        return False, (f"{label}: {where} names more than one ({named}), so which one this "
+                       "line belongs to is not proven.")
+    return False, f"{label}: not printed anywhere near these cartons."
+
+
+def _prove_inseam(sheet: _Sheet, run: tuple[int, ...], inseam: str) -> tuple[bool, str]:
+    """
+    The inseam label governing a carton run: the nearest label row ABOVE the run,
+    inside the run's size table, with no label inside the run. Fails closed on a
+    label anywhere else, two labels on one row, or a mismatch.
+    """
+    header, lo, _hi = _table_bounds(sheet, run[0])
+
+    def labels(row: int) -> list[str]:
+        return [m.group(1) for c in sheet.grid.rows[row - 1] if (m := _INSEAM.match(c or ""))]
+
+    inside = [r for r in range(run[0], run[-1] + 1) if labels(r)]
+    if inside:
+        return False, (f"Inseam: an inseam label sits inside the carton rows (row {inside[0]}), "
+                       "so the block is not one inseam.")
+    above = [r for r in range(lo, run[0]) if labels(r)]
+    if not above:
+        return False, ("Inseam: no inseam label above these cartons inside their table, so "
+                       "the inseam is not proven.")
+    row = above[-1]
+    values = set(labels(row))
+    if len(values) != 1:
+        return False, f"Inseam: row {row} carries more than one inseam label."
+    label = values.pop()
+    if label != str(inseam).strip():
+        return False, (f"Inseam: the cartons sit under 'INS {label}', but this line says "
+                       f"{inseam}.")
+    return True, (f"Inseam {label}: the cartons sit directly under the label 'INS {label}' on "
+                  f"row {row}, inside their table, with no other inseam label in between.")
+
+
+def _inseam_of(line: dict) -> Optional[str]:
+    """
+    The line's inseam, as the digits the label would carry. The stored axis is the
+    PRINTED text ("INS 32"), so it goes through the same parser as the label; a
+    bare number ("32") is accepted too. Anything else is returned as-is, and will
+    not equal a parsed label -- which fails closed.
+    """
+    secondary = str(line.get("size_axis_secondary") or "").strip()
+    if not secondary:
+        return None
+    match = _INSEAM.match(secondary) or re.fullmatch(r"\s*(\d{2})\s*", secondary)
+    return match.group(1) if match else secondary
+
+
+def prove_attribution(line: dict, sheet: _Sheet, run: tuple[int, ...],
+                      target: dict[str, float], cands: _Candidates, source: str,
+                      unique: bool) -> dict:
+    """
+    Whether EVERY field of this line is proven from the grid (Kiko, 2026-10-01).
+
+    Proven means: the carton run is the only one that sums to the recap; the
+    line's quantity is that sum under its own size column; the inseam (a composed
+    size) is the label directly above the run; and colour, style and PO are each
+    the only candidate named by the smallest proven group around the run. The
+    extractor's note is never read, and agreement with another document is never
+    evidence. Anything short of all of it returns proven=False with the reason.
+    """
+    from canonical import canonical
+    from netsuite_client import po_number_key
+
+    lines_out: list[str] = []
+
+    def fail(why: str) -> dict:
+        return {"proven": False, "text": f"Not proven -- {why}"}
+
+    if not unique:
+        return fail("these quantities match more than one set of cartons, so which cartons "
+                    "they are is not proven.")
+    inseam = _inseam_of(line)
+    primary = line.get("size_axis_primary") if inseam else line.get("size")
+    size_label = _size_label(primary)
+    quantity = _num(line.get("quantity"))
+    if size_label is None or quantity is None or abs(target.get(size_label, -1) - quantity) > _EPS:
+        return fail(f"size {primary!r} does not carry this line's quantity in the cartons' "
+                    "sum.")
+    lines_out.append(
+        f"Quantity {quantity:g} for size {primary}: the cartons in rows {run[0]}-{run[-1]} of "
+        f"{source} sum to exactly this recap, and no other run of cartons does.")
+    if inseam:
+        ok, text = _prove_inseam(sheet, run, inseam)
+        if not ok:
+            return fail(text)
+        lines_out.append(text)
+    for kind, value, label in (
+            ("colour", canonical(line.get("color")), "Colour"),
+            ("style", canonical(line.get("style_number")), "Style"),
+            ("po", po_number_key(str(line.get("po_number") or "")), "PO")):
+        if not value:
+            return fail(f"{label.lower()}: the line has none.")
+        ok, text = _prove_named(sheet, run, kind, value, cands, label)
+        if not ok:
+            return fail(text)
+        lines_out.append(text)
+    return {"proven": True,
+            "text": "Checked by arithmetic on the documents, not taken from the extractor's "
+                    "reading. " + " ".join(lines_out)}
+
+
 def _back_across_attachments(kept: list[dict], evidence: Sequence[tuple[Any, str]],
-                             primary: Union[str, Path], notes: list[str]) -> None:
+                             primary: Union[str, Path], notes: list[str],
+                             cands: Optional[_Candidates] = None) -> None:
     """
     Upgrade UNVERIFIABLE lines to BACKED where ANOTHER attachment's cartons sum
     to their recap row (Kiko, 2026-09-28).
@@ -596,6 +811,10 @@ def _back_across_attachments(kept: list[dict], evidence: Sequence[tuple[Any, str
                 "carton_rows": list(found[0][2]), "carton_source": found[0][0],
                 "carton_runs": [{"source": name, "sheet": sheet.grid.name,
                                  "rows": list(run)} for name, sheet, run in found]}
+            if cands is not None:
+                name, sheet, run = found[0]
+                line["attribution_proof"] = prove_attribution(
+                    line, sheet, run, target, cands, f"'{name}'", unique=len(found) == 1)
         notes.append(f"carton backing across attachments, {'/'.join(key[:3])}: {reason}")
 
 
@@ -673,7 +892,27 @@ def check_lines(lines: Sequence[dict], path: Union[str, Path],
                                   "carton_rows": list(rows)}
         result.kept.append(line)
 
-    _back_across_attachments(result.kept, evidence, path, result.notes)
+    cands = _candidates(lines)
+    _back_across_attachments(result.kept, evidence, path, result.notes, cands)
+    # Attribution proof for lines backed by their OWN document's cartons (the
+    # cross-attachment pass above proved its own lines). One cited row only.
+    for line in result.kept:
+        backing = line["carton_backing"]
+        if (backing["status"] != BACKED or "carton_source" in backing
+                or "attribution_proof" in line):
+            continue
+        cited = _parse_hints(line.get("source_hint"))
+        run = tuple(backing.get("carton_rows") or ())
+        sheet = sheets.get(cited[0][0]) if len(cited) == 1 else None
+        if sheet is None or not run:
+            line["attribution_proof"] = {"proven": False,
+                                         "text": "Not proven -- the line cites more than one "
+                                                 "row, so its cartons are not one run."}
+            continue
+        target = sheet.sizes(cited[0][1])
+        line["attribution_proof"] = prove_attribution(
+            line, sheet, run, target, cands, f"sheet '{sheet.grid.name}'",
+            unique=_runs_summing_to(sheet, target) == [run])
 
     for (sheet, row), dropped in dropped_by_row.items():
         keys = ", ".join(f"{d.get('style_number')}/{d.get('color')}/{d.get('size')}="

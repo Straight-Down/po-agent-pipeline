@@ -298,6 +298,10 @@ class ProposedChange:
     #: True when the matched NetSuite line is closed. Such a line is never
     #: written to automatically — `to_netsuite_fields()` refuses.
     line_closed: bool = False
+    #: When a medium/low-confidence line had EVERY field proven from the documents'
+    #: arithmetic (`carton_backing.prove_attribution`), the confidence flag is
+    #: discharged and this holds the proof in plain words. Empty otherwise.
+    confidence_discharge: str = ""
 
     #: The five quantity figures for this line, on EVERY change -- see
     #: `_line_balance`. Display context, never a gate.
@@ -1243,7 +1247,16 @@ def build_proposed_changes(
                 f"(normalized size {_normalize_size(change.size)})"
             )
         if confidence in REVIEW_CONFIDENCES:
-            reasons.append(f"extraction confidence {confidence}" + (f": {note}" if note else ""))
+            # Discharged ONLY by a complete proof of every field from the grid
+            # (Kiko, 2026-10-01). Never by the extractor's note, and never by two
+            # documents agreeing: sharing a print-once convention, they repeat one
+            # inference rather than corroborating it (RUNBOOK section 8 lesson 32).
+            proof = vl.get("attribution_proof") or {}
+            if proof.get("proven"):
+                change.confidence_discharge = proof["text"]
+            else:
+                reasons.append(f"extraction confidence {confidence}"
+                               + (f": {note}" if note else ""))
         backing = vl.get("carton_backing") or {}
         if backing.get("status") == "UNVERIFIABLE":
             # Kept rather than dropped (Paula, 2026-09-23): a rule that cannot be

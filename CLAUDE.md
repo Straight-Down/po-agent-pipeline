@@ -175,7 +175,7 @@ heavily than the code it can read. Known drift as of 2026-09-14:
   `ingest.py`, `schema.py`, `extraction_schema.py`, `claude_extractor.py`,
   `document_parsers.py`, `attachment_classifier.py`, `size_vocabulary.py`,
   `canonical.py`, `config.py`, `carton_backing.py`, alembic migrations
-  0001-0012, and eight test
+  0001-0013, and eight test
   modules — plus, since Phase 2 closed on 2026-09-14, the mailbox intake:
   `graph_client.py` (a four-method Graph interface with a mock and a real
   client), `poller.py` (the polling job and the content-addressed attachment
@@ -470,4 +470,14 @@ not as history - a rule without its failure mode gets rationalised away.
   queue looking approvable - by decision, not oversight. The write-time check is
   the guard; a refusal is a WRITE_FAILED whose message says the line was closed,
   in plain words. Do not "fix" the queue with a refresh job without revisiting that.
+- **A medium-confidence flag is discharged only by proving EVERY field from the
+  grid** (`carton_backing.prove_attribution`, 2026-10-01): a UNIQUE carton run
+  behind the quantity, the inseam label directly above it, and the smallest
+  proven group (run, subtotal block, size table, document) naming only the line's
+  colour, style and PO. A cell names a colour/style only if the WHOLE normalised
+  cell equals it: `BLACK/WHITE`, `BLACK WHITE` and `NAVY / BLACK` are other
+  colours, and substring and whole-word matching both let them prove BLACK. Never read the extractor's note to decide what to prove,
+  and never count two documents agreeing: PO 1720/1721's two PDFs share a
+  print-once convention, so their 25-key agreement was one inference counted
+  twice (RUNBOOK section 8 lesson 32). Anything short of all fields keeps the flag.
 - <add the next one here>

@@ -734,6 +734,10 @@ proposed_changes = Table(
     # RUNBOOK section 8.
     Column("accumulation_basis", Unicode(32)),
     Column("accumulation_base_quantity", Numeric(12, 3)),
+    # -- migration 0013: why a medium/low-confidence line is NOT flagged -- every
+    # -- field proven from the documents' arithmetic, in plain words. NULL when no
+    # -- flag was discharged. Never the extractor's note; never document agreement.
+    Column("confidence_discharge", Unicode(2000)),
     # -- NetSuite's date state at proposal time, for display beside the reference dates
     Column("current_expected_receipt_date", Date),
     Column("current_updated_receipt_date", Date),

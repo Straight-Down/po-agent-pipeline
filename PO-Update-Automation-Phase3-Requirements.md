@@ -149,6 +149,11 @@ level are behind a collapsed **Details** toggle on the row. No confidence badge 
 **Why:** the reviewer needs to know what to check, not the parser's phrasing. The note stays one
 click away for when the plain sentence is not enough.
 
+**Discharged when proven (2026-10-01).** A medium/low-confidence line whose every field is proven
+from the documents' arithmetic (`carton_backing.prove_attribution`) is not flagged at all: it
+reads "Ready to approve", and its Details say what proved it (`proposed_changes.confidence_discharge`,
+migration 0013). The level itself is still stored, so calibration (§1) still sees it.
+
 The original rule, superseded in its first half and kept in its second:
 
 > *"the note is a first-class field on the review row, not a tooltip on a badge, and queue ordering

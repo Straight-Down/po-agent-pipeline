@@ -358,6 +358,162 @@ def test_other_pos_cartons_never_back_a_recap() -> None:
           "an attachment with the PRIMARY's own bytes is not independent evidence")
 
 
+def _act_lines(rows_inseams=((47, "NEW INDIGO", 32), (53, "NEW INDIGO", 34),
+                             (121, "SILVER", 32), (126, "SILVER", 34))) -> list[dict]:
+    """PO 1725's lines as the extractor emits them: composed waist-inseam sizes."""
+    sheet = _sheet(TAINAN, "ACT")
+    return [{"po_number": "0001725", "style_number": "50144", "color": colour,
+             "size": f"{waist}-{inseam}", "size_axis_primary": waist,
+             "size_axis_secondary": f"INS {inseam}", "quantity": qty,
+             "source_hint": f"ACT!R{row}", "confidence": "medium"}
+            for row, colour, inseam in rows_inseams
+            for waist, qty in sheet.sizes(row).items()]
+
+
+def test_a_1725_inseam_is_proven_by_the_label_above_its_cartons() -> None:
+    section("PO 1725: the inseam, colour, style and PO proven from the sheet itself")
+    result = cb.check_lines(_act_lines(), TAINAN)
+    proofs = [ln["attribution_proof"] for ln in result.kept]
+    check(len(proofs) == 28 and all(p["proven"] for p in proofs),
+          "all 28 lines proven: the inference the extractor flagged is now arithmetic",
+          f"{sum(p['proven'] for p in proofs)} of {len(proofs)}")
+    by_row = {ln["source_hint"]: ln["attribution_proof"]["text"] for ln in result.kept}
+    check("rows 12-19" in by_row["ACT!R47"] and "'INS 32' on row 11" in by_row["ACT!R47"]
+          and "'INS 34' on row 97" in by_row["ACT!R126"],
+          "each proof names its carton run and the label above it", by_row["ACT!R47"][:120])
+    check("never" not in by_row["ACT!R47"] and "extractor's reading" in by_row["ACT!R47"],
+          "and says it was checked by arithmetic, not taken from the extractor")
+
+    wrong = _act_lines(((47, "NEW INDIGO", 34),))
+    got = cb.check_lines(wrong, TAINAN).kept[0]["attribution_proof"]
+    check(not got["proven"] and "sit under 'INS 32'" in got["text"],
+          "a line claiming the wrong inseam is NOT proven", got["text"][:90])
+
+
+def test_the_inseam_proof_fails_closed() -> None:
+    section("inseam: a label below the cartons, or inside them, proves nothing")
+    import copy
+
+    grid = next(g for g in read_workbook_grids(TAINAN) if g.name == "ACT")
+    line = _act_lines(((47, "NEW INDIGO", 32),))[0]
+    cands = cb._candidates([line])
+    run = tuple(range(12, 20))
+
+    moved = copy.deepcopy(grid)
+    moved.rows[10][7] = ""          # R11 'INS 32' removed...
+    moved.rows[19][7] = "INS 32"    # ...and printed BELOW the cartons, on R20
+    sheet = cb._Sheet(moved)
+    got = cb.prove_attribution(line, sheet, run, sheet.sizes(47), cands, "x", unique=True)
+    check(not got["proven"] and "no inseam label above" in got["text"],
+          "a label placed anywhere but directly above the run: not proven", got["text"][:80])
+
+    inside = copy.deepcopy(grid)
+    inside.rows[14][7] = "INS 34"   # a second label INSIDE the carton rows
+    sheet = cb._Sheet(inside)
+    got = cb.prove_attribution(line, sheet, run, sheet.sizes(47), cands, "x", unique=True)
+    check(not got["proven"] and "inside the carton rows" in got["text"],
+          "a label inside the run (the run crosses a label): not proven", got["text"][:80])
+
+    # Identical blocks: PO 1624's DKF and MLT carry the same cartons, so a recap
+    # matches two runs and which cartons it is cannot be told apart.
+    twin = [{"po_number": "1624", "style_number": "20139", "color": "DKF", "size": size,
+             "quantity": qty, "source_hint": "PO-1624 20139!R39", "confidence": "medium"}
+            for size, qty in _sheet(FOOTWEAR, "PO-1624 20139").sizes(39).items()]
+    got = cb.check_lines(twin, FOOTWEAR).kept[0]["attribution_proof"]
+    check(not got["proven"] and "more than one set of cartons" in got["text"],
+          "identical carton blocks: not proven, the flag stays", got["text"][:80])
+
+
+def test_1721_carried_forward_po_and_style_are_proven_by_subtotals() -> None:
+    section("PO 1721: carried-forward PO and style proven by the carton PDF's subtotals")
+    lines = [dict(ln, confidence="medium") for ln in _covering_lines()]
+    result = cb.check_lines(lines, COVERING, evidence=[(CARTON_PDF, CARTON_PDF.name)])
+    proofs = {(ln["style_number"], ln["color"]): ln["attribution_proof"] for ln in result.kept}
+    check(all(p["proven"] for p in proofs.values()), "all 25 lines proven")
+    black = proofs[("W520005", "BLACK")]["text"]
+    check("Style W520005: the block of rows 41-58 (which the subtotal on row 59 sums "
+          "exactly) names only W520005" in black,
+          "W520005 BLACK: its style comes from the subtotal-proven block, not from the "
+          "row above", black[black.find("Style"):][:90])
+    w6 = proofs[("W600001", "BLACK")]["text"]
+    check("row 90" in w6 and "PO 1721: the block of rows 41-90 (which the subtotal on row 91"
+          in w6, "W600001 BLACK: style from subtotal R90, PO from the PO total R91")
+
+    alone = cb.check_lines([dict(ln, confidence="medium") for ln in _covering_lines()],
+                           COVERING)
+    check(not any((ln.get("attribution_proof") or {}).get("proven") for ln in alone.kept),
+          "the covering PDF alone proves nothing -- and nothing here ever counts two "
+          "documents AGREEING as proof (they share the print-once convention)")
+
+    # The whole shipment, with ONE block mis-attributed: W520005 BLACK labelled as
+    # a style the carton PDF never prints.
+    wrong = [dict(ln, confidence="medium",
+                  style_number="W520005X" if (ln["style_number"], ln["color"])
+                  == ("W520005", "BLACK") else ln["style_number"])
+             for ln in _covering_lines()]
+    got = cb.check_lines(wrong, COVERING, evidence=[(CARTON_PDF, CARTON_PDF.name)])
+    bad = next(ln for ln in got.kept if ln["style_number"] == "W520005X")
+    text = bad["attribution_proof"]["text"]
+    check(not bad["attribution_proof"]["proven"] and "names W520005, not W520005X" in text,
+          "a style the proven block does not name is not proven", text[:100])
+
+
+def test_a_compound_value_never_names_its_parts() -> None:
+    section("naming is an exact match on the normalised cell: a compound names nothing")
+    from claude_extractor import SheetGrid
+
+    grid = SheetGrid(name="T", first_col=1, rows=[
+        ["COLOUR", "S", "M"],            # a size header
+        ["BLACK/WHITE", "4", "4"],       # another product's compound colour
+        ["NEW  INDIGO", "2", "2"],       # a multi-word colour, oddly spaced
+        ["W520005-B", "1", "1"],         # a style with a suffix
+        ["BLACK WHITE", "1", "1"],       # the same compound, spaced
+        ["NAVY / BLACK", "1", "1"],      # and written the other way round
+        [" Black ", "1", "1"],           # the colour itself, oddly cased and padded
+    ])
+    sheet = cb._Sheet(grid)
+    cands = cb._Candidates(pos=set(), styles={"w520005"}, colours={"black", "new indigo"})
+    check(cb._names(sheet, 2, 2, "colour", cands) == set(),
+          "a compound colour does not name its part -- it once 'proved' BLACK")
+    check(cb._names(sheet, 3, 3, "colour", cands) == {"new indigo"},
+          "a multi-word colour still matches as whole words")
+    check(cb._names(sheet, 4, 4, "style", cands) == set(),
+          "a suffixed style does not name the bare style")
+    check(cb._names(sheet, 5, 6, "colour", cands) == set(),
+          "spaced compounds ('BLACK WHITE', 'NAVY / BLACK') do not name BLACK either -- "
+          "whole-word matching let them")
+    check(cb._names(sheet, 7, 7, "colour", cands) == {"black"},
+          "the colour alone, in any case or padding, does")
+
+
+def test_the_matcher_discharges_only_on_a_complete_proof() -> None:
+    section("matcher: medium confidence is discharged by a full proof, and only by one")
+    import matcher as mt
+    from netsuite_client import NetSuiteClient
+    from test_ingest import ns_line
+
+    client = NetSuiteClient(mock_data={"1662": [ns_line("18", size="S", qty=12)]})
+
+    def change(proof):
+        vl = {"po_number": "1662", "style_number": "M120246", "color": "TID", "size": "S",
+              "quantity": 9, "confidence": "medium", "note": "PO carried forward",
+              "source_hint": "PACKING!R42", "attribution_proof": proof}
+        return mt.build_proposed_changes([vl], client)[0]
+
+    proven = change({"proven": True, "text": "Checked by arithmetic ..."})
+    check(proven.status == mt.STATUS_PENDING_REVIEW
+          and proven.confidence_discharge == "Checked by arithmetic ..."
+          and "extraction confidence" not in proven.attention_reason,
+          "proven: the flag is discharged and the proof travels with the change",
+          proven.status)
+    for proof in ({"proven": False, "text": "Not proven -- ..."}, None):
+        flagged = change(proof)
+        check(flagged.status == mt.STATUS_NEEDS_ATTENTION
+              and "extraction confidence medium" in flagged.attention_reason
+              and not flagged.confidence_discharge,
+              f"{'unproven' if proof else 'no proof at all'}: the flag stays")
+
+
 def test_check_lines_drops_keeps_and_flags() -> None:
     section("check_lines: UNBACKED leaves loudly, UNVERIFIABLE stays flagged")
     lines = [
@@ -460,6 +616,11 @@ def main() -> int:
         test_a_total_of_subtotals_is_a_summary,
         test_cartons_in_another_attachment_back_a_recap,
         test_other_pos_cartons_never_back_a_recap,
+        test_a_1725_inseam_is_proven_by_the_label_above_its_cartons,
+        test_the_inseam_proof_fails_closed,
+        test_1721_carried_forward_po_and_style_are_proven_by_subtotals,
+        test_a_compound_value_never_names_its_parts,
+        test_the_matcher_discharges_only_on_a_complete_proof,
         test_check_lines_drops_keeps_and_flags,
         test_inprotex_deterministic_lines_are_all_backed,
         test_the_quantity_must_be_under_the_lines_own_size,

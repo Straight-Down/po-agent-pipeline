@@ -625,6 +625,8 @@ def _change_row(change: mt.ProposedChange, line: dict, shipment_id, po_id, sha, 
         # slip printed 100 is unreadable without the base.
         "accumulation_basis": (change.accumulation or {}).get("basis"),
         "accumulation_base_quantity": (change.accumulation or {}).get("base_quantity"),
+        "confidence_discharge": (change.confidence_discharge[:2000]
+                                 if change.confidence_discharge else None),
         # NetSuite's date state at proposal time, for display beside the references
         "current_expected_receipt_date": _as_date(change.current_expected_receipt_date),
         "current_updated_receipt_date": _as_date(change.current_updated_receipt_date),

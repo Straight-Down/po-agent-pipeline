@@ -423,7 +423,12 @@ not as history - a rule without its failure mode gets rationalised away.
   and PO 1720's then "backed" the M650022 recap on its own. Measured before
   applying: 0 of 924 stored verdicts moved. Known residue: `G.TOTAL` there still
   counts - header rows separate it from PO 1720's block and the walk stops at
-  non-candidate rows.
+  non-candidate rows. **Harmless on this corpus, not in general: it bites when a
+  recap row EQUALS the grand total** - a document whose whole shipment is one
+  style/colour recap. `G.TOTAL` is then a one-row "carton run" summing to that
+  recap, so the recap is BACKED by a total - even when the real carton rows
+  above do NOT sum to it (a missing or mis-keyed carton). That is a false
+  BACKED, and a line that should have been flagged is not.
 - **Carton backing spans attachments, and only ever UPGRADES** (Kiko,
   2026-09-28; `check_lines(evidence=...)`). A recap its own document cannot check
   is BACKED if a run of cartons in ANOTHER selected attachment sums to it

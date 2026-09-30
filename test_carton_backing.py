@@ -301,7 +301,9 @@ def test_a_total_of_subtotals_is_a_summary() -> None:
     check(len(cartons) == 77 and cartons[-1] == 92,
           "leaving the 76 cartons plus G.TOTAL (R92). KNOWN: G.TOTAL still counts -- PO "
           "1720's block sits above a run of header rows the walk does not cross (only a "
-          "refused summary is passed through). At 1,669 units it backs no recap here.",
+          "refused summary is passed through). At 1,669 units it backs no recap here -- "
+          "but it WOULD back a recap equal to the grand total (a one-recap document) "
+          "on its own, even if the cartons above did not sum to it.",
           f"{len(cartons)} rows, last {cartons[-1]}")
 
 

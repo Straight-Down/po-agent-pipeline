@@ -435,4 +435,8 @@ not as history - a rule without its failure mode gets rationalised away.
   carton + PO 1721's first are neighbours in the carton list). PDFs are gridded
   by `pdf_carton_grid` from word positions, anchored on a LETTER size header -
   a numeric carton row like `17 10 2 4 16 1` otherwise reads as a header.
+- **Grade the tool against PRODUCTION, read-only, never sandbox** (RUNBOOK §8
+  lesson 31). Sandbox reads PO 1624 lines 5/6 as 44/44 and 22/22; production
+  reads 44/52 and 22/23. The tool's 52 and 23 are right, and would have scored
+  as false positives against the stale copy.
 - <add the next one here>

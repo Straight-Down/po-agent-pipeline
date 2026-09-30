@@ -1433,6 +1433,21 @@ Two structural options, and the choice is not obvious:
 
 **The general form:** a rule that has been documented and broken three times is not under-documented. Each repetition is evidence that the rule needs to live somewhere a person cannot walk past -- and the choice between "make it automatic" and "make it fail" should be settled by whether the automation itself can be forgotten. Here it could, so the answer was the check.
 
+### 31. A stale copy does not make a check inconclusive -- it inverts it
+
+PO 1624, lines 5 and 6 (20138 PAT sizes 12 and 13). The slip's carton-backed By Sea figures are **52** and **23**. What each account says:
+
+| Line | Sandbox (quantity / received) | Production (quantity / received) |
+|---|---|---|
+| 5 -- 20138/PAT/12 | 44 / 44 | **44 / 52** |
+| 6 -- 20138/PAT/13 | 22 / 22 | **22 / 23** |
+
+In production the warehouse received exactly what the slip says shipped, and the line quantity was never raised to match. So the tool's proposal (52, 23) is a **genuine finding**: two lines under-stated against goods physically received. Read against the sandbox, which does not carry those receipts, the same proposal looks like the tool inventing 8 and 1 extra units on lines that are otherwise consistent. **Calibrating against sandbox would have scored the two real findings on this PO as false positives.**
+
+The instinct to wave this off as "the sandbox is a bit old, so the comparison is noisy" is the mistake. Noise would scatter both ways. A stale copy is not random: it is systematically missing exactly the events that happened since it was taken. And the events that matter most here -- receipts, over-receipts, manual corrections -- are the ones that make a line disagree with its paperwork. The copy is most wrong precisely where the tool is most likely to be right, so a check against it does not lose power, it **flips sign**: true positives read as false positives, and a tool that faithfully reproduced the stale state would score as accurate.
+
+**The rule:** any figure that grades the tool's output -- a false-positive rate, a calibration set, an "it matches NetSuite" check -- is taken against **production, read-only**, or it is not taken. A sandbox figure may show that code runs; it may not show that the code is *right*. `scripts/read_po_line_states.py --expect production` exists for this, and `--expect` is checked against the account id so a sandbox number cannot be printed under a production heading. Sandbox-derived figures already recorded -- the 426-line PRE_EXISTING_RECEIPT ceiling (`scripts/estimate_pre_existing_receipts.py`) among them -- carry the same exposure and are re-verification candidates. PO 1624 is the first case measured: in sandbox all 28 lines were open and flagged PRE_EXISTING_RECEIPT; in production none is open (the PO is Fully Billed).
+
 
 ## 9. How to recover when something breaks
 

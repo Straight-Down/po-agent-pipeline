@@ -1448,6 +1448,16 @@ The instinct to wave this off as "the sandbox is a bit old, so the comparison is
 
 **The rule:** any figure that grades the tool's output -- a false-positive rate, a calibration set, an "it matches NetSuite" check -- is taken against **production, read-only**, or it is not taken. A sandbox figure may show that code runs; it may not show that the code is *right*. `scripts/read_po_line_states.py --expect production` exists for this, and `--expect` is checked against the account id so a sandbox number cannot be printed under a production heading. Sandbox-derived figures already recorded -- the 426-line PRE_EXISTING_RECEIPT ceiling (`scripts/estimate_pre_existing_receipts.py`) among them -- carry the same exposure and are re-verification candidates. PO 1624 is the first case measured: in sandbox all 28 lines were open and flagged PRE_EXISTING_RECEIPT; in production none is open (the PO is Fully Billed).
 
+### 32. Two documents agreeing is independent evidence only when their conventions differ
+
+PO 1720/1721 arrived with two PDFs: a covering sheet (one recap row per style and colour) and a carton-detail sheet. Extracted separately, they **agreed exactly on all 25 keys and 1,669 units**, and that agreement looked like the obvious way to clear the 15 lines flagged for a carried-forward PO and style.
+
+It is not corroboration. **Both documents print PO and style once and leave the rows below blank** -- the covering sheet prints `1721 W520005 COCONUT` and then a bare `BLACK`; the carton sheet prints `W520005` on its first carton and nothing on the BLACK block. So an extractor attributing `BLACK` to `W520005` in one document makes exactly the same inference, from exactly the same convention, in the other. If the inference were wrong it would be wrong in both, and they would still agree. Their agreement on those 25 keys was **one inference counted twice**.
+
+Agreement between two documents is evidence of a fact only to the extent that the two could have disagreed about it. Where they share the step that produces the fact -- a layout convention, a template, a single upstream spreadsheet printed twice -- they cannot, and their agreement measures only that they share it. It does still count for what the documents state independently. The quantities, for example: the carton sheet's 76 cartons sum to the covering sheet's recaps, and a transcription error would show.
+
+**What cleared the flags instead** is arithmetic that does not depend on the convention: the carton sheet's per-style subtotal (row 59 sums cartons 41-58, exactly) proves those cartons are one block, and that block names only `W520005`; the PO total (row 91) proves the same for PO 1721. `carton_backing.prove_attribution` requires every field of a line to be proven that way before a medium-confidence flag is discharged, never reads the extractor's note, and never accepts document agreement as evidence. When you next reach for "the two sources agree", first write down how they could have disagreed. If you can't, the agreement is not a second source.
+
 
 ## 9. How to recover when something breaks
 

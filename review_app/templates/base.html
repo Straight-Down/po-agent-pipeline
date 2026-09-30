@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}PO review{% endblock %}</title>
+<style>
+  :root { --ink:#1d2330; --muted:#5f6b7a; --line:#dfe3ea; --bg:#f6f7f9; --card:#fff;
+          --flag:#b45309; --flagbg:#fff7ed; --alarm:#b91c1c; --alarmbg:#fef2f2;
+          --info:#1d4ed8; --infobg:#eff6ff; --ok:#15803d; --okbg:#f0fdf4; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+         color:var(--ink); background:var(--bg); }
+  header.bar { display:flex; justify-content:space-between; align-items:center;
+               padding:10px 20px; background:var(--ink); color:#fff; }
+  header.bar a { color:#fff; margin-right:16px; text-decoration:none; }
+  .who { font-weight:600; background:#fff2; padding:3px 10px; border-radius:12px; }
+  main { max-width:1280px; margin:0 auto; padding:20px; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  h2 { font-size:16px; margin:24px 0 8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
+          padding:14px 16px; margin-bottom:14px; }
+  table { width:100%; border-collapse:collapse; background:var(--card); }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line);
+           vertical-align:top; }
+  th { font-size:12px; color:var(--muted); font-weight:600; }
+  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  .muted { color:var(--muted); }
+  .tag { display:inline-block; font-size:11px; font-weight:600; padding:1px 7px;
+         border-radius:10px; border:1px solid currentColor; white-space:nowrap; }
+  .t-flag { color:var(--flag); background:var(--flagbg); }
+  .t-alarm { color:var(--alarm); background:var(--alarmbg); }
+  .t-info { color:var(--info); background:var(--infobg); }
+  .t-ok { color:var(--ok); background:var(--okbg); }
+  .group-flag { border-left:4px solid var(--flag); }
+  .warn { background:var(--alarmbg); border-color:#fecaca; }
+  .info { background:var(--flagbg); border-color:#fed7aa; }
+  details.more { margin-top:6px; }
+  details.more > summary { cursor:pointer; color:var(--muted); font-size:12px; }
+  details.more[open] > summary { margin-bottom:4px; }
+  .plain { margin:0 0 4px; }
+  .ref { background:var(--infobg); border-color:#bfdbfe; }
+  .note { white-space:pre-wrap; max-width:420px; }
+  button { font:inherit; padding:7px 14px; border-radius:6px; border:1px solid var(--ink);
+           background:var(--ink); color:#fff; cursor:pointer; }
+  button[disabled] { opacity:.45; cursor:not-allowed; }
+  button.secondary { background:#fff; color:var(--alarm); border-color:var(--alarm); }
+  textarea, input[type=date] { font:inherit; padding:6px; border:1px solid var(--line);
+                               border-radius:6px; }
+  textarea { width:100%; min-height:60px; }
+  .actions { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width: 800px) { .actions { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<header class="bar">
+  <nav><a href="/">Purchase orders to review</a></nav>
+  <span class="who">Reviewing as {{ reviewer }}</span>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

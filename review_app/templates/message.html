@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<div class="card info">
+  <p class="plain">{{ message }}</p>
+  {% if detail %}<details class="more"><summary>Details</summary><p class="muted">{{ detail }}</p></details>{% endif %}
+</div>
+<p><a href="/">Back to the list</a></p>
+{% endblock %}

@@ -115,7 +115,7 @@ Confirms success/failure back to Paula (and optionally Kiko) — email or Teams 
 | NetSuite | SuiteTalk REST Web Services | Confirmed available on the account; standard REST API handles the sublist writes directly, no RESTlet needed (§6) |
 | LLM | Anthropic API (Claude) | Flexible-format extraction, human-readable change summaries |
 | Database | **Azure SQL Database, serverless compute tier** | See below |
-| Review UI | Email-approval for v1, **approve/reject per PO** — PROPOSED, pending Paula (see `PO-Update-Automation-Phase3-Requirements.md` §6) | Keeps v1 scope small and matches the HTTP-trigger design below. **Not per shipment:** one Inprotex sheet interleaves six POs, so a shipment-level click fires writes across unrelated orders (§6.2). Any PO carrying a date needs a form, not a bare Approve button (§4.1, §6.1) |
+| Review UI | **v1 built 2026-09-30: a local FastAPI app** (`review_app/`, 127.0.0.1, no auth), **approve/reject per PO** — CONFIRMED by Paula 2026-09-16 (see `PO-Update-Automation-Phase3-Requirements.md` §6). Hosting it (Azure, auth) is later work | Keeps v1 scope small and matches the HTTP-trigger design below. **Not per shipment:** one Inprotex sheet interleaves six POs, so a shipment-level click fires writes across unrelated orders (§6.2). Any PO carrying a date needs a form, not a bare Approve button (§4.1, §6.1) |
 
 #### Hosting & trigger decision
 

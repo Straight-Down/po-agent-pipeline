@@ -35,11 +35,11 @@ The column that matters is the second-to-last: **six of these the build plan doe
 
 | # | Requirement | Recorded in | In the plan? | Status |
 |---|---|---|---|---|
-| 1 | Verdict on every line, incl. accepted-unchanged | Build plan item 2 · `Schema-Rationale.md` §8 · `schema.py` `VIEW_CALIBRATION` · `ingest.py` | **yes** | DECIDED BUT UNBUILT |
+| 1 | Verdict on every line, incl. accepted-unchanged | Build plan item 2 · `Schema-Rationale.md` §8 · `schema.py` `VIEW_CALIBRATION` · `ingest.py` | **yes** | BUILT AND TESTED (review_app v1, 2026-09-30) |
 | 2 | `ns_line_is_open` read from two places | Build plan item 2 · `RUNBOOK.md` §7 · `matcher.POLine` | **yes** | BUILT AND TESTED |
 | 3 | Assignment groups presented as groups | Build plan item 2 · `Architecture.md` §6.3 · `matcher._assignment_payload` | **yes** | DECIDED BUT UNBUILT |
-| 4 | Ordered-vs-shipped document summary | `RUNBOOK.md` §7 | no | DECIDED BUT UNBUILT |
-| 5 | Show the note, not the confidence level | `RUNBOOK.md` §7 · `Architecture.md` §6.2 | no | DECIDED BUT UNBUILT |
+| 4 | Ordered-vs-shipped document summary | `RUNBOOK.md` §7 | no | BUILT AND TESTED (review_app v1) |
+| 5 | Say what to check, not the confidence level | `RUNBOOK.md` §7 · `Architecture.md` §6.2 | no | BUILT AND TESTED (review_app v1) |
 | 6 | Approval unit chosen deliberately | `RUNBOOK.md` §7 · `Schema-Rationale.md` §1 · `Architecture.md` §6.2 | no | **CONFIRMED** 2026-09-16 |
 | 7 | Partial-failure semantics | `RUNBOOK.md` §7 · `Schema-Rationale.md` §6 · `Architecture.md` §6.2 | no | **CONFIRMED** 2026-09-16 |
 | 8 | The five figures, and that nothing gates on them | `Schema-Rationale.md` §10 · `schema.py` · `matcher._line_balance` | no | BUILT AND TESTED |
@@ -53,7 +53,7 @@ The column that matters is the second-to-last: **six of these the build plan doe
 
 ## 1. A verdict on EVERY line shown, including accepted-unchanged
 
-**DECIDED BUT UNBUILT.** The columns exist and are empty by design.
+**BUILT AND TESTED, 2026-09-30** (`review_app`): an Approve records `ACCEPTED`, reviewer and time on every line it covers, NO_CHANGE lines included; a Reject records `REJECTED` and the reason on every awaiting line. `test_review_app.test_approve_records_a_verdict_on_every_line`.
 
 > *"This only works if the review UI records a verdict on EVERY line it shows, including lines
 > accepted unchanged."* — `PO-Update-Automation-Schema-Rationale.md` §8
@@ -121,7 +121,7 @@ reject a double-assignment, so a per-row dropdown UI offers choices the database
 
 ## 4. An ordered-vs-shipped summary at the document level
 
-**DECIDED BUT UNBUILT.** Build plan: silent.
+**BUILT AND TESTED, 2026-09-30** (`review_app`, the per-PO page), for the lines on the slip: PO lines a slip does not mention have no row, so "ordered" is NetSuite's quantity on the lines the slip names. Build plan: silent.
 
 > *"A uniform overship is a document-level fact, and per-line review hides it. […] the approval unit
 > needs a document-level summary alongside the lines — ordered versus shipped for the whole PO, and
@@ -137,13 +137,21 @@ So nothing should *gate* on this figure — see §8. It is a display requirement
 
 ---
 
-## 5. Show the extractor's NOTE, not its confidence level
+## 5. Say what to check, not the confidence level
 
-**DECIDED BUT UNBUILT.** The plan quotes the measurement but draws only the calibration conclusion,
-not the display rule.
+**BUILT AND TESTED, 2026-09-30, AMENDED the same day.** What the code does (`review_app`): a flagged
+line leads with one plain sentence saying what to check — generated from the matcher's reason by
+`review_app/wording.py`, e.g. *"The tool had to work out part of this line itself. Check it against
+the packing slip before approving."* The extractor's own note, the raw reason and the confidence
+level are behind a collapsed **Details** toggle on the row. No confidence badge anywhere.
+
+**Why:** the reviewer needs to know what to check, not the parser's phrasing. The note stays one
+click away for when the plain sentence is not enough.
+
+The original rule, superseded in its first half and kept in its second:
 
 > *"the note is a first-class field on the review row, not a tooltip on a badge, and queue ordering
-> must not be built on the level alone."* — `RUNBOOK.md` §7
+> must not be built on the level alone."* — `RUNBOOK.md` §7 (amended there too)
 
 **Measured, both sides:**
 
@@ -525,8 +533,9 @@ the last of them**, including the two this document had raised as proposals:
 | Multi-batch (§12) | OPEN since 2026-08-10, code silently wrong | **accumulate** — built, migration 0007 |
 | Approver (§13) | OPEN since the architecture doc | **Paula only**, no delegation |
 
-**What is left is work, not decisions.** Entries 1, 3, 4 and 5 are DECIDED BUT UNBUILT — they
-describe a screen nobody has written yet. Entry 12 is the only one of the four rulings that needed
+**What is left is work, not decisions.** Entries 1, 4 and 5 are built in review_app v1 (2026-09-30).
+Entry 3 (assignment groups) is still DECIDED BUT UNBUILT: v1 REFUSES to render a PO holding one,
+and NEEDS_RESOLUTION, rather than guess at a picker no real data has exercised. Entry 12 is the only one of the four rulings that needed
 code, and it has it.
 
 **One thing to carry into the build rather than rediscover:** §13 means the queue has no drain while

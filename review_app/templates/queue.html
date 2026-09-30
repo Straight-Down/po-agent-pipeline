@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}{{ heading }}{% endblock %}
+{% block content %}
+<h1>{{ heading }}</h1>
+{% if not entries %}
+<div class="card muted">Nothing to review right now.</div>
+{% else %}
+<table>
+  <thead><tr>
+    <th>PO</th><th>Vendor</th><th>Email received</th><th>What's needed</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for e in entries %}
+    {% set v = e.view %}
+    <tr>
+      <td><a href="/po/{{ v.id }}">{{ v.shipment_po.po_number_printed }}</a>
+        {% if v.shipment_po.ns_tranid %}<br><span class="muted">{{ v.shipment_po.ns_tranid }}</span>{% endif %}</td>
+      <td>{{ v.shipment.vendor_name or "–" }}</td>
+      <td>{{ (v.message or {}).get("received_at") or "–" }}</td>
+      <td>{{ e.status }}</td>
+      <td>{% if e.escalated %}<span class="tag t-flag">some lines not counted as shipped</span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% if no_action_view is defined %}
+<details class="more"><summary>Details</summary>
+  <p class="muted">Every PO here had no open matched NetSuite line (and no open candidate line)
+  when its packing slip was processed. The queue never shows them.</p>
+  <ul>{% for e in entries %}<li>{{ e.view.shipment_po.po_number_printed }}: {% for ln in e.view.lines %}{{ ln.state }}{{ ", " if not loop.last }}{% endfor %}</li>{% endfor %}</ul>
+</details>
+{% endif %}
+{% endblock %}

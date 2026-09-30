@@ -180,7 +180,8 @@ heavily than the code it can read. Known drift as of 2026-09-14:
   `graph_client.py` (a four-method Graph interface with a mock and a real
   client), `poller.py` (the polling job and the content-addressed attachment
   store) and `extract_pending.py` (the ingest -> extraction driver, a separate
-  command by design).
+  command by design). Since 2026-09-30, `review_app/`: the Phase 3 review UI
+  v1 (local FastAPI, 127.0.0.1, no auth; approving sets APPROVED and stops).
 - "Nothing here has touched production data" should be re-confirmed rather
   than assumed, given how much has been built since.
 
@@ -452,4 +453,15 @@ not as history - a rule without its failure mode gets rationalised away.
   lesson 31). Sandbox reads PO 1624 lines 5/6 as 44/44 and 22/22; production
   reads 44/52 and 22/23. The tool's 52 and 23 are right, and would have scored
   as false positives against the stale copy.
+- **The review app must never import `netsuite_client`** - nor `matcher` or
+  `ingest`, which import it. Approving sets APPROVED and stops; the write path
+  is separate work. `test_review_app_never_imports_netsuite_client` checks the
+  source AND a fresh interpreter's `sys.modules`, so a transitive import fails too.
+- **"Is any line open?" must read `change_candidates` as well as the row.** A
+  line with no chosen target (NEEDS_RESOLUTION) has `ns_line_is_open` NULL and
+  its open candidates in `change_candidates` (Requirements §2). Reading the row
+  alone parked a PO with two OPEN lines in "no action possible".
+- **A verdict names a decision-maker, and nothing defaults one.** `review_app`
+  will not start without `PO_AGENT_REVIEWER`; with no login, a default would
+  put a real person's name on clicks they never made.
 - <add the next one here>

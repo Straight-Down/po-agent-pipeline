@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}PO {{ view.shipment_po.po_number_printed }} can't be reviewed here yet{% endblock %}
+{% block content %}
+<h1>PO {{ view.shipment_po.po_number_printed }} can't be reviewed here yet</h1>
+<div class="card info">
+  <p class="plain">Some items on this packing slip could go to more than one line on the PO,
+  and choosing between them isn't built yet. So none of this PO can be approved or rejected
+  here for now. Let Kiko know it's waiting.</p>
+  <details class="more"><summary>Details</summary>
+    <p class="muted">The page is refused rather than shown without these lines, so the PO can't
+    be approved with lines missing. {{ view.refused_lines|length }} line(s):</p>
+    <table>
+      <thead><tr><th>Line</th><th>State</th><th>Recap label</th><th class="n">Slip qty</th><th>Reason</th></tr></thead>
+      <tbody>
+      {% for ln in view.refused_lines %}
+        <tr><td>{{ ln.label }}</td><td>{{ ln.state }}</td><td>{{ ln.src_recap_label or "–" }}</td>
+            <td class="n">{{ ln.src_quantity_text }}</td><td class="note">{{ ln.attention_reason or "" }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted">NEEDS_ASSIGNMENT: several shipment rows (e.g. By Sea / By UPS) and several PO
+    lines share one key; one choice constrains the others (Requirements §3). NEEDS_RESOLUTION:
+    one shipment row matches several open PO lines.</p>
+  </details>
+</div>
+{% endblock %}

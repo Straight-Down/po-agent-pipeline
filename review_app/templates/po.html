@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}PO {{ view.shipment_po.po_number_printed }}{% endblock %}
+
+{% macro status(ln) -%}
+  {%- if ln.disposition == "decided" -%}
+    {%- if ln.human_verdict == "REJECTED" -%}<span class="tag t-alarm">Rejected</span> <span class="muted">by {{ ln.verdict_by }}</span>
+    {%- elif ln.human_verdict -%}<span class="tag t-ok">Approved</span> <span class="muted">by {{ ln.verdict_by }}</span>
+    {%- else -%}<span class="muted">Already handled</span>{%- endif -%}
+  {%- elif ln.disposition == "block" -%}<strong>Can't be approved yet</strong>
+  {%- elif ln.disposition == "accept_no_change" -%}No change needed
+  {%- elif ln.flagged -%}<strong>Check, then approve with the PO</strong>
+  {%- else -%}Ready to approve
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro rows(lines) %}
+<table>
+  <thead><tr>
+    <th>Item</th><th class="n">NetSuite line</th><th class="n">Ordered</th><th class="n">Received</th>
+    <th class="n">Still to receive</th><th class="n">On this slip</th><th class="n">Proposed total</th>
+    <th>What to do</th><th>Document</th>
+  </tr></thead>
+  <tbody>
+  {% for ln in lines %}
+    <tr>
+      <td>{{ ln.label }}{% if ln.src_recap_label %}<br><span class="muted">{{ ln.src_recap_label }}</span>{% endif %}</td>
+      <td class="n">{{ ln.ns_line_id or "–" }}</td>
+      <td class="n">{{ ln.current_quantity|qty }}</td>
+      <td class="n">{{ ln.current_quantity_received|qty }}</td>
+      <td class="n">{{ ln.outstanding|qty }}</td>
+      <td class="n">{{ ln.src_quantity_text or "–" }}</td>
+      <td class="n"><strong>{{ ln.proposed_quantity|qty }}</strong>
+        {% if ln.accumulation_basis == "ACCUMULATED" %}<br><span class="muted">adds to {{ ln.accumulation_base_quantity|qty }} already recorded</span>{% endif %}</td>
+      <td class="note">
+        <p class="plain">{{ status(ln) }}</p>
+        {% if ln.accumulation_basis == "PRE_EXISTING_RECEIPT" %}<span class="tag t-info">already received in NetSuite</span>
+        {% elif ln.accumulation_basis == "DISPUTED" %}<span class="tag t-alarm">changed in NetSuite since last seen</span>{% endif %}
+        {% for r in ln.plain_reasons %}<p class="plain">{{ r }}</p>{% endfor %}
+        {% if ln.override_protected and ln.disposition in ("approve", "accept_no_change") %}<p class="plain">Someone already set a receipt date on this line in NetSuite, so a date you enter won't be applied to it.</p>{% endif %}
+        {% if ln.disposition == "decided" and ln.human_verdict == "REJECTED" and ln.human_verdict_note %}<p class="plain muted">Reason: {{ ln.human_verdict_note }}</p>{% endif %}
+        <details class="more"><summary>Details</summary>
+          <div class="muted">
+            State: {{ ln.state }}{% if ln.accumulation_basis %} · basis: {{ ln.accumulation_basis }}{% endif %}
+            · extraction confidence: {{ ln.extraction_confidence }}{% if ln.source_hint %} · source: {{ ln.source_hint }}{% endif %}
+            {% if ln.extraction_note %}<br>Extractor's note: {{ ln.extraction_note }}{% endif %}
+            {% if ln.attention_reason %}<br>Tool's reason: {{ ln.attention_reason }}{% endif %}
+            {% if ln.block_reason %}<br>Why it can't be approved: {{ ln.block_reason }}{% endif %}
+          </div>
+        </details>
+      </td>
+      <td>{% if ln.source_sha256 %}<a href="/source/{{ ln.id }}">Open</a>{% else %}<span class="muted">none on file</span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+
+{% block content %}
+{% set po = view.shipment_po %}
+<h1>PO {{ po.po_number_printed }}{% if po.ns_tranid %} <span class="muted">· {{ po.ns_tranid }} in NetSuite</span>{% endif %}</h1>
+<p class="muted">{{ view.shipment.vendor_name or "Vendor not stated" }}
+  {% if view.message %} · “{{ view.message.subject }}” · received {{ view.message.received_at }}{% endif %}</p>
+
+{% if view.rows_lost_message %}
+<div class="card info">
+  <p class="plain">{{ view.rows_lost_message }}</p>
+  <details class="more"><summary>Details</summary><div class="muted">
+    {{ view.rows_lost.lines_removed }} of {{ view.rows_lost.lines_extracted }} extracted lines removed
+    ({{ "%.0f"|format(100 * view.rows_lost.lines_removed / view.rows_lost.lines_extracted) if view.rows_lost.lines_extracted else "–" }}%).
+    <ul>{% for r in view.rows_lost.removed %}<li>{{ r.source_hint or "no row" }} · {{ r.key }} = {{ r.quantity }} · {{ r.reason }}</li>{% endfor %}</ul>
+  </div></details>
+</div>
+{% endif %}
+
+<div class="card">
+  <p class="plain"><strong>What arrived.</strong> {{ view.summary_sentence }}</p>
+  {% set s = view.summary %}
+  <details class="more"><summary>Details</summary><div class="muted">
+    Lines on the slip: {{ s.lines_on_slip }}; units on the slip: {{ s.shipped_total|qty }}.
+    {% if s.matched_lines %}Matched to NetSuite: {{ s.matched_lines }} lines; ordered {{ s.ordered_on_matched|qty }},
+    shipped {{ s.shipped_on_matched|qty }}, difference {{ s.variance|qty }}{% if s.variance_pct is not none %} ({{ "%+.1f"|format(s.variance_pct * 100) }}%){% endif %};
+    {{ s.over }} over, {{ s.under }} under, {{ s.equal }} equal.{% endif %}
+    “Ordered” is NetSuite's current quantity on the lines this slip names; PO lines the slip does not mention are not shipped yet and have no row here.
+  </div></details>
+</div>
+
+<div class="card ref">
+  {% if view.shipment.vendor_etd or view.shipment.vendor_eta %}
+  <p class="plain">The vendor says it {% if view.shipment.vendor_etd %}leaves {{ view.shipment.vendor_etd }}{% endif %}{% if view.shipment.vendor_etd and view.shipment.vendor_eta %} and {% endif %}{% if view.shipment.vendor_eta %}arrives {{ view.shipment.vendor_eta }}{% endif %}.
+  That's for your reference only. If you enter a receipt date below, use your own.</p>
+  {% else %}<p class="plain">The vendor didn't give shipping dates.</p>{% endif %}
+</div>
+
+{% if view.warnings %}
+<details class="more card"><summary>Details: everything the tool noted while reading this packing slip ({{ view.warnings|length }})</summary>
+  <ul class="muted">{% for w in view.warnings %}<li>{{ w }}</li>{% endfor %}</ul></details>
+{% endif %}
+
+{% if view.flagged_lines %}
+{% if view.can_approve %}
+<h2>{{ view.flagged_lines|length }} line{{ "s" if view.flagged_lines|length != 1 }} to check before approving</h2>
+<p class="muted">Approving the PO includes these. Each says what to check.</p>
+{% else %}
+<h2>{{ view.flagged_lines|length }} line{{ "s" if view.flagged_lines|length != 1 }} that need attention</h2>
+<p class="muted">Each says why. Your decision is at the bottom of the page.</p>
+{% endif %}
+<div class="group-flag">{{ rows(view.flagged_lines) }}</div>
+{% endif %}
+{% if view.other_lines %}
+<h2>{{ "Other lines" if view.flagged_lines else "Lines" }} ({{ view.other_lines|length }})</h2>
+{{ rows(view.other_lines) }}
+{% endif %}
+
+{% if view.awaiting %}
+<h2>Your decision</h2>
+<div class="actions">
+  <form class="card" method="post" action="/po/{{ view.id }}/approve">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <input type="hidden" name="fingerprint" value="{{ view.fingerprint }}">
+    {% if view.can_approve %}
+      <p><label>Receipt date (optional)<br>
+        <input type="date" name="receipt_date" value=""></label><br>
+        <span class="muted">Leave it empty to approve the quantities now and add the date later.</span></p>
+      {% if view.override_protected_covered %}
+        <p class="plain">Someone already set a receipt date in NetSuite on {{ view.override_protected_covered|length }} of these lines, so a date you enter won't be applied to {{ "them" if view.override_protected_covered|length != 1 else "it" }}:
+        {{ view.override_protected_covered|map(attribute="label")|join(", ") }}.</p>
+      {% endif %}
+      <button type="submit">{{ view.approve_label }}</button>
+      <p class="muted">This records your approval. Nothing changes in NetSuite yet.</p>
+    {% else %}
+      {% for message, count in view.block_explanations %}<p class="plain">{{ message }}</p>{% endfor %}
+      <button type="submit" disabled>Approve</button>
+      <details class="more"><summary>Details</summary><ul class="muted">
+        {% for ln in view.blocking %}<li>{{ ln.label }}: {{ ln.block_reason }}</li>{% endfor %}</ul></details>
+    {% endif %}
+  </form>
+  <form class="card" method="post" action="/po/{{ view.id }}/reject">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <input type="hidden" name="fingerprint" value="{{ view.fingerprint }}">
+    <p><label>Why are you rejecting this PO? (required)<br>
+      <textarea name="reason" required maxlength="1000"></textarea></label></p>
+    <button type="submit" class="secondary">Reject this PO</button>
+    <p class="muted">Nothing on this PO will be updated. Your reason is saved with it.</p>
+  </form>
+</div>
+{% else %}
+<div class="card">This PO has been decided. Nothing to do.</div>
+{% endif %}
+{% endblock %}

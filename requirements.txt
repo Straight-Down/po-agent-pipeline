@@ -24,3 +24,7 @@ pdfplumber>=0.11           # PDF text layer
 # Used by scripts/probe_graph_auth.py; the pipeline itself runs against the
 # mock until GRAPH_CLIENT=real, so this is not yet on any hot path.
 msal>=1.38                 # Entra token acquisition with a certificate credential
+fastapi>=0.115             # review_app: the local Phase 3 review UI (v1)
+uvicorn>=0.30              # review_app: serves it on 127.0.0.1 only
+jinja2>=3.1                # review_app: page templates (autoescaped)
+python-multipart>=0.0.9    # review_app: form posts (approve / reject)

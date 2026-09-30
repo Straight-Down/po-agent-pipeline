@@ -64,6 +64,58 @@ if os.environ.get("PO_AGENT_DB_URL"):
 
 target_metadata = metadata
 
+#: Names the ONE database a run may migrate when it is not a `*-test` database.
+CONFIRM_ENV = "PO_AGENT_MIGRATE_CONFIRM"
+
+
+class MigrationRefused(RuntimeError):
+    """A migration was pointed at a database that was not confirmed for this run."""
+
+
+def _require_test_or_confirmed(url: str) -> None:
+    """
+    Refuse to migrate anything but a `*-test` database unless THIS run names it.
+
+    A second copy, one layer down, of the harness's `-test` rule
+    (`dialect_target._require_disposable`), so a hand-run `alembic upgrade head`
+    is refused too -- not only the suite. The test and production databases sit
+    on the same server, and until 2026-10-01 a single string check in the harness
+    was all that stood between a destructive run and `sqldb-po-agent`.
+
+    Unlike the harness, this layer has a way through, because real databases DO
+    need migrating (production at cutover, `po_agent.db`, a run database). The way
+    through names its target: `PO_AGENT_MIGRATE_CONFIRM` must equal this
+    database's name exactly -- `sqldb-po-agent`, or a SQLite file's name such as
+    `po_agent.db`. There is deliberately no generic "force" flag: a URL that points
+    somewhere unexpected is still refused, because the confirmation names where
+    you meant to go.
+
+    Offline mode (`--sql`) is not checked: it only prints SQL and opens nothing.
+    Never echoes the URL -- only host and database name, never a password.
+    """
+    from sqlalchemy.engine import make_url
+
+    from dialect_target import TEST_DATABASE_SUFFIX
+
+    parsed = make_url(url)
+    database = parsed.database
+    if not database or database == ":memory:":
+        return  # in-memory SQLite: nothing survives the run
+    name = Path(database).name if parsed.get_backend_name() == "sqlite" else database
+    stem = name.rsplit(".", 1)[0] if name.rsplit(".", 1)[-1] in ("db", "sqlite", "sqlite3") else name
+    if stem.endswith(TEST_DATABASE_SUFFIX):
+        return
+    confirm = (os.environ.get(CONFIRM_ENV) or "").strip()
+    if confirm and confirm == name:
+        return
+    where = f"{parsed.host}/{name}" if parsed.host else name
+    raise MigrationRefused(
+        f"Refusing to migrate {where!r}: it is not a '*{TEST_DATABASE_SUFFIX}' database and "
+        f"this run has not confirmed it. To migrate it deliberately, set "
+        f"{CONFIRM_ENV}={name} for this command only."
+        + (f" ({CONFIRM_ENV} is set, but to {confirm!r}.)" if confirm else "")
+    )
+
 
 def run_migrations_offline() -> None:
     """Emit SQL to stdout instead of running it -- for reviewing what will happen."""
@@ -80,6 +132,7 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    _require_test_or_confirmed(config.get_main_option("sqlalchemy.url"))
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

@@ -336,6 +336,12 @@ not as history - a rule without its failure mode gets rationalised away.
   variable serving both roles is set correctly for at most one of them. It was
   once found naming the production database while the instruction said test.
   No override - rename the database. RUNBOOK section 8 lesson 25.
+  **Alembic has the same rule one layer down** (`migrations/env.py`, 2026-10-01):
+  a hand-run `alembic upgrade`/`downgrade` refuses any non-`*-test` database
+  unless `PO_AGENT_MIGRATE_CONFIRM` equals THAT database's name for the run
+  (`sqldb-po-agent`, `po_agent.db`, a run file's name). No generic force flag.
+  Set it for ONE command and clear it: left in a shell it re-authorises later runs.
+  Name throwaway migration files `*-test.db` or they are refused too.
 - **A migration that alters a table any VIEW depends on must DROP those views
   first and recreate them after.** Documented since 0002 and forgotten anyway,
   three times; now enforced by

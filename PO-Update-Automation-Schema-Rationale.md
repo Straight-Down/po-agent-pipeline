@@ -284,6 +284,8 @@ alembic check               # metadata vs migrations drift
 alembic revision --autogenerate -m "what changed"
 ```
 
+**Since 2026-10-01 these are refused** against any database whose name does not end in `-test`, unless `PO_AGENT_MIGRATE_CONFIRM` names that exact database for the run (`migrations/env.py`; RUNBOOK section 8 lesson 25). Set it for one command and clear it after -- left in a shell, it re-authorises every later run against that name.
+
 **Do not edit a migration that has been applied anywhere.** Change `schema.py` and generate a new revision.
 
 **The state machine is seeded by the migration** as a data migration, not at application startup, so a fresh database is immediately consistent and the legal transitions cannot disagree with the code.

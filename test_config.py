@@ -692,6 +692,218 @@ def test_connection_retry_is_bounded_narrow_and_counted() -> None:
         engine.dispose()
 
 
+def test_a_test_is_rerun_only_for_the_link_bounded_and_counted() -> None:
+    section("a whole test is re-run only when the LINK failed: bounded, and counted")
+    from types import SimpleNamespace
+
+    from sqlalchemy.exc import IntegrityError, OperationalError
+
+    import dialect_target as dt
+
+    class Dbapi(Exception):
+        """Shaped like a pyodbc error: args[0] is the SQLSTATE."""
+
+    # --- what counts as the link ------------------------------------------
+    dropped = OperationalError("DROP TABLE x", (), Dbapi("08S01", "link failure"))
+    try:
+        try:
+            raise Dbapi("08001", "login timeout")
+        except Dbapi as inner:
+            raise RuntimeError("wrapped by a caller") from inner
+    except RuntimeError as exc:
+        chained = exc
+    def raised(build):
+        try:
+            build()
+        except BaseException as exc:  # noqa: BLE001 -- capturing it is the point
+            return exc
+        raise AssertionError("nothing raised")
+
+    def unreachable_from(state):
+        def build():
+            try:
+                raise Dbapi(state, "simulated")
+            except Dbapi as inner:
+                raise dt.TargetUnreachable("could not be reached") from inner
+        return raised(build)
+
+    def assert_while_handling():
+        try:
+            raise Dbapi("08S01", "link failure")
+        except Dbapi:
+            assert 9 == 50  # noqa: PT017 -- an assertion with the link as its CONTEXT
+
+    def pytest_fail_while_handling():
+        import pytest
+
+        try:
+            raise Dbapi("08S01", "link failure")
+        except Dbapi:
+            pytest.fail("the test's own verdict")
+
+    def other_error_while_handling():
+        try:
+            raise Dbapi("08S01", "link failure")
+        except Dbapi:
+            raise KeyError("unrelated")  # noqa: B904 -- implicit context is the case
+
+    for label, exc, expected in (
+            ("a link failure mid-statement, as SQLAlchemy wraps it", dropped, True),
+            ("TargetUnreachable caused by a login TIMEOUT", unreachable_from("HYT00"), True),
+            ("TargetUnreachable caused by a REFUSED login", unreachable_from("28000"), False),
+            ("TargetUnreachable with no cause at all", dt.TargetUnreachable("down"), False),
+            ("a login timeout re-raised FROM by other code", chained, True),
+            ("an assert raised WHILE HANDLING a link failure",
+             raised(assert_while_handling), False),
+            ("pytest.fail() raised while handling a link failure",
+             raised(pytest_fail_while_handling), False),
+            ("an unrelated error raised while handling one (implicit context only)",
+             raised(other_error_while_handling), False),
+            ("an AssertionError", AssertionError("9 != 50"), False),
+            ("a constraint violation",
+             IntegrityError("INSERT", (), Dbapi("23000", "duplicate key")), False),
+            ("a syntax error", OperationalError("SELECT", (), Dbapi("42000", "near '1'")), False),
+            ("a superseded engine", dt.SupersededEngine("stale"), False)):
+        check(dt.is_connection_class(exc) is expected,
+              f"{label} is {'' if expected else 'NOT '}connection-class")
+
+    # --- the loop -----------------------------------------------------------
+    link = [SimpleNamespace(connection_failure=True)]
+    clean = [SimpleNamespace(connection_failure=False)]
+
+    def runner(outcomes):
+        runs = []
+
+        def run_once():
+            runs.append(1)
+            return outcomes[min(len(runs), len(outcomes)) - 1]
+
+        return run_once, runs
+
+    saved = dt.test_retries, list(dt.retried_tests)
+    try:
+        dt.test_retries, dt.retried_tests[:] = 0, []
+        check(dt.rerun_summary() == "database link: 0 tests re-run",
+              "zero re-runs is said out loud")
+
+        slept: list = []
+        run_once, runs = runner([link, clean])
+        got = dt.run_test_with_retries("t.py::a", run_once, sleep=slept.append)
+        check(got is clean and len(runs) == 2,
+              "a test that lost the link once is run again, from the start",
+              f"{len(runs)} run(s)")
+
+        run_once, runs = runner([link])
+        got = dt.run_test_with_retries("t.py::b", run_once, sleep=slept.append)
+        check(len(runs) == dt.TEST_RETRIES + 1 and got is link,
+              "a test that keeps losing it is re-run at most twice, then FAILS",
+              f"{len(runs)} run(s)")
+
+        run_once, runs = runner([clean])
+        dt.run_test_with_retries("t.py::c", run_once, sleep=slept.append)
+        check(len(runs) == 1, "a test that did not fail on the link runs once", f"{len(runs)}")
+
+        check(dt.test_retries == 3 and dt.retried_tests == ["t.py::a", "t.py::b", "t.py::b"],
+              "every re-run is counted against the test that needed it",
+              f"{dt.test_retries}: {dt.retried_tests}")
+        summary = dt.rerun_summary()
+        check("3 test re-run(s)" in summary and "t.py::a x1" in summary
+              and "t.py::b x2" in summary and "not a clean run" in summary,
+              "and the summary names them and says the run was not clean", summary[:70])
+    finally:
+        dt.test_retries, dt.retried_tests[:] = saved
+
+    # --- the REAL hook, end to end ------------------------------------------
+    # The fakes above prove the loop; this proves conftest is wired to it. A real
+    # pytest run over a probe file, with the target NAMED as a server so the hook
+    # is live. Nothing connects: no `--mssql`, and the probe builds no engine.
+    import os
+    import re
+    import subprocess
+    import sys
+    import tempfile
+    import textwrap
+
+    probe = textwrap.dedent('''
+        from sqlalchemy.exc import OperationalError
+
+        import dialect_target as dt
+
+        RUNS = {}
+        _results = []
+
+
+        class Dbapi(Exception):
+            pass
+
+
+        def _ran(name):
+            RUNS[name] = RUNS.get(name, 0) + 1
+            return RUNS[name]
+
+
+        def _link():
+            return OperationalError("DROP TABLE x", (), Dbapi("08S01", "simulated"))
+
+
+        def test_a_link_fails_once_then_passes():
+            if _ran("once") == 1:
+                raise _link()
+
+
+        def test_b_link_fails_every_time():
+            _ran("always")
+            raise _link()
+
+
+        def test_c_assertion_failure():
+            _ran("assert")
+            assert 9 == 50
+
+
+        def test_d_recorded_check_false_then_link_drops():
+            _ran("check")
+            _results.append((False, "a check of the test's own", "9 != 50"))
+            raise _link()
+
+
+        def test_e_assert_while_handling_a_link_failure():
+            _ran("handled")
+            try:
+                raise _link()
+            except OperationalError:
+                assert 9 == 50
+
+
+        def test_z_report():
+            print("RUN COUNTS:", sorted(RUNS.items()))
+    ''')
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "test_rerun_probe.py"
+        path.write_text(probe, encoding="utf-8")
+        env = dict(os.environ)
+        env[dt.TARGET_ENV] = "mssql+pyodbc://u:p@nonexistent.invalid/probe-test?driver=X"
+        out = subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", "conftest", "--rootdir", str(HERE),
+             "-q", "-s", "-p", "no:cacheprovider", str(path)],
+            cwd=HERE, env=env, capture_output=True, text=True, timeout=180).stdout
+
+    counts = re.search(r"RUN COUNTS: (.*)", out)
+    check(bool(counts) and counts.group(1).strip() == str(
+        [("always", 3), ("assert", 1), ("check", 1), ("handled", 1), ("once", 2)]),
+          "under real pytest: the link-only failures are re-run (once -> 2 runs, always -> "
+          "3), and an assert, a failed check() and an assert-while-handling run ONCE",
+          counts.group(1).strip() if counts else out[-300:])
+    check("4 failed, 2 passed" in out,
+          "each test is reported once, by its LAST attempt -- discarded attempts add "
+          "nothing to the totals", (re.findall(r"\d+ failed.*", out) or [out[-200:]])[-1])
+    check("database link: 3 test re-run(s)" in out
+          and "test_a_link_fails_once_then_passes x1" in out
+          and "test_b_link_fails_every_time x2" in out
+          and "database link: 0 connection retries" in out,
+          "and BOTH counts are printed at the end, the connect-level zero included")
+
+
 def test_harness_refuses_a_non_disposable_database() -> None:
     section("the harness will only point at a database named disposable")
     import os
@@ -950,6 +1162,7 @@ def main() -> int:
         test_harness_refuses_to_run_as_dbo,
         test_a_superseded_engine_raises_instead_of_reading_another_tests_schema,
         test_connection_retry_is_bounded_narrow_and_counted,
+        test_a_test_is_rerun_only_for_the_link_bounded_and_counted,
         test_harness_refuses_a_non_disposable_database,
         test_no_unquoted_reserved_identifiers_in_handwritten_sql,
         test_no_test_builds_its_own_engine_unannounced,

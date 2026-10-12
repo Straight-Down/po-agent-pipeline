@@ -249,6 +249,100 @@ def retry_summary() -> str:
     )
 
 
+#: A test that fails on the LINK is re-run from the start at most this many times.
+TEST_RETRIES = 2
+#: How many whole-test re-runs this process made, and of which tests.
+test_retries = 0
+retried_tests: list = []
+
+
+def is_connection_class(exc) -> bool:
+    """
+    True if `exc`, or anything it wraps or was raised from, is the link failing.
+
+    A DBAPI error whose SQLSTATE is in `_CONNECTION_SQLSTATES`, reached through
+    SQLAlchemy's `.orig` and through `__cause__` -- the driver's error never
+    arrives bare. `TargetUnreachable` qualifies only THROUGH its cause:
+    `connect()` raises it for a refused login and a missing driver too, and
+    re-running a test three times against a refused login is the lockout the
+    connect-level filter exists to avoid.
+
+    Three things are deliberately False:
+
+    - **an assertion, whatever it was raised while handling.** `except Dbapi:
+      assert ...` and `pytest.fail()` inside an `except` carry the link error as
+      their implicit `__context__`. Following it would re-run an assertion
+      failure, and a re-run that passed would bury it. So the top-level
+      exception decides, and `__context__` is never followed -- only the
+      explicit `raise ... from`.
+    - a constraint violation, a syntax error, a refused login: findings.
+    - `SupersededEngine`: a bug in the test, not weather.
+    """
+    if isinstance(exc, AssertionError) or type(exc).__module__.startswith("_pytest."):
+        return False
+    seen = set()
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if _is_connection_failure(current):
+            return True
+        stack.extend((getattr(current, "orig", None), current.__cause__))
+    return False
+
+
+def run_test_with_retries(nodeid, run_once, sleep=None):
+    """
+    Run one test; re-run it FROM THE START if it failed on the link.
+
+    `run_once()` runs setup, call and teardown and returns the reports. A report
+    is retryable only if conftest marked it `connection_failure`, which it does
+    only when the test raised a connection-class error AND recorded no failed
+    check of its own -- an assertion failure is never retried, whatever else
+    happened in the same test.
+
+    Safe where a retry inside a transaction is not: every database-backed test
+    STARTS by dropping and rebuilding the schema (`fresh_engine()`, or the
+    migration tests' own `_drop_everything`), so a re-run inherits nothing from
+    the attempt before. That holds while fixtures are function-scoped, which
+    they all are: a module- or session-scoped fixture holding an engine would
+    be carried into the re-run, and pytest would replay its cached setup error
+    instead of reconnecting.
+    Returns the LAST attempt's reports; earlier attempts are counted and named
+    (`rerun_summary`), never shown as passes.
+    """
+    global test_retries
+    import time
+
+    sleep = sleep or time.sleep
+    for attempt in range(TEST_RETRIES + 1):
+        reports = run_once()
+        on_the_link = any(getattr(r, "connection_failure", False) for r in reports)
+        if not on_the_link or attempt == TEST_RETRIES:
+            return reports
+        test_retries += 1
+        retried_tests.append(nodeid)
+        sleep(CONNECT_BACKOFF_SECONDS[min(attempt, len(CONNECT_BACKOFF_SECONDS) - 1)])
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def rerun_summary() -> str:
+    """The test-level line for the end of a server run. Zero is said out loud."""
+    if test_retries == 0:
+        return "database link: 0 tests re-run"
+    counts: dict = {}
+    for nodeid in retried_tests:
+        counts[nodeid] = counts.get(nodeid, 0) + 1
+    named = ", ".join(f"{n} x{c}" for n, c in sorted(counts.items()))
+    return (
+        f"database link: {test_retries} test re-run(s) after a connection failure "
+        f"(up to {TEST_RETRIES} each) across {len(counts)} test(s): {named}. A test "
+        "listed here passed or failed on a LATER attempt -- this was not a clean run."
+    )
+
+
 def connect(sqlite_file=None):
     """
     An engine on the configured target, with the connection actually tested.

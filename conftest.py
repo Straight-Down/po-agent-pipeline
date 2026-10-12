@@ -113,6 +113,33 @@ def pytest_terminal_summary(terminalreporter):
 
     if not dt_target.is_sqlite():
         terminalreporter.write_line(dt_target.retry_summary())
+        terminalreporter.write_line(dt_target.rerun_summary())
+
+
+def pytest_runtest_protocol(item, nextitem):
+    """
+    On a server target, re-run a test that failed on the LINK -- from the start.
+
+    Only connection-class failures (`pytest_runtest_makereport` below decides,
+    and an assertion failure never qualifies), at most `TEST_RETRIES` times, and
+    every re-run is counted and named in the terminal summary. Only the last
+    attempt is reported, so a test is counted once. SQLite runs are untouched:
+    there is no link to fail.
+    """
+    import dialect_target as dt_target
+
+    if dt_target.is_sqlite():
+        return None
+
+    from _pytest.runner import runtestprotocol
+
+    item.ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+    reports = dt_target.run_test_with_retries(
+        item.nodeid, lambda: runtestprotocol(item, nextitem=nextitem, log=False))
+    for report in reports:
+        item.ihook.pytest_runtest_logreport(report=report)
+    item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+    return True
 
 
 @pytest.fixture
@@ -195,6 +222,15 @@ def pytest_runtest_makereport(item, call):
     """
     outcome = yield
     report = outcome.get_result()
+
+    # Is this failure the link? Decided here because this is where the exception
+    # is still in hand. Setup counts too: `fresh_engine()` is usually called in
+    # the test body, but a fixture that opens a connection fails in setup.
+    if report.when in ("setup", "call") and report.failed and call.excinfo is not None:
+        import dialect_target as dt_target
+
+        report.connection_failure = dt_target.is_connection_class(call.excinfo.value)
+
     if report.when != "call":
         return
 
@@ -210,6 +246,11 @@ def pytest_runtest_makereport(item, call):
     failed = [entry for entry in window if not entry[0]]
     if not failed:
         return
+
+    # A check of the test's own recorded FALSE: that is an assertion failure, and
+    # an assertion failure is never retried -- even if the link dropped later in
+    # the same test.
+    report.connection_failure = False
 
     lines = [f"{len(failed)} of {len(window)} check(s) recorded FALSE in {item.name}:"]
     for entry in failed:

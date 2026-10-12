@@ -66,7 +66,7 @@ class NotADisposableDatabase(Exception):
 #: Every database this harness may be pointed at must be named to end in this.
 #:
 #: NOT a convention -- a refusal, with no override and no escape hatch. The
-#: harness calls `_drop_everything()` on its target once per test, roughly 25
+#: harness calls `_drop_everything()` on its target once per test, roughly 85
 #: times a run: it is a destructive tool by design, and the only thing standing
 #: between it and a database that matters is the name it was handed.
 #:
@@ -174,7 +174,7 @@ def _require_disposable(url) -> None:
     raise NotADisposableDatabase(
         f"{TARGET_ENV} names the database {name!r}, which does not end in "
         f"{TEST_DATABASE_SUFFIX!r}.\n"
-        "This harness DROPS EVERY TABLE on its target once per test -- about 25 times "
+        "This harness DROPS EVERY TABLE on its target once per test -- about 85 times "
         "a run -- so it will only point at a database whose name says it is disposable. "
         "There is no override: if you genuinely need it here, rename the database.\n"
         f"(The variable is {TARGET_ENV}. Alembic reads a DIFFERENT one, PO_AGENT_DB_URL, "
@@ -182,9 +182,82 @@ def _require_disposable(url) -> None:
     )
 
 
-def connect():
+#: Connection ESTABLISHMENT is tried this many times in all, then it fails.
+CONNECT_ATTEMPTS = 3
+#: Seconds waited before the 2nd and 3rd attempts.
+CONNECT_BACKOFF_SECONDS = (2, 5)
+#: ODBC SQLSTATEs that mean "the connection could not be opened": link failure
+#: and login timeout. Deliberately not 28000 (login REFUSED) or anything else --
+#: a wrong password retried three times is three failed logins against a server
+#: that locks accounts, and an error that is not about the link is a finding.
+_CONNECTION_SQLSTATES = frozenset({"08001", "08S01", "HYT00", "HYT01"})
+
+#: How many times this process retried opening a connection. Printed at the end
+#: of every server run (`retry_summary`, conftest) -- a retry nobody is told
+#: about turns a degrading link into a green run.
+connect_retries = 0
+
+
+def _is_connection_failure(exc: BaseException) -> bool:
+    """True for a DBAPI error whose SQLSTATE says the connection never opened."""
+    state = exc.args[0] if exc.args else None
+    return isinstance(state, str) and state in _CONNECTION_SQLSTATES
+
+
+def _establish(open_connection, sleep=None):
+    """
+    Open one DBAPI connection, retrying a failed OPEN a bounded number of times.
+
+    **Only ever wraps the open itself.** A connection that does not exist yet
+    cannot be inside a transaction, so retrying here can never replay a
+    statement or paper over half-applied work. A statement that fails on an
+    established connection is not seen by this function at all and still fails
+    its test: that is a real event on a real link, and the suite should say so.
+    """
+    global connect_retries
+    import time
+
+    sleep = sleep or time.sleep
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        try:
+            return open_connection()
+        except Exception as exc:  # noqa: BLE001 -- re-raised unless it is the link
+            if attempt == CONNECT_ATTEMPTS or not _is_connection_failure(exc):
+                raise
+            connect_retries += 1
+            sleep(CONNECT_BACKOFF_SECONDS[attempt - 1])
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _retry_connection_establishment(engine) -> None:
+    """Route every new DBAPI connection this engine's pool opens through `_establish`."""
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "do_connect")
+    def _do_connect(dialect, _conn_rec, cargs, cparams):
+        return _establish(lambda: dialect.loaded_dbapi.connect(*cargs, **cparams))
+
+
+def retry_summary() -> str:
+    """One line for the end of a server run. Says zero out loud when it is zero."""
+    if connect_retries == 0:
+        return "database link: 0 connection retries"
+    return (
+        f"database link: {connect_retries} connection attempt(s) FAILED and were retried "
+        f"(up to {CONNECT_ATTEMPTS} tries each). The run's result stands, but the link "
+        "is degrading -- a count that grows between runs is the thing to act on."
+    )
+
+
+def connect(sqlite_file=None):
     """
     An engine on the configured target, with the connection actually tested.
+
+    `sqlite_file` is for a caller that needs the SQLite database in a FILE (the
+    review app answers on worker threads, and an in-memory SQLite database is
+    private to one connection). It is ignored on a server target, which is the
+    point: the caller keeps its file on SQLite and still moves with `--mssql`.
+    The file must be named `*-test.db`, like every other target.
 
     `create_engine` is lazy about the *server* -- it succeeds against one that is
     not running -- but eager about the *driver*, which it imports immediately. So
@@ -196,6 +269,10 @@ def connect():
     the module docstring for why that matters more here than anywhere else.
     """
     url = target_url()
+    if is_sqlite() and sqlite_file is not None:
+        from pathlib import Path
+
+        url = f"sqlite:///{Path(sqlite_file).as_posix()}"
     # Checked BEFORE any connection: refusing after connecting would already have
     # proved the credentials work against something that must not be touched.
     _require_disposable(url)
@@ -204,6 +281,9 @@ def connect():
 
     try:
         engine = sc.connect(url)
+        # Before the reachability test below, so the first connection of a run
+        # gets the same bounded retry as every later one.
+        _retry_connection_establishment(engine)
     except ModuleNotFoundError as exc:
         raise TargetUnreachable(
             f"{TARGET_ENV} is set to {_redacted(url)}, but its database driver is not "
@@ -299,17 +379,59 @@ def _drop_everything(engine) -> None:
         conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
 
 
-def fresh_engine():
+class SupersededEngine(Exception):
+    """An engine was used after a later `fresh_engine()` tore its schema down."""
+
+
+#: The engine `fresh_engine()` last handed out on a SERVER target. None on SQLite.
+_current_server_engine = None
+
+
+def _retire(engine) -> None:
+    """
+    Make every later use of `engine` raise `SupersededEngine` (2026-10-12).
+
+    In-memory SQLite gives each `fresh_engine()` call its own database, so a test
+    may hold two at once. A server target is ONE database: the second call drops
+    every table the first engine was looking at, and the first engine goes on
+    working -- against the second's schema, silently. Two tests copied "run 1's
+    rows" from an engine whose rows the next line had just dropped; they copied
+    nothing, and the failure read as "a stored verdict is not found on SQL
+    Server", a product defect that did not exist. Raising here names the real
+    cause at the line that has it.
+    """
+    from sqlalchemy import event
+
+    def refuse(_conn):
+        raise SupersededEngine(
+            "This engine came from an earlier fresh_engine() call. On a server target "
+            "every call rebuilds the SAME database, so the rows it held were dropped by "
+            "the later call. Read what you need from it BEFORE asking for the next one."
+        )
+
+    event.listen(engine, "engine_connect", refuse)
+    engine.dispose()
+
+
+def fresh_engine(sqlite_file=None):
     """
     A built, seeded schema with both views -- on whichever target is configured.
 
     The suites' own `fresh_db()` delegates here, so one environment variable
     moves every DB-backed test onto SQL Server without touching a test.
+    `sqlite_file`: see `connect`.
+
+    **On a server, each call invalidates the engine the previous call returned**
+    (`_retire`): there is one database, and this call is about to empty it.
     """
+    global _current_server_engine
     from sqlalchemy import text
 
-    engine = connect()
+    engine = connect(sqlite_file)
     if not is_sqlite():
+        if _current_server_engine is not None:
+            _retire(_current_server_engine)
+        _current_server_engine = engine
         # Persistent server: the previous test's schema is still there.
         _drop_everything(engine)
 

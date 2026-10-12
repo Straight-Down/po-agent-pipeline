@@ -59,7 +59,7 @@ def pytest_configure(config):
         # Deliberately do NOT read `.env` here. The connection string lives there,
         # so loading it unconditionally would put PO_AGENT_TEST_DB_URL in the
         # environment of EVERY run and quietly move the default loop onto Azure --
-        # ~25 schema teardowns over the network on every `pytest -q`. SQLite stays
+        # ~85 schema teardowns over the network on every `pytest -q`. SQLite stays
         # the default precisely because a slow loop is a loop people stop running.
         return
 
@@ -100,6 +100,19 @@ def pytest_report_header(config):
     import dialect_target as dt_target
 
     return dt_target.describe()
+
+
+def pytest_terminal_summary(terminalreporter):
+    """
+    Say how many connection attempts were retried, on every server run.
+
+    Printed when the count is zero too: a line that only appears when something
+    went wrong is a line nobody notices the absence of.
+    """
+    import dialect_target as dt_target
+
+    if not dt_target.is_sqlite():
+        terminalreporter.write_line(dt_target.retry_summary())
 
 
 @pytest.fixture

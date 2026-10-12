@@ -1648,6 +1648,26 @@ def _classification_snapshot(engine) -> dict:
     return {"attachments": attach, "proposals": keys, "roles": roles}
 
 
+def _db_inheriting_attachments(first_db):
+    """
+    A fresh database carrying `first_db`'s attachment rows -- what
+    `extract_pending --all` re-extracts into.
+
+    The rows are read BEFORE the fresh database is asked for. In-memory SQLite
+    hands out a separate database per `fresh_db()`; a server target is one
+    database, so the call drops `first_db`'s rows. Reading afterwards copied
+    nothing on SQL Server, and run 2 then asked the model again -- a failure of
+    this setup that read as the stored verdict not being found.
+    """
+    with first_db.connect() as src:
+        rows = [dict(row) for row in src.execute(select(attachments)).mappings().all()]
+    second_db = fresh_db()
+    with second_db.begin() as dst:
+        for row in rows:
+            dst.execute(attachments.insert(), row)
+    return second_db, len(rows)
+
+
 def test_classification_is_decided_once_and_replayed() -> None:
     section("one classification per ingest, stored, and replayed on re-extraction")
     from attachment_classifier import classifier_prompt_hash
@@ -1674,10 +1694,7 @@ def test_classification_is_decided_once_and_replayed() -> None:
         # 1's attachment rows -- which is how `extract_pending --all` re-extracts
         # into a fresh database. Same database would be a dedup no-op that parses
         # nothing and so proves nothing about the decision.
-        second_db = fresh_db()
-        with first_db.connect() as src, second_db.begin() as dst:
-            for row in src.execute(select(attachments)).mappings().all():
-                dst.execute(attachments.insert(), dict(row))
+        second_db, inherited = _db_inheriting_attachments(first_db)
         second, parses_2 = _ingest_real_classifier(second_db, docs, model, parsed)
         snap_2 = _classification_snapshot(second_db)
 
@@ -1691,6 +1708,8 @@ def test_classification_is_decided_once_and_replayed() -> None:
 
     check(first.created and second.created, "both runs created a shipment",
           f"{first.summary()} | {second.summary()}")
+    check(inherited == 2, "run 2's database really did inherit run 1's attachment rows",
+          f"{inherited} row(s) copied")
     check(calls_after_first == 1,
           "run 1 asked the model ONCE for the whole ingest (was twice: ingest + parse)",
           f"{calls_after_first} call(s)")
@@ -1817,14 +1836,17 @@ def test_sheet_choice_is_decided_once_and_replayed() -> None:
         _ingest_real_parse(first_db, [path], model)
         first = list(model.extracted)
         calls_after_first = model.sheet_calls
+        # Read what RUN 1 stored now, before any other database exists. Read at the
+        # end, on a server this was the CONTROL run's row -- the only one left.
+        with first_db.connect() as conn:
+            stored = json.loads(conn.execute(
+                select(attachments.c.sheet_verdicts_json)
+                .where(attachments.c.content_sha256 == sha)).scalar() or "[]")
 
         # Run 2: the SAME message into a second database that inherits run 1's
         # attachment rows -- how `extract_pending --all` re-extracts. The same
         # database would be a dedup no-op that parses nothing.
-        second_db = fresh_db()
-        with first_db.connect() as src, second_db.begin() as dst:
-            for row in src.execute(select(attachments)).mappings().all():
-                dst.execute(attachments.insert(), dict(row))
+        second_db, inherited = _db_inheriting_attachments(first_db)
         model.extracted.clear()
         _ingest_real_parse(second_db, [path], model)
         second = list(model.extracted)
@@ -1835,12 +1857,9 @@ def test_sheet_choice_is_decided_once_and_replayed() -> None:
         _ingest_real_parse(fresh_db(), [path], model)
         control = list(model.extracted)
 
-        with first_db.connect() as conn:
-            stored = json.loads(conn.execute(
-                select(attachments.c.sheet_verdicts_json)
-                .where(attachments.c.content_sha256 == sha)).scalar() or "[]")
-
     check(calls_after_first == 1, "run 1 asked the sheet question once", str(calls_after_first))
+    check(inherited == 1, "run 2's database really did inherit run 1's attachment row",
+          f"{inherited} row(s) copied")
     check(bool(first) and first == second,
           "run 2 extracted EXACTLY the sheets run 1 did", f"{first} vs {second}")
     check(calls_after_second == calls_after_first,

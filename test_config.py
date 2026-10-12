@@ -584,6 +584,114 @@ def test_harness_refuses_to_run_as_dbo() -> None:
               "transaction, whatever built the engine")
 
 
+def test_a_superseded_engine_raises_instead_of_reading_another_tests_schema() -> None:
+    section("an engine from an earlier fresh_engine() cannot be used after a later one")
+    from sqlalchemy import create_engine, text
+
+    import dialect_target as dt
+
+    # The mechanism, on two throwaway engines: a server target cannot be assumed
+    # here, and the refusal itself is not dialect-specific.
+    old, other = create_engine("sqlite://"), create_engine("sqlite://")
+    with old.connect() as conn:
+        check(conn.execute(text("SELECT 1")).scalar() == 1, "an engine works until retired")
+    dt._retire(old)
+    try:
+        with old.connect():
+            pass
+        check(False, "a retired engine refuses to connect", "NOT REFUSED")
+    except dt.SupersededEngine as exc:
+        check("BEFORE" in str(exc), "a retired engine refuses to connect, saying what to do "
+              "instead", str(exc)[:60])
+    with other.connect() as conn:
+        check(conn.execute(text("SELECT 1")).scalar() == 1,
+              "and only that engine -- a guard that refused every engine would pass the "
+              "half above")
+
+
+def test_connection_retry_is_bounded_narrow_and_counted() -> None:
+    section("the harness retries OPENING a connection: bounded, narrow, and counted")
+    import dialect_target as dt
+
+    class Dbapi(Exception):
+        """Shaped like a pyodbc error: args[0] is the SQLSTATE."""
+
+    def opener(failures, state):
+        calls = []
+
+        def open_connection():
+            calls.append(1)
+            if len(calls) <= failures:
+                raise Dbapi(state, "simulated")
+            return "connection"
+
+        return open_connection, calls
+
+    saved = dt.connect_retries
+    try:
+        dt.connect_retries = 0
+        slept: list = []
+        open_connection, calls = opener(2, "08001")
+        check(dt._establish(open_connection, sleep=slept.append) == "connection",
+              "a link that fails twice and then opens yields the connection")
+        check(len(calls) == 3 and slept == list(dt.CONNECT_BACKOFF_SECONDS),
+              "after backing off between attempts", f"{len(calls)} call(s), slept {slept}")
+        check(dt.connect_retries == 2 and "2 connection attempt(s) FAILED" in dt.retry_summary(),
+              "and BOTH retries are counted and reported -- never absorbed",
+              dt.retry_summary()[:60])
+
+        dt.connect_retries = 0
+        open_connection, calls = opener(99, "08S01")
+        try:
+            dt._establish(open_connection, sleep=slept.append)
+            check(False, "a link that stays down fails", "NO ERROR")
+        except Dbapi:
+            check(len(calls) == dt.CONNECT_ATTEMPTS,
+                  "a link that stays down fails after a bounded number of attempts",
+                  f"{len(calls)} call(s)")
+
+        for label, state in (("a REFUSED login", "28000"), ("a deadlock", "40001"),
+                             ("a constraint violation", "23000")):
+            dt.connect_retries = 0
+            open_connection, calls = opener(99, state)
+            try:
+                dt._establish(open_connection, sleep=slept.append)
+                check(False, f"{label} is not retried", "NO ERROR")
+            except Dbapi:
+                check(len(calls) == 1 and dt.connect_retries == 0,
+                      f"{label} is raised at once, not retried", f"{len(calls)} call(s)")
+
+        check(dt.retry_summary() == "database link: 0 connection retries",
+              "zero is said out loud, so the line's absence is never the signal")
+    finally:
+        dt.connect_retries = saved
+
+    # NEVER inside a transaction: a statement failing on an ESTABLISHED connection
+    # must reach the test. Proven on a real engine wired the way `connect()` wires it.
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.exc import OperationalError
+
+    engine = create_engine("sqlite://")
+    opened: list = []
+    real = dt._establish
+    dt._establish = lambda fn, sleep=None: (opened.append(1), real(fn, sleep))[1]
+    try:
+        dt._retry_connection_establishment(engine)
+        with engine.connect() as conn:
+            check(conn.execute(text("SELECT 1")).scalar() == 1 and len(opened) == 1,
+                  "the engine's connections are opened THROUGH the retry", f"{len(opened)}")
+            try:
+                conn.execute(text("SELECT * FROM no_such_table"))
+                check(False, "a failing statement still fails", "NO ERROR")
+            except OperationalError:
+                check(len(opened) == 1,
+                      "a statement that fails on an open connection is NOT retried and "
+                      "opens nothing new", f"{len(opened)} open(s)")
+    finally:
+        dt._establish = real
+        engine.dispose()
+
+
 def test_harness_refuses_a_non_disposable_database() -> None:
     section("the harness will only point at a database named disposable")
     import os
@@ -737,6 +845,95 @@ def test_no_unquoted_reserved_identifiers_in_handwritten_sql() -> None:
     check(True, "(RUNBOOK section 8: raw SQL declines every service the library provides)")
 
 
+#: Every place a TEST builds a database engine without going through
+#: `dialect_target.fresh_engine()`, and why that is right for it. A test that
+#: builds its own engine has left the dialect switch, and nothing says so: until
+#: 2026-10-12 `test_poller.py` and `test_review_app.py` did, and 29 of 177 tests
+#: reported green under `--mssql` without reaching the server. The switch is
+#: opt-in, so it can only list who opted in; this is the list of who opted OUT.
+ENGINES_BUILT_OUTSIDE_THE_HARNESS = {
+    ("test_config.py", "test_a_superseded_engine_raises_instead_of_reading_another_tests_schema"):
+        "tests the retire mechanism itself, on throwaway engines; no schema, no dialect",
+    ("test_config.py", "test_connection_retry_is_bounded_narrow_and_counted"):
+        "tests the retry wiring itself, on a throwaway engine; no schema, no dialect",
+    ("test_schema.py", "test_migration_seed_matches_schema"):
+        "builds from dialect_target.migration_url(), so it DOES follow the switch (but "
+        "gets no connection retry); Alembic must build the schema, which "
+        "fresh_engine() would pre-empt",
+    ("test_schema.py", "test_migration_round_trip"):
+        "builds from dialect_target.migration_url(), so it DOES follow the switch (but "
+        "gets no connection retry); Alembic must build the schema, which "
+        "fresh_engine() would pre-empt",
+}
+
+
+def _project_sources():
+    import ast
+    import pathlib as _pl
+
+    here = _pl.Path(__file__).resolve().parent
+    for f in sorted(here.rglob("*.py")):
+        if ".venv" in f.parts or "__pycache__" in f.parts:
+            continue
+        try:
+            yield f.relative_to(here), ast.parse(f.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+
+
+def test_no_test_builds_its_own_engine_unannounced() -> None:
+    section("a test that leaves the dialect switch has to be on the list, with a reason")
+    import ast
+
+    found = set()
+    for rel, tree in _project_sources():
+        if not rel.name.startswith("test_") or len(rel.parts) != 1:
+            continue
+        # Helpers and classes too, not only `test_*` functions: the two files that
+        # opted out did it in a `fresh_db()` helper and a fixture class.
+        for func in (n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))):
+            for node in ast.walk(func):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+                owner = fn.value.id if (isinstance(fn, ast.Attribute)
+                                        and isinstance(fn.value, ast.Name)) else ""
+                if name == "create_engine" or (
+                        name == "connect" and owner in ("sc", "_sc", "schema", "sqlite3")):
+                    found.add((rel.name, func.name))
+
+    unannounced = sorted(found - set(ENGINES_BUILT_OUTSIDE_THE_HARNESS))
+    check(not unannounced,
+          "every engine a test builds for itself is listed, with why it may skip the switch",
+          str(unannounced) if unannounced else f"{len(found)} listed")
+    stale = sorted(set(ENGINES_BUILT_OUTSIDE_THE_HARNESS) - found)
+    check(not stale, "and the list names nothing that no longer does it", str(stale))
+    check(len(found) >= 4, "the scan finds the cases known to exist -- it can fail",
+          str(sorted(found)))
+
+
+def test_no_boolean_is_comparison_in_queries() -> None:
+    section("`.is_(True)` renders `IS 1`: valid on SQLite, a syntax error on SQL Server")
+    import ast
+
+    hits, calls = [], 0
+    for rel, tree in _project_sources():
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("is_", "is_not", "isnot") and len(node.args) == 1):
+                calls += 1
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, bool):
+                    hits.append(f"{rel}:{node.lineno}")
+    check(calls > 5, "the scan sees this project's `.is_()` / `.is_not()` calls", str(calls))
+    # WHY: `review_app.data.load_po` filtered on `is_open.is_(True)`, and every PO
+    # page raised "Incorrect syntax near '1'" on SQL Server. The rule was already
+    # written down, as a comment in test_schema.py, and was reintroduced anyway.
+    check(not hits, "none compares a column to True/False with IS -- use `== True`",
+          str(hits) if hits else "clean")
+
+
 def main() -> int:
     print("=" * 78)
     print("CONFIGURATION TESTS")
@@ -751,8 +948,12 @@ def main() -> int:
         test_no_credentials_in_tracked_files,
         test_redaction_is_structural_and_fails_closed,
         test_harness_refuses_to_run_as_dbo,
+        test_a_superseded_engine_raises_instead_of_reading_another_tests_schema,
+        test_connection_retry_is_bounded_narrow_and_counted,
         test_harness_refuses_a_non_disposable_database,
         test_no_unquoted_reserved_identifiers_in_handwritten_sql,
+        test_no_test_builds_its_own_engine_unannounced,
+        test_no_boolean_is_comparison_in_queries,
     )
 
     # A test registered twice runs twice and its checks are counted twice. That

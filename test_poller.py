@@ -34,8 +34,9 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import func, select
 
+import dialect_target as dt_target
 import extract_pending as ep
 import graph_client as gc
 import poller
@@ -65,22 +66,12 @@ def fresh_db():
     `change_state_transitions` at runtime, and an unseeded table makes every
     transition illegal. Migration 0001 seeds it in production; this mirrors that,
     the same way `test_ingest.fresh_db` does.
-    """
-    import schema as sc
-    from sqlalchemy import text as sa_text
 
-    engine = create_engine("sqlite://")
-    metadata.create_all(engine)
-    with engine.begin() as conn:
-        conn.execute(sc.change_states.insert(), [
-            {"state": st, "is_terminal": t, "description": d}
-            for st, t, d in sc.CHANGE_STATES])
-        conn.execute(sc.change_state_transitions.insert(), [
-            {"from_state": f, "to_state": t, "trigger": g, "actor_kind": a}
-            for f, t, g, a in sc.CHANGE_STATE_TRANSITIONS])
-        for _name, ddl in sc.VIEWS:
-            conn.execute(sa_text(ddl))
-    return engine
+    Delegates to `dialect_target`, so `--mssql` moves this file onto SQL Server.
+    Until 2026-10-12 it built its own `sqlite://` engine, which opted every test
+    here out of the dialect switch without saying so (RUNBOOK section 8 lesson 33).
+    """
+    return dt_target.fresh_engine()
 
 
 def counts(engine) -> dict:
@@ -762,17 +753,19 @@ def test_dry_run_touches_nothing(tmp: Path) -> None:
     check(preview["msg-symmetry-004"].attachment_preview == [],
           "a message with no attachments previews as empty, not as an error")
 
+    real = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+    check(real.stored == 7, "a real poll afterwards stores everything the dry run showed",
+          str(real.stored))
+
     # A dry run must survive a broken message: the mailbox you most want to look
-    # at before touching is the one you already suspect.
+    # at before touching is the one you already suspect. LAST, because it takes a
+    # database of its own: on a server that call empties the one `engine` holds,
+    # and the real poll above used to run after it.
     bad = poller.poll_once(fresh_db(), _ExplodingListClient("msg-tainan-005"), MAILBOX,
                            store, now=NOW, dry_run=True)
     check(bad.seen == 7 and len(bad.failed) == 1,
           "one unreadable message is reported, the rest still listed",
           f"seen={bad.seen} failed={len(bad.failed)}")
-
-    real = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
-    check(real.stored == 7, "a real poll afterwards stores everything the dry run showed",
-          str(real.stored))
 
 
 def test_parse_since(tmp: Path) -> None:

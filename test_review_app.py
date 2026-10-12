@@ -21,8 +21,9 @@ import traceback
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import select
 
+import dialect_target as dt_target
 import schema as sc
 from schema import audit_log, message_attachments, proposed_changes, shipment_pos
 
@@ -51,18 +52,12 @@ def section(title: str) -> None:
 
 def _build_db(path: Path):
     """A seeded schema in a FILE: the app answers requests on worker threads, and an
-    in-memory SQLite database is private to the connection that made it."""
-    engine = create_engine(f"sqlite:///{path}")
-    sc.metadata.create_all(engine)
-    with engine.begin() as conn:
-        conn.execute(sc.change_states.insert(), [
-            {"state": s, "is_terminal": t, "description": d} for s, t, d in sc.CHANGE_STATES])
-        conn.execute(sc.change_state_transitions.insert(), [
-            {"from_state": f, "to_state": t, "trigger": g, "actor_kind": a}
-            for f, t, g, a in sc.CHANGE_STATE_TRANSITIONS])
-        for _name, ddl in sc.VIEWS:
-            conn.execute(text(ddl))
-    return engine
+    in-memory SQLite database is private to the connection that made it.
+
+    Through `dialect_target`, so `--mssql` moves this file onto SQL Server (where
+    `path` is unused: a server database is shared between threads already). It
+    built its own SQLite engine until 2026-10-12, and so never left SQLite."""
+    return dt_target.fresh_engine(sqlite_file=path)
 
 
 class World:

@@ -36,7 +36,7 @@ if config.config_file_name is not None:
 # ONE variable, and deliberately NOT the harness's one.
 #
 # `PO_AGENT_DB_URL` names a database to MIGRATE. `PO_AGENT_TEST_DB_URL` names one
-# the test harness may DROP EVERY TABLE on, ~25 times a run. Those are opposite
+# the test harness may DROP EVERY TABLE on, ~85 times a run. Those are opposite
 # safety requirements, so the safe default for one is the unsafe default for the
 # other, and a single variable serving both is set correctly for at most one of
 # them. This file never reads the harness variable and never falls back to it.

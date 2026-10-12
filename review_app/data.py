@@ -319,7 +319,11 @@ def load_po(conn, shipment_po_id: str) -> Optional[PoView]:
         select(change_candidates.c.id)
         .join(proposed_changes, change_candidates.c.change_id == proposed_changes.c.id)
         .where(proposed_changes.c.shipment_po_id == shipment_po_id)
-        .where(change_candidates.c.is_open.is_(True))
+        # `== True`, not `.is_(True)`: that renders `IS 1`, which SQLite accepts
+        # and SQL Server rejects ("Incorrect syntax near '1'"). Every PO page
+        # failed on SQL Server until 2026-10-12, unseen: this app's tests built
+        # their own SQLite engine.
+        .where(change_candidates.c.is_open == True)  # noqa: E712
         .limit(1)
     ).first() is not None
     lost = conn.execute(

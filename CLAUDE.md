@@ -524,4 +524,19 @@ not as history - a rule without its failure mode gets rationalised away.
   statements or add `pool_pre_ping`: a retry inside a transaction can replay
   work, and a silent one turns a bad link into a green run. The count prints at
   the end of every `--mssql` run, zero included - read it.
+- **A whole TEST is re-run only when the link failed, at most twice, and never
+  for an assertion** (`conftest.pytest_runtest_protocol`,
+  `dialect_target.run_test_with_retries`; server targets only). Connection-class
+  means SQLSTATE 08001/08S01/HYT00/HYT01 reached through `.orig` or an explicit
+  `raise ... from` - `TargetUnreachable` counts only when THAT is its cause, so
+  a refused login (28000) is not re-run. **Never follow `__context__`:**
+  `except <link error>: assert ...` carries the link error as implicit context,
+  and following it re-ran an assertion failure (caught in review, 2026-10-12).
+  A top-level `AssertionError` or pytest outcome is never connection-class; a
+  test that recorded a FALSE `check()` is not re-run even if the link then
+  dropped. Safe only because every database-backed test STARTS by dropping and
+  rebuilding the schema and every fixture is function-scoped - a module- or
+  session-scoped fixture holding an engine would be carried into the re-run.
+  The second summary line names every re-run test; a run with re-runs is not a
+  clean run.
 - <add the next one here>

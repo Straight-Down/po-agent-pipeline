@@ -340,7 +340,8 @@ not as history - a rule without its failure mode gets rationalised away.
   ValueError that QUOTES the password. RUNBOOK section 8 lesson 23.
 - **The test harness only points at a database whose name ends in `-test`,** and
   alembic reads a DIFFERENT variable (`PO_AGENT_DB_URL`) from the harness
-  (`PO_AGENT_TEST_DB_URL`). The harness DROPS EVERY TABLE ~25 times a run; one
+  (`PO_AGENT_TEST_DB_URL`). The harness DROPS EVERY TABLE once per database-backed test (~85 times a run
+  since `test_poller.py` and `test_review_app.py` joined it on 2026-10-12); one
   variable serving both roles is set correctly for at most one of them. It was
   once found naming the production database while the instruction said test.
   No override - rename the database. RUNBOOK section 8 lesson 25.
@@ -497,4 +498,30 @@ not as history - a rule without its failure mode gets rationalised away.
   and never count two documents agreeing: PO 1720/1721's two PDFs share a
   print-once convention, so their 25-key agreement was one inference counted
   twice (RUNBOOK section 8 lesson 32). Anything short of all fields keeps the flag.
+- **On a server target every `fresh_db()` is the SAME database, emptied.** Read
+  what a test needs from an earlier engine BEFORE asking for the next one. Two
+  replay tests copied "run 1's rows" after the second `fresh_db()` had dropped
+  them; on SQLite (a database per call) they passed, on SQL Server they copied
+  nothing and the failure read as "a stored verdict is not found" - a product
+  bug that did not exist (2026-10-12). An earlier engine now raises
+  `dialect_target.SupersededEngine` on a server.
+- **A test gets its database from `dialect_target.fresh_engine()`, never from
+  `create_engine`.** A test that builds its own engine leaves the dialect switch
+  silently: `test_poller.py` and `test_review_app.py` did, and 29 of 177 tests
+  were green under `--mssql` without reaching the server - hiding a review app
+  whose every PO page failed on SQL Server. A genuine exception goes in
+  `test_config.ENGINES_BUILT_OUTSIDE_THE_HARNESS` with its reason, or
+  `test_no_test_builds_its_own_engine_unannounced` fails. A SQLite FILE (worker
+  threads) is `fresh_engine(sqlite_file=...)`. RUNBOOK section 8 lesson 33.
+- **Compare a Boolean column with `== True  # noqa: E712`, never `.is_(True)`.**
+  That renders `IS 1`: fine on SQLite, `Incorrect syntax near '1'` on SQL
+  Server. `test_no_boolean_is_comparison_in_queries` catches the literal
+  `.is_(True)` / `.is_(False)` only - not `.is_(true())`, a variable, or raw SQL.
+- **The harness retries OPENING a connection only** (`dialect_target._establish`:
+  3 attempts, backoff, link/timeout SQLSTATEs only), and only on engines built
+  by `dialect_target.connect()` - the migration tests' `sc.connect(url)` engines
+  and the Alembic subprocess get no retry and no count. Do not widen it to
+  statements or add `pool_pre_ping`: a retry inside a transaction can replay
+  work, and a silent one turns a bad link into a green run. The count prints at
+  the end of every `--mssql` run, zero included - read it.
 - <add the next one here>

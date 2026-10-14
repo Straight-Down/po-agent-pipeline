@@ -345,6 +345,13 @@ not as history - a rule without its failure mode gets rationalised away.
   variable serving both roles is set correctly for at most one of them. It was
   once found naming the production database while the instruction said test.
   No override - rename the database. RUNBOOK section 8 lesson 25.
+  **`PO_AGENT_DB_URL` is deliberately UNSET in `.env`** (2026-10-14), so nothing
+  reaches a real database by default. With it unset, the review app refuses to
+  start unless given `--db`, and Alembic falls back to `alembic.ini`'s local
+  `sqlite:///po_agent.db`, which its own guard then refuses without
+  `PO_AGENT_MIGRATE_CONFIRM=po_agent.db`. To migrate Azure SQL by hand, set
+  it for that ONE command. It will need setting at deployment, in the hosting
+  environment's configuration rather than in `.env`.
   **Alembic has the same rule one layer down** (`migrations/env.py`, 2026-10-01):
   a hand-run `alembic upgrade`/`downgrade` refuses any non-`*-test` database
   unless `PO_AGENT_MIGRATE_CONFIRM` equals THAT database's name for the run

@@ -562,6 +562,16 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
     **Residual gap, named rather than hidden:** a line this tool has never seen, with nothing received, whose quantity was edited by hand, is indistinguishable from an untouched line. NetSuite carries no separate "originally ordered" figure to compare against — `quantity` is both the ordered value and the field this tool overwrites. Every line the tool has seen once is covered from then on.
 
 
+31. **NEW 2026-10-19 — on a dropped database connection the review app keeps the data consistent but tells Paula the wrong thing, or nothing.** Both gaps are in what the user is told; neither leaves a bad row.
+
+    `review_app.data.approve` does everything in ONE transaction: re-read the PO and check its fingerprint, then per line update `proposed_changes` and insert the `REVIEW_APPROVED` audit row. A drop anywhere before COMMIT rolls all of it back, so an approval can never exist without its audit row (`reject` is built the same way).
+
+    - **(1) A drop shows a generic server error that does not say whether the approval was saved.** `review_app/app.py` catches only `ReviewRefused`; a dropped connection is any other exception, so it becomes FastAPI's generic error page. In the usual case nothing was saved and approving again works, but the page does not say so, and reloading the PO is the only way for Paula to find out.
+    - **(2) A drop DURING the commit can report the opposite of what happened.** If the server committed but the client lost the connection before hearing so, the approval and its audit rows ARE saved while the browser shows an error. If Paula then clicks Approve again from the same page, the stored state no longer matches the page's fingerprint and she is told *"Something on this PO changed since you opened it, so nothing was saved"* -- when it was in fact saved, by her, a moment earlier. No double approval results (the fingerprint check refuses the second click), but the message is wrong.
+
+    **No test kills a connection mid-ingest or mid-approve. This safety analysis is from reading the code, not from a test.** The same reading covered ingest: `ingest_shipment` commits in separate steps (attachment and message bookkeeping; per-sheet verdicts; then the shipment and every row under it in one transaction), and `extract_pending` marks the message extracted in a further transaction afterwards. A drop leaves either no shipment, so the next run re-ingests it, or a complete one, so the next run's duplicate check skips it -- never a partial shipment. A test that drops the connection at each of those points would turn this from a reading into a result.
+
+
 ## 7. Design constraints discovered by testing
 
 These are not open questions — they are settled constraints that later phases must respect. Each was found by measurement, not design review.

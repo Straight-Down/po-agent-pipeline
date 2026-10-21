@@ -12,14 +12,19 @@ Details: an unrecognised reason is never dropped.
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 #: (category, phrase the matcher writes, what Paula reads). Matched in order on
 #: the matcher's `attention_reason`; one sentence per category found.
 REASON_CATEGORIES: tuple[tuple[str, str, str], ...] = (
-    ("pre_existing", "units received before the tool started tracking it",
-     "This line was already received in NetSuite before this packing slip arrived, so "
-     "the tool hasn't proposed a number for it."),
+    # The figures are added from the row by `reasons(..., row=)`; this is the
+    # fallback when they are not to hand. Never a combined total (2026-10-21).
+    ("pre_existing", "from before this tool tracked it",
+     "NetSuite already shows goods received on this line, and that figure doesn't "
+     "agree with the ordered quantity or with this packing slip. The tool doesn't add "
+     "a packing slip to earlier receipts, so it hasn't proposed a number. Check the "
+     "line in NetSuite."),
     ("disputed", "Someone changed the line outside this tool",
      "The quantity in NetSuite has been changed since the tool last saw this line, so "
      "it hasn't proposed a number. Check the line in NetSuite."),
@@ -56,13 +61,40 @@ REASON_CATEGORIES: tuple[tuple[str, str, str], ...] = (
 UNRECOGNISED = "This line needs a look. What the tool noted is under Details."
 
 
-def reasons(attention_reason: Optional[str]) -> list[str]:
-    """Plain sentences for a line's reasons; empty when there are none."""
+def reasons(attention_reason: Optional[str], row: Optional[dict] = None) -> list[str]:
+    """Plain sentences for a line's reasons; empty when there are none. Given the
+    line's `row`, the already-received sentence states its figures."""
     text = attention_reason or ""
     if not text.strip():
         return []
-    found = [plain for _key, phrase, plain in REASON_CATEGORIES if phrase.lower() in text.lower()]
+    found = [(_received_figures(row) if key == "pre_existing" and row else None) or plain
+             for key, phrase, plain in REASON_CATEGORIES if phrase.lower() in text.lower()]
     return found or [UNRECOGNISED]
+
+
+def _received_figures(row: dict) -> Optional[str]:
+    """The already-received disagreement, in figures. Compared, never added: no
+    sentence here may offer a total. None if a figure is missing (use the fallback)."""
+    ordered, received = _dec(row.get("current_quantity")), _dec(row.get("current_quantity_received"))
+    slip = _dec(row.get("src_quantity_text"))
+    if ordered is None or received is None or slip is None:
+        return None
+    parts = []
+    if ordered != received:
+        parts.append(f"NetSuite shows {_n(ordered)} ordered but {_n(received)} received on this line.")
+    if slip != received:
+        parts.append(f"This packing slip says {_n(slip)}, and NetSuite has {_n(received)} received.")
+    if not parts:
+        return None
+    return " ".join(parts) + (" The tool doesn't add a packing slip to what was already "
+                              "received, so it hasn't proposed a number. Check the line in NetSuite.")
+
+
+def _dec(value) -> Optional[Decimal]:
+    try:
+        return None if value is None else Decimal(str(value).strip())
+    except InvalidOperation:
+        return None
 
 
 # -- why an Approve is unavailable --------------------------------------------
@@ -70,9 +102,10 @@ def reasons(attention_reason: Optional[str]) -> list[str]:
 #: Grouped explanations for a disabled Approve, by what blocks it.
 BLOCK_MESSAGES = {
     "pre_existing": (
-        "These lines were already received in NetSuite before this packing slip arrived. "
-        "The tool can't tell whether that receipt already covers this shipment, so it "
-        "hasn't proposed a number. There's nothing to approve here yet."),
+        "NetSuite already shows goods received on these lines, and those figures don't "
+        "agree with the ordered quantity or with this packing slip. The tool doesn't add a "
+        "packing slip to earlier receipts, so it hasn't proposed a number. Check them in "
+        "NetSuite; reject this PO here to clear it from your list."),
     "disputed": (
         "The quantity in NetSuite has been changed since the tool last saw these lines, so "
         "it hasn't proposed a number. Check them in NetSuite. There's nothing to approve "

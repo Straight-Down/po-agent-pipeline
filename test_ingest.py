@@ -1397,7 +1397,7 @@ def test_netsuite_disagreeing_with_our_record_is_flagged() -> None:
 
 
 def test_untracked_line_with_receipts_is_flagged() -> None:
-    section("no history, goods already arrived: PRE_EXISTING_RECEIPT, not a dispute")
+    section("receipts present, figures disagree: flagged with both figures, nothing proposed")
     engine = fresh_db()
     report = _ship(engine, po="1662", graph_id="AAMk-batch-2",
                    slip_lines=[line(qty=100)],
@@ -1409,58 +1409,124 @@ def test_untracked_line_with_receipts_is_flagged() -> None:
     check(change.accumulation_basis == "PRE_EXISTING_RECEIPT",
           "basis PRE_EXISTING_RECEIPT", str(change.accumulation_basis))
     check(change.accumulation_basis != "DISPUTED",
-          "and specifically NOT DISPUTED -- nothing contradicts anything here, there "
-          "is simply no history to add to")
-    check(change.state == sc.STATE_NEEDS_ATTENTION,
-          "it still needs Paula, because the total has to be confirmed once",
-          change.state)
+          "and specifically NOT DISPUTED -- nobody changed anything behind the tool")
+    check(change.state == sc.STATE_NEEDS_ATTENTION, "it goes to Paula", change.state)
 
     reason = change.attention_reason or ""
-    check("128" in reason, "the reason states what was already received", reason[:110])
-    check("100" in reason, "and what this slip adds", reason[:110])
-    check("confirm the total" in reason,
-          "phrased as a one-time confirmation, not a report of a disagreement",
-          reason[:110])
-    check("Nothing disagrees" in reason,
-          "and says so outright, so a reviewer is not hunting for a conflict that "
-          "does not exist", reason[:110])
+    check("128 received" in reason, "the reason states what was already received", reason[:160])
+    check("ordered quantity is 300" in reason and "this slip says 100" in reason,
+          "and both figures that disagree with it, plainly", reason[:200])
+    check("228" not in reason and "confirm the total" not in reason,
+          "and NEVER a combined total -- 128 + 100 is not offered in any form", reason)
     check("vendor line has no quantity" not in reason,
           "it does NOT blame the document -- the slip stated 100 perfectly clearly",
           reason[:110])
 
 
-def test_pre_existing_receipt_retires_itself() -> None:
-    section("the day-one case is one-time: confirm it once, then it accumulates")
+def test_received_line_whose_figures_all_agree_needs_no_action() -> None:
+    section("receipts present, ordered == received == slip: no action, nothing flagged")
     engine = fresh_db()
+    change = _only_change(engine, _ship(
+        engine, po="1662", graph_id="AAMk-agree", slip_lines=[line(qty=52)],
+        ns_lines=[ns_line("18", qty=52, recv=52.0)]).shipment_id)
+    check(change.state == sc.STATE_NO_CHANGE, "NO_CHANGE -- nothing to do", change.state)
+    check(change.accumulation_basis == "PRE_EXISTING_RECEIPT",
+          "the basis still records why", str(change.accumulation_basis))
+    check(change.attention_reason is None, "no reason, because nothing needs a look",
+          str(change.attention_reason))
+    check(float(change.proposed_quantity) == float(change.current_quantity) == 52.0,
+          "and the 'proposal' is NetSuite's own 52 -- not 104",
+          f"{change.proposed_quantity} / {change.current_quantity}")
 
-    # First contact with a line that was partly received before the tool existed.
-    first = _ship(engine, po="1662", graph_id="AAMk-batch-1",
-                  slip_lines=[line(qty=100)],
-                  ns_lines=[ns_line("18", qty=300, recv=128.0)])
-    change_1 = _only_change(engine, first.shipment_id)
-    check(change_1.accumulation_basis == "PRE_EXISTING_RECEIPT",
-          "first contact: PRE_EXISTING_RECEIPT", str(change_1.accumulation_basis))
 
-    # Paula confirms the total: the 128 already there plus this slip's 100.
-    _record_write(engine, change_1, 228, dt.datetime(2026, 9, 16, 10, 0, 0))
+def test_received_line_with_one_disagreement_names_only_that_one() -> None:
+    section("receipts present, ONE figure disagrees: flagged, that figure named, no sum")
+    cases = (
+        # PO 1624 line 5 in production: ordered 44, received 52, slip 52.
+        ("ordered disagrees", 44, 52.0, 52, "ordered quantity is 44", "this slip says",
+         ("96", "104")),
+        ("slip disagrees", 52, 52.0, 50, "this slip says 50", "ordered quantity is",
+         ("102",)),
+    )
+    for label, ordered, recv, slip, named, not_named, sums in cases:
+        engine = fresh_db()
+        change = _only_change(engine, _ship(
+            engine, po="1662", graph_id=f"AAMk-{label}", slip_lines=[line(qty=slip)],
+            ns_lines=[ns_line("18", qty=ordered, recv=recv)]).shipment_id)
+        reason = change.attention_reason or ""
+        check(change.state == sc.STATE_NEEDS_ATTENTION and change.proposed_quantity is None,
+              f"{label}: flagged, nothing proposed", f"{change.state} {change.proposed_quantity}")
+        check(named in reason and not_named not in reason,
+              f"{label}: states the figure that disagrees, and only that one", reason[:200])
+        check(not any(s in reason for s in sums),
+              f"{label}: no sum of slip and receipts appears", reason)
 
-    # A later slip on the same line. NetSuite now holds the confirmed 228.
-    second = _ship(engine, po="1662", graph_id="AAMk-batch-2",
-                   slip_lines=[line(qty=50)],
-                   ns_lines=[ns_line("18", qty=228, recv=228.0)],
-                   now=dt.datetime(2026, 10, 1, 9, 0, 0))
-    change_2 = _only_change(engine, second.shipment_id)
 
-    check(change_2.accumulation_basis == "ACCUMULATED",
-          "the NEXT slip is an ordinary ACCUMULATED -- the flag retired itself",
-          str(change_2.accumulation_basis))
-    check(change_2.accumulation_basis != "PRE_EXISTING_RECEIPT",
-          "it does NOT ask again; the confirmation became the history")
-    check(float(change_2.proposed_quantity) == 278.0,
-          "and proposes 228 + 50 = 278, with the confirmed total as the base",
-          str(change_2.proposed_quantity))
-    check(change_2.state == sc.STATE_PENDING_REVIEW,
-          "back to an ordinary proposal", change_2.state)
+def test_agreeing_receipts_set_a_confidence_flag_aside_but_keep_it() -> None:
+    section("all figures agree + medium confidence: no action, flag still recorded")
+    medium = dict(conf="medium", note="inseam inferred from the recap block")
+
+    engine = fresh_db()
+    agree = _only_change(engine, _ship(
+        engine, po="1662", graph_id="AAMk-agree-medium", slip_lines=[line(qty=52, **medium)],
+        ns_lines=[ns_line("18", qty=52, recv=52.0)]).shipment_id)
+    check(agree.state == sc.STATE_NO_CHANGE,
+          "every figure agrees: NO_CHANGE despite the medium-confidence flag", agree.state)
+    check("extraction confidence medium: inseam inferred" in (agree.attention_reason or "")
+          and agree.needs_review and agree.extraction_confidence == "medium",
+          "and the flag is KEPT -- reason, needs_review and confidence all still recorded",
+          str(agree.attention_reason))
+
+    engine = fresh_db()
+    disagree = _only_change(engine, _ship(
+        engine, po="1662", graph_id="AAMk-disagree-medium", slip_lines=[line(qty=50, **medium)],
+        ns_lines=[ns_line("18", qty=52, recv=52.0)]).shipment_id)
+    reason = disagree.attention_reason or ""
+    check(disagree.state == sc.STATE_NEEDS_ATTENTION and disagree.proposed_quantity is None,
+          "a disagreeing figure keeps it in review, nothing proposed", disagree.state)
+    check("this slip says 50" in reason and "extraction confidence medium" in reason,
+          "with BOTH flags visible", reason[:200])
+
+    engine = fresh_db()
+    unreceived = _only_change(engine, _ship(
+        engine, po="1662", graph_id="AAMk-unreceived-medium", slip_lines=[line(qty=52, **medium)],
+        ns_lines=[ns_line("18", qty=52, recv=0.0)]).shipment_id)
+    check(unreceived.state == sc.STATE_NEEDS_ATTENTION,
+          "nothing received: the flag is NOT set aside -- there is no independent count "
+          "to agree with", unreceived.state)
+
+    # Only the confidence flag yields. Any other reason keeps the line in review.
+    import matcher as mt
+    other = mt.build_proposed_changes(
+        [{**line(qty=52, **medium), "carton_backing": {"status": "UNVERIFIABLE",
+                                                      "reason": "no carton rows"}}],
+        NetSuiteClient(mock_data={"1662": [ns_line("18", qty=52, recv=52.0)]}),
+        line_history={})[0]
+    check(other.status == mt.STATUS_NEEDS_ATTENTION
+          and "carton backing unverifiable" in (other.attention_reason or ""),
+          "every figure agrees but carton backing is unverifiable: stays in review",
+          f"{other.status} {other.attention_reason}")
+
+
+def test_the_receipt_rule_survives_a_second_sighting() -> None:
+    section("seen before, never written: receipts are still compared, never replaced or added")
+    # Without this, the second ingest of a line (a re-run, or a later email) takes
+    # the seen-before path and proposed the slip's figure outright -- here 50 onto a
+    # line holding 52 received.
+    engine = fresh_db()
+    first = _only_change(engine, _ship(
+        engine, po="1662", graph_id="AAMk-seen-1", slip_lines=[line(qty=50)],
+        ns_lines=[ns_line("18", qty=52, recv=52.0)]).shipment_id)
+    second = _only_change(engine, _ship(
+        engine, po="1662", graph_id="AAMk-seen-2", slip_lines=[line(qty=50)],
+        ns_lines=[ns_line("18", qty=52, recv=52.0)],
+        now=dt.datetime(2026, 10, 2, 9, 0, 0)).shipment_id)
+    check(first.accumulation_basis == second.accumulation_basis == "PRE_EXISTING_RECEIPT",
+          "both sightings are judged on the receipts",
+          f"{first.accumulation_basis} / {second.accumulation_basis}")
+    check(second.proposed_quantity is None and second.state == sc.STATE_NEEDS_ATTENTION,
+          "the second proposes nothing either -- NOT the slip's 50 as a first shipment",
+          f"{second.state} {second.proposed_quantity}")
 
 
 def test_the_two_no_proposal_cases_do_not_share_a_label() -> None:
@@ -2226,7 +2292,10 @@ def main() -> int:
         test_po_1624_later_shipment_accumulates_onto_the_first,
         test_netsuite_disagreeing_with_our_record_is_flagged,
         test_untracked_line_with_receipts_is_flagged,
-        test_pre_existing_receipt_retires_itself,
+        test_received_line_whose_figures_all_agree_needs_no_action,
+        test_received_line_with_one_disagreement_names_only_that_one,
+        test_agreeing_receipts_set_a_confidence_flag_aside_but_keep_it,
+        test_the_receipt_rule_survives_a_second_sighting,
         test_the_two_no_proposal_cases_do_not_share_a_label,
         test_unwritten_proposals_do_not_move_the_base,
         test_classification_is_decided_once_and_replayed,

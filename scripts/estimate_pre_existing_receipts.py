@@ -1,12 +1,11 @@
 """
 How many OPEN PO lines already carry a receipt this tool has no record of?
 
-That number is the ceiling on the `PRE_EXISTING_RECEIPT` wave: each such line
-asks for a one-time confirmation the first time a packing slip touches it,
-because the units already received were put there by something other than this
-tool and accumulating from a zero base would drop them. It retires itself -- the
-confirmation becomes history, so the next slip on that line is an ordinary
-`ACCUMULATED`.
+That number is the ceiling on the `PRE_EXISTING_RECEIPT` wave: the units already
+received on such a line were put there by something other than this tool, so a
+packing slip touching it is COMPARED with the receipts, never added to them
+(2026-10-21). Lines whose figures all agree need nothing; only those that
+disagree are flagged for a reviewer -- so the flags are a subset of this count.
 
 Read-only throughout: three SuiteQL SELECTs and a bounded set of PO reads.
 

@@ -2,8 +2,9 @@
 {% block title %}{{ heading }}{% endblock %}
 {% block content %}
 <h1>{{ heading }}</h1>
+{% if no_action_view is defined %}<h2>POs with nothing left for the reviewer</h2>{% endif %}
 {% if not entries %}
-<div class="card muted">Nothing to review right now.</div>
+<div class="card muted">{{ "None." if no_action_view is defined else "Nothing to review right now." }}</div>
 {% else %}
 <div class="queue-list">
   {% for e in entries %}
@@ -19,9 +20,48 @@
 {% endif %}
 {% if no_action_view is defined %}
 <details class="more"><summary>Details</summary>
-  <p class="muted">Every PO here had no open matched NetSuite line (and no open candidate line)
-  when its packing slip was processed. The queue never shows them.</p>
+  <p class="muted">Every PO here either had no open matched NetSuite line (and no open candidate
+  line) when its packing slip was processed, or has nothing left for the reviewer to decide: its
+  only undecided lines are already received with every figure agreeing (listed below). The queue
+  never shows them.</p>
   <ul>{% for e in entries %}<li>{{ e.view.shipment_po.po_number_printed }}: {% for ln in e.view.lines %}{{ ln.state }}{{ ", " if not loop.last }}{% endfor %}</li>{% endfor %}</ul>
 </details>
+
+<h2>Lines already received, with every figure agreeing ({{ no_action_lines|length }})</h2>
+<p class="muted lede">Ordered, received and this packing slip are the same number, so there is
+nothing to update. These lines are left off the reviewer's page and out of every decision,
+including on POs still in the queue for their other lines. A flag the tool raised while reading
+the slip is kept and shown here; it did not stop the line being set aside, because NetSuite's
+received figure agrees with it.</p>
+{% if not no_action_lines %}
+<div class="card muted">None.</div>
+{% else %}
+<div class="table-scroll">
+<table>
+  <thead><tr>
+    <th scope="col">PO</th><th scope="col">Item</th><th scope="col" class="n">NetSuite line</th>
+    <th scope="col" class="n">Ordered</th><th scope="col" class="n">Received</th><th scope="col" class="n">On this slip</th>
+    <th scope="col">PO still in the queue?</th><th scope="col">Flag recorded</th>
+  </tr></thead>
+  {% for v, ln in no_action_lines %}
+  <tbody><tr>
+    <td class="item"><a href="/po/{{ v.id }}">{{ v.shipment_po.po_number_printed }}</a></td>
+    <td class="item">{{ ln.label }}{% if ln.src_recap_label %}<br><span class="muted">{{ ln.src_recap_label }}</span>{% endif %}</td>
+    <td class="n">{{ ln.ns_line_id or "–" }}</td>
+    <td class="n">{{ ln.current_quantity|qty }}</td>
+    <td class="n">{{ ln.current_quantity_received|qty }}</td>
+    <td class="n">{{ ln.src_quantity_text or "–" }}</td>
+    <td>{{ "No" if v.no_action_possible else "Yes, for its other lines" }}</td>
+    <td class="status">{% if ln.plain_reasons %}<span class="pill p-flag">Flagged</span>
+      <div class="why">{% for r in ln.plain_reasons %}<p>{{ r }}</p>{% endfor %}</div>
+      <details class="more"><summary>Details</summary><div class="muted">
+        Extraction confidence: {{ ln.extraction_confidence }}{% if ln.source_hint %} · source: {{ ln.source_hint }}{% endif %}
+        <br>Tool's reason: {{ ln.attention_reason }}</div></details>
+      {% else %}<span class="muted">None</span>{% endif %}</td>
+  </tr></tbody>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
 {% endif %}
 {% endblock %}

@@ -709,10 +709,12 @@ proposed_changes = Table(
     # --   PRE_EXISTING_RECEIPT  no history AND the line already carries receipts
     # --                         from before this tool existed. NOT a dispute --
     # --                         nothing contradicts anything, there is just nothing
-    # --                         to add to. Expected in a batch on first contact,
-    # --                         asks for a one-time confirmation, and RETIRES
-    # --                         ITSELF: the confirmation becomes history, so the
-    # --                         next slip on that line is ACCUMULATED.
+    # --                         to add to. The slip is COMPARED with the receipts,
+    # --                         never added (2026-10-21): all agreeing -> NO_CHANGE,
+    # --                         hidden from the reviewer; any disagreement ->
+    # --                         nothing proposed, flagged with the figures. No
+    # --                         combined total, and nothing "retires": a line the
+    # --                         tool never writes never gains history.
     # --   DISPUTED              our record and NetSuite CONTRADICT each other --
     # --                         we wrote one number and the line holds another, or
     # --                         the line moved since we last looked. Someone

@@ -355,6 +355,58 @@ def test_a_blocking_line_disables_approve() -> None:
               "and a POST anyway is refused")
 
 
+def test_received_and_agreeing_lines_are_kept_from_the_reviewer() -> None:
+    section("already received, every figure agreeing: off the review page, on the diagnostic one")
+    with _World() as w:
+        # PO 1662 line L (30/30) becomes "already received, agrees"; the PO keeps two
+        # lines that do need Paula. PO 1900's only line becomes the same, so that PO
+        # has nothing left to decide.
+        def mark_received_and_agreeing(change_id, qty, keep_flag=False):
+            values = dict(state=sc.STATE_NO_CHANGE, accumulation_basis="PRE_EXISTING_RECEIPT",
+                          current_quantity_received=qty, proposed_quantity=qty)
+            if not keep_flag:
+                values["attention_reason"] = None
+            with w.engine.begin() as conn:
+                conn.execute(proposed_changes.update().where(proposed_changes.c.id == change_id)
+                             .values(**values))
+        mark_received_and_agreeing(w.lines("1662")["L"]["id"], 30)
+        # PO 1900's line is medium confidence: the matcher sets it aside, flag kept.
+        check("extraction confidence medium" in (w.lines("1900")["S"]["attention_reason"] or ""),
+              "premise: PO 1900's line carries a confidence flag")
+        mark_received_and_agreeing(w.lines("1900")["S"]["id"], 5, keep_flag=True)
+        c = w.client()
+
+        queue, parked = c.get("/").text, c.get("/no-action").text
+        check("1662" in queue and "1900" not in queue,
+              "a PO with nothing left to decide leaves the queue; one with other lines stays")
+        check("1900" in parked and "Lines already received, with every figure agreeing (2)" in parked
+              and "Yes, for its other lines" in parked,
+              "the diagnostic page lists both lines, and says which PO is still queued")
+        check(parked.count(">Flagged<") == 1 and "work out part of this line" in parked
+              and "Tool's reason: extraction confidence medium" in parked,
+              "the kept confidence flag is shown there, in words and raw; the unflagged line has none",
+              str(parked.count(">Flagged<")))
+
+        html = c.get(f"/po/{w.po_id('1662')}").text
+        check(" / L<" not in html and " / S<" in html and " / M<" in html,
+              "the agreeing line has no row on the review page; the others do")
+        check("Approve 2 lines (1 flagged)" in html,
+              "and Approve covers only what the reviewer sees",
+              re.search(r'<button type="submit"[^>]*>([^<]+)<', html).group(1))
+        c.post(f"/po/{w.po_id('1662')}/approve", data=w.form(c, "1662"))
+        lines = w.lines("1662")
+        check(lines["L"]["human_verdict"] is None and lines["S"]["human_verdict"] == "ACCEPTED",
+              "approving records nothing on the hidden line",
+              f"L={lines['L']['human_verdict']} S={lines['S']['human_verdict']}")
+        check("1662" not in c.get("/").text and "1662" in c.get("/no-action").text,
+              "and once the rest is decided, the PO is parked like a closed one")
+
+        empty = c.get(f"/po/{w.po_id('1900')}").text
+        check("already received in NetSuite, and the figures agree. Nothing to do." in empty
+              and "has been decided" not in empty,
+              "a PO with only such lines says so, not that it was decided")
+
+
 def test_one_shared_block_reason_is_said_once() -> None:
     section("every line blocked for one reason: said once above the table, not per row")
     with _World() as w:
@@ -506,8 +558,8 @@ def test_the_wording_map_tracks_what_the_matcher_writes() -> None:
         "2 NetSuite line(s) match this style/colour/size (line 3, 41) but none is open":
             "no longer open",
         "extraction confidence medium: PO carried forward": "work out part of this line",
-        "this line had 62 units received before the tool started tracking it":
-            "already received in NetSuite",
+        "NetSuite line 3 already shows 62 received, from before this tool tracked it, but "
+        "this slip says 60": "already shows goods received",
         "NetSuite line 5 holds 44, but ... Someone changed the line outside this tool":
             "has been changed since",
     }
@@ -518,16 +570,26 @@ def test_the_wording_map_tracks_what_the_matcher_writes() -> None:
     check(wording.reasons("something the matcher says next year") == [wording.UNRECOGNISED],
           "an unrecognised reason is never dropped: it says 'needs a look'")
 
+    # Given the row, the already-received sentence states the figures -- and never a sum.
+    received = "NetSuite line 5 already shows 52 received, from before this tool tracked it"
+    both = wording.reasons(received, {"current_quantity": "44.000",
+                                      "current_quantity_received": "52.000",
+                                      "src_quantity_text": "50"})
+    check(len(both) == 1 and "44 ordered but 52 received" in both[0]
+          and "This packing slip says 50, and NetSuite has 52 received" in both[0],
+          "with figures to hand, the sentence states them plainly", str(both))
+    check(not any(s in both[0] for s in ("102", "96", "94")),
+          "and adds none of them together", both[0])
+
     def blocked(**row):
         return SimpleNamespace(row={"state": "NEEDS_ATTENTION", "ns_line_id": "3",
                                     "ns_line_is_open": True, "accumulation_basis": None, **row})
 
     pre = wording.block_explanations([blocked(accumulation_basis="PRE_EXISTING_RECEIPT")] * 2)
     check(pre == [(wording.BLOCK_MESSAGES["pre_existing"], 2)]
-          and pre[0][0].startswith("These lines were already received in NetSuite before this "
-                                   "packing slip arrived.")
-          and pre[0][0].endswith("There's nothing to approve here yet."),
-          "a PRE_EXISTING_RECEIPT PO explains the disabled Approve in the agreed words")
+          and pre[0][0].startswith("NetSuite already shows goods received on these lines")
+          and "doesn't add a packing slip to earlier receipts" in pre[0][0],
+          "a PRE_EXISTING_RECEIPT PO explains the disabled Approve without offering a total")
     check(wording.block_explanations([blocked(ns_line_is_open=False)])[0][0]
           == wording.BLOCK_MESSAGES["not_updatable"],
           "a line with no open NetSuite line gets the not-updatable message")

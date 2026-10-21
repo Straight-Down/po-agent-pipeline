@@ -83,6 +83,15 @@ class Line:
         return self.row["state"] in REVIEW_STATES and self.row["human_verdict"] is None
 
     @property
+    def no_action_needed(self) -> bool:
+        """Already received in NetSuite, and ordered, received and the slip all agree
+        (2026-10-21). Never shown to the reviewer and never part of a verdict: like a
+        PO with no open line, it appears only on the diagnostic page."""
+        return (self.row["state"] == sc.STATE_NO_CHANGE
+                and self.row["accumulation_basis"] == "PRE_EXISTING_RECEIPT"
+                and self.row["human_verdict"] is None)
+
+    @property
     def flagged(self) -> bool:
         return self.row["state"] == sc.STATE_NEEDS_ATTENTION
 
@@ -105,7 +114,7 @@ class Line:
     @property
     def plain_reasons(self) -> list[str]:
         """What Paula reads about this line; the raw reason goes under Details."""
-        return wording.reasons(self.row["attention_reason"])
+        return wording.reasons(self.row["attention_reason"], self.row)
 
     @property
     def label(self) -> str:
@@ -184,8 +193,18 @@ class PoView:
         return [ln for ln in self.lines if ln.disposition == "refused"]
 
     @property
+    def shown_lines(self) -> list[Line]:
+        """Every line the reviewer sees and decides on: all but `no_action_lines`."""
+        return [ln for ln in self.lines if not ln.no_action_needed]
+
+    @property
+    def no_action_lines(self) -> list[Line]:
+        """Already received and agreeing: listed on the diagnostic page only."""
+        return [ln for ln in self.lines if ln.no_action_needed]
+
+    @property
     def awaiting(self) -> list[Line]:
-        return [ln for ln in self.lines if ln.awaiting]
+        return [ln for ln in self.shown_lines if ln.awaiting]
 
     @property
     def blocking(self) -> list[Line]:
@@ -193,8 +212,8 @@ class PoView:
 
     @property
     def covered(self) -> list[Line]:
-        """The lines an Approve records a verdict on."""
-        return [ln for ln in self.lines if ln.disposition in ("approve", "accept_no_change")]
+        """The lines an Approve records a verdict on. Never a no-action line."""
+        return [ln for ln in self.shown_lines if ln.disposition in ("approve", "accept_no_change")]
 
     @property
     def flagged_covered(self) -> int:
@@ -219,17 +238,23 @@ class PoView:
         No line of this PO has an OPEN matched NetSuite line -- counting candidate
         lines too. NEEDS_RESOLUTION has no target (so `ns_line_is_open` is NULL)
         but two or more OPEN candidates; reading the row alone parked it as closed.
+
+        Also true when nothing the reviewer would see is still waiting: a PO whose
+        only awaiting lines need no action (already received, figures agree) has
+        nothing to decide, and goes to the diagnostic page like a closed one.
         """
-        return not self.candidate_open and not any(ln.row["ns_line_is_open"]
-                                                   for ln in self.lines)
+        shown = self.shown_lines
+        nothing_open = not self.candidate_open and not any(ln.row["ns_line_is_open"]
+                                                           for ln in shown)
+        return nothing_open or not any(ln.awaiting for ln in shown)
 
     @property
     def flagged_lines(self) -> list[Line]:
-        return [ln for ln in self.lines if ln.flagged]
+        return [ln for ln in self.shown_lines if ln.flagged]
 
     @property
     def other_lines(self) -> list[Line]:
-        return [ln for ln in self.lines if not ln.flagged]
+        return [ln for ln in self.shown_lines if not ln.flagged]
 
     @property
     def override_protected_covered(self) -> list[Line]:
@@ -285,8 +310,8 @@ def _disposition(row: dict) -> tuple[str, str]:
     if row["proposed_quantity"] is None:
         basis = row["accumulation_basis"]
         if basis == "PRE_EXISTING_RECEIPT":
-            return "block", ("needs the line's total confirmed once (PRE_EXISTING_RECEIPT); "
-                             "that input is not in v1")
+            return "block", ("PRE_EXISTING_RECEIPT: already received, and ordered or the slip "
+                             "disagrees with received -- nothing proposed, by design")
         if basis == "DISPUTED":
             return "block", "DISPUTED: nothing proposed -- NetSuite and this tool's record disagree"
         return "block", "no quantity proposed"

@@ -54,7 +54,7 @@ The column that matters is the second-to-last: **six of these the build plan doe
 
 ## 1. A verdict on EVERY line shown, including accepted-unchanged
 
-**BUILT AND TESTED, 2026-09-30** (`review_app`): an Approve records `ACCEPTED`, reviewer and time on every line it covers, NO_CHANGE lines included; a Reject records `REJECTED` and the reason on every awaiting line. `test_review_app.test_approve_records_a_verdict_on_every_line`.
+**BUILT AND TESTED, 2026-09-30** (`review_app`): an Approve records `ACCEPTED`, reviewer and time on every line it covers, NO_CHANGE lines included; a Reject records `REJECTED` and the reason on every awaiting line. **Exception (2026-10-21):** a line already received in NetSuite with ordered, received and the slip all agreeing is never shown to the reviewer, so neither verdict touches it; it stays `NO_CHANGE` with no verdict and is listed on the diagnostic page. `test_review_app.test_approve_records_a_verdict_on_every_line`.
 
 > *"This only works if the review UI records a verdict on EVERY line it shows, including lines
 > accepted unchanged."* — `PO-Update-Automation-Schema-Rationale.md` §8
@@ -425,7 +425,7 @@ line.
 | Line matches what our record says we wrote | `ACCUMULATED` — propose base + this slip |
 | Line differs from what we wrote | `DISPUTED` — **nothing proposed**, both numbers to Paula |
 | No history, nothing received | `FIRST_SHIPMENT` — base zero, propose the slip |
-| No history, but goods already received | `PRE_EXISTING_RECEIPT` — confirm the total once |
+| No written history, but goods already received | `PRE_EXISTING_RECEIPT` — compared, never added (2026-10-21): all agree → no action; any disagreement → nothing proposed, figures stated |
 | Seen before, never written, line has moved since | `DISPUTED` — edited outside the tool |
 
 **The tool does not reconcile.** Picking one source as authoritative is exactly the judgement that
@@ -454,9 +454,16 @@ axes in 0003.
 ### The day-one case is separate from the alarming one
 
 `PRE_EXISTING_RECEIPT` is **not** a dispute. Nothing contradicts anything: the line simply has no
-history and already carries receipts from before this tool existed. It asks *"this line had N units
-received before the tool started tracking it; confirm the total"*, and it **retires itself** — the
-confirmation becomes history, so the next slip on that line is an ordinary `ACCUMULATED`.
+history and already carries receipts from before this tool existed. **Rebuilt 2026-10-21 (Kiko):**
+a PO split across deliveries is rare, so the slip is never added to existing receipts and no
+combined total is ever suggested. If ordered, received and the slip all agree, nothing is needed:
+the line is `NO_CHANGE`, kept off the reviewer's page and listed only on the diagnostic page — even
+with a medium/low extraction-confidence flag, which stays recorded and is shown there (no other flag
+yields). If
+either figure disagrees with received, nothing is proposed and the line is flagged with the figures
+stated. There is no confirm-a-total step, so the case no longer "retires itself" — a line the tool
+never writes never gains history. (Superseded: *"this line had N units received before the tool
+started tracking it; confirm the total"*.)
 
 `DISPUTED` is reserved for a genuine contradiction and should never be routine. **They cannot share
 a label:** `PRE_EXISTING_RECEIPT` is guaranteed to arrive in a batch on first contact, and a
@@ -466,15 +473,16 @@ already watched that happen once — §5 above is the same failure in the confid
 
 **The wave is 426 open PO lines across 33 POs** (sandbox, 2026-09-16,
 `scripts/estimate_pre_existing_receipts.py`). A ceiling, not a forecast: only the part of it that
-actually ships asks anything, and each asks once. Re-run against production before cutover.
+actually ships is judged at all, and only lines whose figures disagree reach the reviewer — each
+time a slip touches them, until fixed in NetSuite. Re-run against production before cutover.
 
 **Do not backfill `write_attempts` to suppress it.** Writing "this tool wrote N" for a quantity it
 did not write fabricates the record that every later accumulation on that line is computed from —
 one invented base is wrong forever, compounds with each shipment, and is indistinguishable
-afterwards from a real write. 426 one-time questions is the cheaper price.
+afterwards from a real write. At most 426 flags is the cheaper price.
 
 **For the screen:** these two need visibly different treatment. A `PRE_EXISTING_RECEIPT` row is a
-confirmation prompt; a `DISPUTED` row is an alarm. They share a state (`NEEDS_ATTENTION`) and are
+statement of figures that disagree (nothing proposed, no total offered); a `DISPUTED` row is an alarm. They share a state (`NEEDS_ATTENTION`) and are
 told apart only by `accumulation_basis`.
 
 **For the screen:** show the basis. An `ACCUMULATED` row is the one case where the proposed quantity

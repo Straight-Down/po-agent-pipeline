@@ -546,4 +546,18 @@ not as history - a rule without its failure mode gets rationalised away.
   session-scoped fixture holding an engine would be carried into the re-run.
   The second summary line names every re-run test; a run with re-runs is not a
   clean run.
+- **A line with receipts and no WRITTEN history is COMPARED with the slip, never
+  added to it** (Kiko, 2026-10-21; `matcher._accumulated_quantity`). Ordered =
+  received = slip is `NO_CHANGE` with basis `PRE_EXISTING_RECEIPT`, which the
+  review app hides from the reviewer and from every verdict (`Line.no_action_needed`);
+  anything else is `NEEDS_ATTENTION` with nothing proposed and the figures stated.
+  An agreeing line is set aside even with a medium/low extraction-confidence flag -
+  the flag stays in `attention_reason`/`needs_review` and shows on `/no-action` -
+  but ONLY that flag yields; any other reason (carton backing, colour, closed...)
+  keeps it in review (`test_agreeing_receipts_set_a_confidence_flag_aside_but_keep_it`).
+  Never reintroduce a "confirm the total" prompt or any sentence offering slip +
+  received. The comparison also runs for a line SEEN but never written: skipping it
+  there let a re-run of the same email propose the slip's figure outright onto a
+  received line (`test_the_receipt_rule_survives_a_second_sighting`). `ACCUMULATED`
+  (lines this tool wrote) is untouched - Paula's 2026-09-16 ruling stands.
 - <add the next one here>

@@ -98,6 +98,7 @@
     shipped {{ s.shipped_on_matched|qty }}, difference {{ s.variance|qty }}{% if s.variance_pct is not none %} ({{ "%+.1f"|format(s.variance_pct * 100) }}%){% endif %};
     {{ s.over }} over, {{ s.under }} under, {{ s.equal }} equal.{% endif %}
     “Ordered” is NetSuite's current quantity on the lines this slip names; PO lines the slip does not mention are not shipped yet and have no row here.
+    {% if view.no_action_lines %}{{ view.no_action_lines|length }} line{{ "s" if view.no_action_lines|length != 1 }} on this slip {{ "are" if view.no_action_lines|length != 1 else "is" }} already received in NetSuite with ordered, received and the slip all agreeing, so {{ "they need" if view.no_action_lines|length != 1 else "it needs" }} nothing and {{ "have" if view.no_action_lines|length != 1 else "has" }} no row here either.{% endif %}
   </div></details>
 </div>
 
@@ -116,16 +117,17 @@
 {#- Presentation only: decided from what each row would already show. Every line
     blocked, all in one block group, all with the same plain-English reasons and
     the same tag (accumulation basis). Anything differing keeps it per line. -#}
-{%- set first_line = view.lines[0] if view.lines else none -%}
-{%- set same_block = view.lines|length > 1
-      and view.lines|selectattr("disposition", "ne", "block")|list|length == 0
+{%- set shown = view.shown_lines -%}
+{%- set first_line = shown[0] if shown else none -%}
+{%- set same_block = shown|length > 1
+      and shown|selectattr("disposition", "ne", "block")|list|length == 0
       and view.block_explanations|length == 1
-      and view.lines|rejectattr("plain_reasons", "equalto", first_line.plain_reasons)|list|length == 0
-      and view.lines|rejectattr("accumulation_basis", "equalto", first_line.accumulation_basis)|list|length == 0 -%}
+      and shown|rejectattr("plain_reasons", "equalto", first_line.plain_reasons)|list|length == 0
+      and shown|rejectattr("accumulation_basis", "equalto", first_line.accumulation_basis)|list|length == 0 -%}
 {% if same_block %}
 <div class="card block-all">
   <p class="plain"><span class="pill p-stop">Can't be approved yet</span>
-    All {{ view.lines|length }} lines on this PO{% if first_line.plain_reasons %}, each for the same reason:{% else %}, for the same reason. It's explained with your decision at the bottom of the page.{% endif %}</p>
+    All {{ shown|length }} lines on this PO{% if first_line.plain_reasons %}, each for the same reason:{% else %}, for the same reason. It's explained with your decision at the bottom of the page.{% endif %}</p>
   {% for r in first_line.plain_reasons %}<p class="plain">{{ r }}</p>{% endfor %}
 </div>
 {% endif %}
@@ -179,6 +181,8 @@
     <p class="muted">Nothing on this PO will be updated. Your reason is saved with it.</p>
   </form>
 </div>
+{% elif view.no_action_lines and not view.shown_lines %}
+<div class="card">Every line on this packing slip was already received in NetSuite, and the figures agree. Nothing to do.</div>
 {% else %}
 <div class="card">This PO has been decided. Nothing to do.</div>
 {% endif %}

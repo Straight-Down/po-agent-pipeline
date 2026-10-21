@@ -102,11 +102,11 @@ QUANTITY_TOLERANCE = 0.001
 BASIS_FIRST_SHIPMENT = "FIRST_SHIPMENT"  # nothing written before; base is zero
 BASIS_ACCUMULATED = "ACCUMULATED"  # added to what this tool previously wrote
 
-#: No history AND the line already carries receipts from before this tool existed.
-#: **Not a dispute** -- nothing disagrees, there is simply nothing to compare. It is
-#: the expected state of every partially-received line on first contact, it asks for
-#: a one-time confirmation, and it RETIRES ITSELF: once confirmed and written the
-#: line has history, so every later slip is an ordinary ACCUMULATED.
+#: No written history AND the line already carries receipts from before this tool
+#: tracked it. **Not a dispute.** The slip is COMPARED with the receipts, never
+#: added to them (Kiko, 2026-10-21): ordered == received == slip is NO_CHANGE and
+#: needs no reviewer; any disagreement is flagged with the figures and nothing is
+#: proposed. No combined total is ever offered. See `_accumulated_quantity`.
 BASIS_PRE_EXISTING_RECEIPT = "PRE_EXISTING_RECEIPT"
 
 #: Our record and NetSuite genuinely CONTRADICT each other -- we wrote one number
@@ -847,18 +847,25 @@ def _accumulated_quantity(
     - **Never seen before, nothing received.** An ordinary first shipment. The
       base is zero and the slip's figure is the proposal, which is what this
       engine did for every line before accumulation existed.
-    - **Never seen before, but goods have already been received against it.**
-      `PRE_EXISTING_RECEIPT`, and **deliberately not a dispute.** Nothing
-      contradicts anything; there is simply no history, which is the expected state
-      of every partially-received line the first time a slip touches it after this
-      feature shipped. Accumulating from zero would propose only this slip and lose
-      the earlier units, so nothing is proposed and a human confirms the total once.
-      It **retires itself**: that confirmation becomes history, and the next slip on
-      the line is an ordinary `ACCUMULATED`.
+    - **Goods have already been received against it** (and this tool never wrote
+      it). `PRE_EXISTING_RECEIPT`, **deliberately not a dispute.** Rebuilt 2026-10-21
+      (Kiko): a PO split across deliveries is rare, so the tool NEVER adds this
+      slip on top of existing receipts and NEVER suggests a combined total. Two
+      outcomes, decided by comparing the figures, never by adding them:
+        - ordered == received AND slip == received -> nothing to do. Returned as
+          NetSuite's own quantity, so the line lands in NO_CHANGE; the review app
+          keeps it off the reviewer's page and lists it only on the diagnostic page.
+        - either figure disagrees with received -> nothing proposed, flagged with
+          the figures stated, for a human to sort out in NetSuite.
+      The confirm-a-total-once step this replaced is gone, and with it the idea that
+      the case "retires itself": a line the tool never writes never gains history.
     - **Seen before but never written** (proposed and rejected, or still pending).
       The base is still zero, because an unwritten proposal changed nothing. But
       the observation is kept: if NetSuite's quantity has moved since we looked,
-      someone edited the line, and THAT is a genuine dispute.
+      someone edited the line, and THAT is a genuine dispute. If it has not moved
+      and the line carries receipts, the receipt rule above still applies -- having
+      SEEN a line gives the tool nothing of its own to add to, and without this a
+      re-run of the same email (which records an observation) would skip the rule.
 
     ## Why the expected case and the alarming case do not share a label
 
@@ -912,10 +919,10 @@ def _accumulated_quantity(
         payload["basis"] = BASIS_ACCUMULATED
         return expected + slip, payload, None
 
+    payload.update({"base_quantity": 0.0, "prior_writes": 0})
     if history is not None and history.observed_quantity is not None:
         observed = float(history.observed_quantity)
-        payload.update({"base_quantity": 0.0, "observed_quantity": observed,
-                        "observed_at": history.observed_at, "prior_writes": 0})
+        payload.update({"observed_quantity": observed, "observed_at": history.observed_at})
         if abs(ns_quantity - observed) > QUANTITY_TOLERANCE:
             payload["basis"] = BASIS_DISPUTED
             return None, payload, (
@@ -924,21 +931,37 @@ def _accumulated_quantity(
                 "it. Someone changed the line outside this tool. No quantity proposed — the "
                 f"shipped {slip:g} on this slip cannot be added to a base the tool cannot vouch for"
             )
-        payload["basis"] = BASIS_FIRST_SHIPMENT
-        return slip, payload, None
+        # Not moved since we looked. Fall through: seen-but-never-written gives the
+        # tool nothing of its own to add to, so receipts are judged exactly as on
+        # first sight.
 
     received = float(line.quantity_received or 0.0)
-    payload.update({"base_quantity": 0.0, "prior_writes": 0,
-                    "quantity_received": received})
+    payload["quantity_received"] = received
     if received > QUANTITY_TOLERANCE:
-        # Expected, one-time, and phrased as a question rather than an alarm.
-        # See the docstring on why this is deliberately not DISPUTED.
+        # Compared, NEVER added (Kiko, 2026-10-21). See the docstring on why this is
+        # deliberately not DISPUTED, and why there is no combined total.
         payload["basis"] = BASIS_PRE_EXISTING_RECEIPT
+        ordered_agrees = abs(ns_quantity - received) <= QUANTITY_TOLERANCE
+        slip_agrees = abs(slip - received) <= QUANTITY_TOLERANCE
+        payload.update({"ordered_agrees_with_received": ordered_agrees,
+                        "slip_agrees_with_received": slip_agrees})
+        if ordered_agrees and slip_agrees:
+            # Nothing to do. NetSuite's own value, not `slip`, so the line compares
+            # exactly equal and lands in NO_CHANGE rather than a tolerance-sized change.
+            return line.quantity, payload, None
+        disagreements = []
+        if not ordered_agrees:
+            disagreements.append(f"its ordered quantity is {ns_quantity:g}")
+        if not slip_agrees:
+            disagreements.append(f"this slip says {slip:g}")
+        # The wording module keys on "from before this tool tracked it": keep that
+        # phrase whole in one literal (test_the_wording_map_tracks_what_the_matcher_writes).
         return None, payload, (
-            f"this line had {received:g} units received before the tool started tracking it, "
-            f"and this slip adds {slip:g}. Nothing disagrees — there is simply no history to "
-            "add to, so confirm the total this line should hold. Once confirmed, later "
-            "shipments on this line accumulate automatically"
+            f"NetSuite line {line.line_id} already shows {received:g} received, "
+            "from before this tool tracked it, "
+            f"but {' and '.join(disagreements)}. No quantity proposed — "
+            "the tool does not add a slip to earlier receipts and does not suggest a "
+            "combined total"
         )
     payload["basis"] = BASIS_FIRST_SHIPMENT
     return slip, payload, None
@@ -1246,6 +1269,7 @@ def build_proposed_changes(
                 f"{change.style_number}/{change.color}/{change.size} "
                 f"(normalized size {_normalize_size(change.size)})"
             )
+        confidence_reason = None
         if confidence in REVIEW_CONFIDENCES:
             # Discharged ONLY by a complete proof of every field from the grid
             # (Kiko, 2026-10-01). Never by the extractor's note, and never by two
@@ -1255,8 +1279,9 @@ def build_proposed_changes(
             if proof.get("proven"):
                 change.confidence_discharge = proof["text"]
             else:
-                reasons.append(f"extraction confidence {confidence}"
-                               + (f": {note}" if note else ""))
+                confidence_reason = (f"extraction confidence {confidence}"
+                                     + (f": {note}" if note else ""))
+                reasons.append(confidence_reason)
         backing = vl.get("carton_backing") or {}
         if backing.get("status") == "UNVERIFIABLE":
             # Kept rather than dropped (Paula, 2026-09-23): a rule that cannot be
@@ -1272,7 +1297,19 @@ def build_proposed_changes(
             # there in `accumulation["slip_quantity"]`.
             reasons.append("vendor line has no quantity")
 
-        if reasons:
+        # Already received, and ordered, received and the slip all agree: nothing to
+        # do, even when the extraction was medium/low confidence (Kiko, 2026-10-21).
+        # The flag is NOT discharged -- it stays recorded in `attention_reason` (and
+        # `needs_review`) and the review app shows it on the diagnostic page -- it
+        # just does not put a no-op in front of a reviewer. ONLY the confidence flag
+        # yields: any other reason, or any disagreeing figure, keeps the line in review.
+        receipts_agree = (accumulation.get("basis") == BASIS_PRE_EXISTING_RECEIPT
+                          and accumulation.get("ordered_agrees_with_received")
+                          and accumulation.get("slip_agrees_with_received"))
+        if receipts_agree and confidence_reason and reasons == [confidence_reason]:
+            change.status = STATUS_NO_CHANGE
+            change.attention_reason = confidence_reason
+        elif reasons:
             # NEEDS_RESOLUTION is the narrow case: several open lines, a human
             # picks one. Everything else that blocks a write stays NEEDS_ATTENTION.
             if assignment:

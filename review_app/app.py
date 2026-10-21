@@ -69,10 +69,15 @@ def create_app(settings: Settings, engine=None, now=None) -> FastAPI:
     @app.get("/no-action", response_class=HTMLResponse)
     def no_action(request: Request):
         with engine.connect() as conn:
-            entries = [e for e in data.list_queue(conn) if e.view.no_action_possible]
+            everything = data.list_queue(conn)
+        entries = [e for e in everything if e.view.no_action_possible]
+        # Already received with every figure agreeing: on ANY PO, including ones still
+        # in the queue for their other lines. The reviewer never sees these lines.
+        no_action_lines = [(e.view, ln) for e in everything for ln in e.view.no_action_lines]
         # DIAGNOSTIC ONLY: reachable by URL, linked from nowhere.
         return page(request, "queue.html", entries=entries, no_action_view=True,
-                    heading="Diagnostic: POs with no open NetSuite line when processed "
+                    no_action_lines=no_action_lines,
+                    heading="Diagnostic: nothing for the reviewer to do "
                             "(not shown to the reviewer)")
 
     @app.get("/po/{shipment_po_id}", response_class=HTMLResponse)

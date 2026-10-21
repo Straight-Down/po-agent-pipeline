@@ -183,6 +183,8 @@ calibrates it.
 
 **CONFIRMED by Paula, 2026-09-16: "per PO".** Recorded as OPEN in three places before that; the reasoning below is what was put to her and what she agreed with.
 
+**SUPERSEDED 2026-10-21 (Kiko): approval is per line, with every line ticked by default** -- one doubtful line must not block the rest of the PO. Not built yet; the review app is still per PO. See `RUNBOOK.md` §11, Phase 4 decision 5, which also records today's behaviour.
+
 > *"the Phase 3 approval unit must be defined deliberately — per PO, per shipment, or per line —
 > rather than falling out of the implementation."* — `RUNBOOK.md` §7
 >

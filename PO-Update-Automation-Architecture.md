@@ -91,7 +91,7 @@ Computes proposed new Quantity, Expected Receipt Date, Override Expected Receipt
 
 **Review & approve**
 Human-in-the-loop step, permanent by design (per Paula's and Kiko's decision this session). Two viable implementations, roughly in order of build effort:
-- *Simplest*: an email digest with an approve/reject link **per PO**, no custom UI to build. **The unit is per PO, not per shipment or per line** — PROPOSED and pending Paula's confirmation; reasoning in `PO-Update-Automation-Phase3-Requirements.md` §6, which also consolidates every other requirement this step has to satisfy.
+- *Simplest*: an email digest with an approve/reject link **per PO**, no custom UI to build. **The unit was ruled per PO** (Paula, 2026-09-16; `PO-Update-Automation-Phase3-Requirements.md` §6, which also consolidates every other requirement this step has to satisfy) **and is superseded 2026-10-21: per line, every line ticked by default**, so one doubtful line does not block the rest. Not built yet; see `RUNBOOK.md` §11, Phase 4 decision 5.
 - *Small dashboard*: a lightweight internal web page (e.g., a single FastAPI + HTMX or Next.js page) listing pending shipments with a diff table and Approve/Reject/Edit buttons — closer to what the sample spreadsheet we generated this session (`Proposed_PO_Updates_SD-219.xlsx`) shows, but interactive and persistent instead of a one-off file.
 - **Decided by Paula (2026-08-10): receipt dates are never auto-proposed.** She determines Expected Receipt Date / Updated Receipt Date herself — "it's a receiving date and includes buffers," not the vendor's port ETA or any other vendor-stated date. This means the simple approve/reject-a-computed-value pattern **does not work for the date fields specifically**, even though it's fine for Quantity. The review step needs an input, not just a decision: show the vendor's raw ETD/ETA as reference only (clearly labeled as reference, not a proposal), and require Paula to type in the actual receipt date before the write-back can proceed. An email-link flow needs a lightweight form for this (even a simple "reply with the date" or a linked mini-form), not a bare Approve button, for any shipment carrying a date field. Quantity can still move through a plain approve/reject, since that value is decided by policy, not by Paula's judgment.
 
@@ -102,7 +102,7 @@ On approval, calls NetSuite's REST API (or a SuiteScript RESTlet, if the standar
 Every shipment processed, every proposed change, who approved it and when, and the NetSuite write result — stored durably (Azure SQL Database, serverless tier — see §4.2). This is something Option A can't really give us.
 
 **Notifications**
-Confirms success/failure back to Paula (and optionally Kiko) — email or Teams message.
+~~Confirms success/failure back to Paula (and optionally Kiko) — email or Teams message.~~ **Decided 2026-10-21** (`RUNBOOK.md` §11, Phase 4 decisions 1-2): a once-daily email digest to the approver when changes are waiting, blocked on Graph `Mail.Send` scoped to `shipments@`, with no notification until then. Write success and failure are shown on screen per line when she approves, not sent afterwards.
 
 ### 4.2 Tech stack (decided 2026-08-05)
 

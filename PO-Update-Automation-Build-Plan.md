@@ -169,7 +169,7 @@ Build it when a real multi-vendor email appears, not before — and when it does
 
    Concretely, the screen needs: the group's rows together, each with its recap label and quantity; the shared candidate lines once rather than repeated per row; and remaining choices narrowing as each assignment is made. The grouping key is `(shipment_po_id, key_style, key_color, key_size)` — i.e. the canonical key **without** `key_recap_label`, which is exactly `matcher._sibling_key`. This is the first review-screen requirement with cross-row state; everything before it was per-row.
 3. Error handling: what happens if NetSuite rejects a write (e.g., closed PO, permission error) — should surface clearly, not fail silently.
-4. Confirmation notification back to Paula (and Kiko) on success/failure.
+4. ~~Confirmation notification back to Paula (and Kiko) on success/failure.~~ **Superseded 2026-10-21** (`RUNBOOK.md` §11, Phase 4 decisions 1-2): writes run while she waits and show a per-line result on screen; email is only a once-daily digest of waiting changes, blocked on Graph `Mail.Send`.
 
 **Exit criteria:** end-to-end flow works against sandbox — email in, review link out, approval in, NetSuite sandbox PO updated, confirmation out.
 

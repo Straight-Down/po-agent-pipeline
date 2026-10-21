@@ -482,6 +482,10 @@ not as history - a rule without its failure mode gets rationalised away.
   `ingest`, which import it. Approving sets APPROVED and stops; the write path
   is separate work. `test_review_app_never_imports_netsuite_client` checks the
   source AND a fresh interpreter's `sys.modules`, so a transitive import fails too.
+  **Planned narrowing, not removal** (RUNBOOK §11, Phase 4 decision 2): when
+  Approve starts writing synchronously, the app may call ONE write function with a
+  defined signature and nothing else, and this test is rewritten to enforce exactly
+  that. Until then the rule stands as written; never delete the test to make room.
 - **"Is any line open?" must read `change_candidates` as well as the row.** A
   line with no chosen target (NEEDS_RESOLUTION) has `ns_line_is_open` NULL and
   its open candidates in `change_candidates` (Requirements §2). Reading the row

@@ -355,6 +355,52 @@ def test_a_blocking_line_disables_approve() -> None:
               "and a POST anyway is refused")
 
 
+def test_one_shared_block_reason_is_said_once() -> None:
+    section("every line blocked for one reason: said once above the table, not per row")
+    with _World() as w:
+        # A second closed line on PO 1800, blocked exactly like the first.
+        s = w.lines("1800")["S"]
+        with w.engine.begin() as conn:
+            conn.execute(proposed_changes.insert().values(
+                {**s, "id": sc.new_id(), "key_size": "m", "src_size_text": "M", "ns_line_id": "2"}))
+        c = w.client()
+        url = f"/po/{w.po_id('1800')}"
+        html = c.get(url).text
+        main = main_text(html)
+        check(main.count("be approved yet") == 1 and "All 2 lines on this PO, each for the same reason" in main,
+              "the status is stated once, for the whole PO", str(main.count("be approved yet")))
+        check(main.count("no longer open") == 1,
+              "and the shared reason once, not under each row", str(main.count("no longer open")))
+        check(html.count("State: ") == 2 and 'name="fingerprint"' in html and "disabled" in html,
+              "each line keeps its Details; the form is untouched")
+        check(not INTERNAL.findall(main), "nothing internal leaks into the banner",
+              str(INTERNAL.findall(main)))
+
+        # Same reasons, but one line shows a different tag: not the same reason on screen.
+        m_id = w.lines("1800")["M"]["id"]
+        with w.engine.begin() as conn:
+            conn.execute(proposed_changes.update().where(proposed_changes.c.id == m_id)
+                         .values(accumulation_basis="DISPUTED"))
+        main = main_text(c.get(url).text)
+        check(main.count("be approved yet") == 2 and "changed in NetSuite since last seen" in main,
+              "a tag on one line only keeps it per line, with the tag shown")
+        with w.engine.begin() as conn:
+            conn.execute(proposed_changes.update().where(proposed_changes.c.id == m_id)
+                         .values(accumulation_basis=s["accumulation_basis"]))
+
+        # Same PO, but one line now carries an extra reason: mixed, so per line again.
+        with w.engine.begin() as conn:
+            conn.execute(proposed_changes.update()
+                         .where(proposed_changes.c.id == m_id)
+                         .values(attention_reason=s["attention_reason"]
+                                 + "; extraction confidence medium: test"))
+        main = main_text(c.get(url).text)
+        check(main.count("be approved yet") == 2 and "for the same reason" not in main,
+              "reasons that differ keep the per-line status", str(main.count("be approved yet")))
+        check(main.count("no longer open") == 2 and "work out part of this line" in main,
+              "and each line's own explanation")
+
+
 def test_source_documents_are_served_only_through_a_proposal() -> None:
     section("GET /source/{change_id}: one proposal's document, nothing else")
     with _World() as w:

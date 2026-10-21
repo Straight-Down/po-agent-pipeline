@@ -5,24 +5,17 @@
 {% if not entries %}
 <div class="card muted">Nothing to review right now.</div>
 {% else %}
-<table>
-  <thead><tr>
-    <th>PO</th><th>Vendor</th><th>Email received</th><th>What's needed</th><th></th>
-  </tr></thead>
-  <tbody>
+<div class="queue-list">
   {% for e in entries %}
     {% set v = e.view %}
-    <tr>
-      <td><a href="/po/{{ v.id }}">{{ v.shipment_po.po_number_printed }}</a>
-        {% if v.shipment_po.ns_tranid %}<br><span class="muted">{{ v.shipment_po.ns_tranid }}</span>{% endif %}</td>
-      <td>{{ v.shipment.vendor_name or "–" }}</td>
-      <td>{{ (v.message or {}).get("received_at") or "–" }}</td>
-      <td>{{ e.status }}</td>
-      <td>{% if e.escalated %}<span class="tag t-flag">some lines not counted as shipped</span>{% endif %}</td>
-    </tr>
+    <div class="queue-row{{ ' is-flagged' if e.escalated }}">
+      <span class="po"><a href="/po/{{ v.id }}">{{ v.shipment_po.po_number_printed }}</a>{% if v.shipment_po.ns_tranid %}<span class="muted">{{ v.shipment_po.ns_tranid }}</span>{% endif %}</span>
+      <span class="vendor">{{ v.shipment.vendor_name or "–" }} · email received {{ (v.message or {}).get("received_at") or "–" }}</span>
+      <span class="counts">{{ e.status }}</span>
+      {% if e.escalated %}<span class="tag t-flag">some lines not counted as shipped</span>{% endif %}
+    </div>
   {% endfor %}
-  </tbody>
-</table>
+</div>
 {% endif %}
 {% if no_action_view is defined %}
 <details class="more"><summary>Details</summary>

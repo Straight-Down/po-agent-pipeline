@@ -5,60 +5,166 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}PO review{% endblock %}</title>
 <style>
-  :root { --ink:#1d2330; --muted:#5f6b7a; --line:#dfe3ea; --bg:#f6f7f9; --card:#fff;
-          --flag:#b45309; --flagbg:#fff7ed; --alarm:#b91c1c; --alarmbg:#fef2f2;
-          --info:#1d4ed8; --infobg:#eff6ff; --ok:#15803d; --okbg:#f0fdf4; }
-  * { box-sizing: border-box; }
-  body { margin:0; font:14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
-         color:var(--ink); background:var(--bg); }
-  header.bar { display:flex; justify-content:space-between; align-items:center;
-               padding:10px 20px; background:var(--ink); color:#fff; }
-  header.bar a { color:#fff; margin-right:16px; text-decoration:none; }
-  .who { font-weight:600; background:#fff2; padding:3px 10px; border-radius:12px; }
-  main { max-width:1280px; margin:0 auto; padding:20px; }
-  h1 { font-size:20px; margin:0 0 12px; }
-  h2 { font-size:16px; margin:24px 0 8px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
-          padding:14px 16px; margin-bottom:14px; }
-  table { width:100%; border-collapse:collapse; background:var(--card); }
-  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line);
-           vertical-align:top; }
-  th { font-size:12px; color:var(--muted); font-weight:600; }
-  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
-  .muted { color:var(--muted); }
-  .tag { display:inline-block; font-size:11px; font-weight:600; padding:1px 7px;
-         border-radius:10px; border:1px solid currentColor; white-space:nowrap; }
-  .t-flag { color:var(--flag); background:var(--flagbg); }
-  .t-alarm { color:var(--alarm); background:var(--alarmbg); }
-  .t-info { color:var(--info); background:var(--infobg); }
-  .t-ok { color:var(--ok); background:var(--okbg); }
-  .group-flag { border-left:4px solid var(--flag); }
-  .warn { background:var(--alarmbg); border-color:#fecaca; }
-  .info { background:var(--flagbg); border-color:#fed7aa; }
-  details.more { margin-top:6px; }
-  details.more > summary { cursor:pointer; color:var(--muted); font-size:12px; }
-  details.more[open] > summary { margin-bottom:4px; }
+  /* Visual target: Claude outputs/po-review-mockup.html, "Bordered" treatment.
+     No web fonts are fetched (the app runs locally, possibly offline): IBM Plex
+     is used when installed, otherwise the system stack, at the mockup's sizes. */
+  :root {
+    --bg:#f7f7f5; --surface:#ffffff; --fg:#1a1d21; --fg-muted:#5c6670;
+    --rule:#ccd2d8; --rule-strong:#8d979f;
+    --accent:#1f3a5f; --accent-soft:#e8edf4;
+    --flag:#8a5a00; --flag-soft:#fdf3e0;
+    --ok:#19633f; --ok-soft:#e6f2ec;
+    --stop:#9a2727; --stop-soft:#fbeaea;
+    --font-ui:"IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --font-data:"IBM Plex Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    color-scheme:light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#14171a; --surface:#1c2024; --fg:#e8eaec; --fg-muted:#9aa4ad;
+      --rule:#333a41; --rule-strong:#6d777f;
+      --accent:#8fb3dd; --accent-soft:#1e2a39;
+      --flag:#e5b25d; --flag-soft:#322718;
+      --ok:#74c79b; --ok-soft:#16281f;
+      --stop:#e58a8a; --stop-soft:#2d1a1a;
+      color-scheme:dark;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:var(--font-ui);
+         font-size:16px; line-height:1.5; }
+  a { color:var(--accent); text-underline-offset:3px; }
+  a:focus-visible, button:focus-visible, summary:focus-visible,
+  input:focus-visible, textarea:focus-visible { outline:3px solid var(--flag); outline-offset:2px; }
+
+  /* 1240, not the mockup's 1100: the real line table has nine columns, not six. */
+  .wrap { max-width:1240px; margin-inline:auto; padding:28px 16px 64px; }
+
+  /* ---- page header ---- */
+  header.masthead { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:baseline;
+                    gap:8px 20px; border-bottom:3px solid var(--accent); padding-bottom:10px;
+                    margin-bottom:28px; }
+  header.masthead nav a { color:var(--fg); font-size:15px; font-weight:600; text-decoration:none; }
+  header.masthead nav a:hover { text-decoration:underline; }
+  .who { font-size:13.5px; color:var(--fg-muted); }
+
+  h1 { font-size:22px; font-weight:600; letter-spacing:-0.01em; margin:0 0 8px; text-wrap:balance; }
+  h1.po-title { font-family:var(--font-data); font-size:22px; }
+  h1.po-title .muted { font-family:var(--font-ui); font-size:15px; font-weight:400; }
+  h2 { font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:0.08em;
+       color:var(--fg-muted); margin:32px 0 8px; }
+  .lede { font-size:14px; margin:0 0 20px; }
+  .muted { color:var(--fg-muted); }
   .plain { margin:0 0 4px; }
-  .ref { background:var(--infobg); border-color:#bfdbfe; }
+  .plain:last-child { margin-bottom:0; }
+
+  /* ---- cards (summary, reference, notices, forms) ---- */
+  .card { background:var(--surface); border:1px solid var(--rule); border-radius:3px;
+          padding:12px 14px; margin-bottom:14px; font-size:14px; }
+  .card.info { background:var(--flag-soft); border-left:4px solid var(--flag); }
+  .card.warn { background:var(--stop-soft); border-left:4px solid var(--stop); }
+  .card.ref  { border-left:4px solid var(--accent); }
+  .card.block-all { border-left:4px solid var(--stop); font-size:15px; }
+  .card.block-all .pill { margin-right:6px; vertical-align:1px; }
+
+  /* ---- queue ---- */
+  .queue-list { display:grid; gap:8px; }
+  .queue-row { display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 16px;
+               background:var(--surface); border:1px solid var(--rule);
+               border-left:4px solid var(--accent); border-radius:3px; padding:14px 16px; }
+  .queue-row.is-flagged { border-left-color:var(--flag); }
+  .queue-row .po { font-family:var(--font-data); font-size:16px; font-weight:600; letter-spacing:-0.01em; }
+  .queue-row .po a { color:var(--fg); text-decoration-thickness:1px; }
+  .queue-row .po .muted { font-weight:400; font-size:13.5px; margin-left:6px; }
+  .queue-row .vendor { color:var(--fg-muted); font-size:14px; }
+  .queue-row .counts { margin-left:auto; font-size:14px; font-variant-numeric:tabular-nums; }
+
+  /* ---- line tables ---- */
+  .table-scroll { overflow-x:auto; min-width:0; border:1px solid var(--rule); border-radius:3px;
+                  background:var(--surface); margin-bottom:14px; }
+  .table-scroll.group-flag { border-left:4px solid var(--flag); }
+  table { border-collapse:collapse; width:100%; }
+  .table-scroll > table { min-width:900px; }
+  th, td { text-align:left; padding:10px 12px; vertical-align:top; }
+  thead th { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em;
+             color:var(--fg-muted); border-bottom:2px solid var(--rule-strong); white-space:nowrap; }
+  tbody { border-bottom:1px solid var(--rule); }
+  tbody:last-child { border-bottom:0; }
+  .n { text-align:right; font-family:var(--font-data); font-variant-numeric:tabular-nums; white-space:nowrap; }
+  thead th.n { font-family:var(--font-ui); }
+  .n strong { font-weight:600; }
+  .n .sub { display:block; max-width:24ch; margin-left:auto; white-space:normal;
+            font-family:var(--font-ui); font-size:12.5px; line-height:1.35; }
+  .item { font-family:var(--font-data); font-size:13.5px; white-space:nowrap; }
+  .item .muted { font-family:var(--font-ui); font-size:12.5px; }
+  td.status { min-width:15ch; max-width:30ch; font-size:14px; }
+  td.status > * + * { margin-top:6px; }
+  td.doc { font-size:14px; white-space:nowrap; }
+  tbody.is-change td { background:var(--accent-soft); }
+  tbody.is-change td.proposed strong { color:var(--accent); }
+  tbody.is-flag td { background:var(--flag-soft); }
+  /* The plain-English explanation: its own row, directly under the line it explains. */
+  tr.why-row td { padding-top:0; }
+  tr.has-why td { border-bottom:0; }
+  .why { font-size:13.5px; color:var(--fg-muted); max-width:72ch; margin:0; }
+  .why p { margin:0 0 4px; }
+  .why p:last-child { margin-bottom:0; }
+  .why .verbatim { white-space:pre-wrap; }
   .note { white-space:pre-wrap; max-width:420px; }
-  button { font:inherit; padding:7px 14px; border-radius:6px; border:1px solid var(--ink);
-           background:var(--ink); color:#fff; cursor:pointer; }
-  button[disabled] { opacity:.45; cursor:not-allowed; }
-  button.secondary { background:#fff; color:var(--alarm); border-color:var(--alarm); }
-  textarea, input[type=date] { font:inherit; padding:6px; border:1px solid var(--line);
-                               border-radius:6px; }
-  textarea { width:100%; min-height:60px; }
-  .actions { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+
+  /* ---- status words ---- */
+  .pill, .tag { display:inline-block; font-family:var(--font-ui); font-size:12px; font-weight:600;
+                letter-spacing:0.02em; padding:2px 8px; border-radius:2px; border:1px solid currentColor;
+                white-space:nowrap; line-height:1.5; }
+  .p-change, .t-info  { color:var(--accent); }
+  .p-same,   .t-ok    { color:var(--ok); }
+  .p-flag,   .t-flag  { color:var(--flag); }
+  .p-stop,   .t-alarm { color:var(--stop); }
+  .p-quiet  { color:var(--fg-muted); }
+  .tag { white-space:normal; }
+  .by { display:block; font-size:12.5px; }
+
+  /* ---- Details toggles ---- */
+  details.more { margin-top:6px; font-size:13px; }
+  details.more > summary { cursor:pointer; color:var(--fg-muted); font-size:12.5px; }
+  details.more[open] > summary { margin-bottom:4px; }
+  details.more ul { margin:4px 0 0; padding-left:18px; }
+  /* A table inside Details (refused page) has one tbody, so rows need their own rule. */
+  details table { margin-top:6px; }
+  details table th, details table td { padding:6px 8px; border-bottom:1px solid var(--rule); }
+
+  /* ---- decision ---- */
+  .actions { display:grid; grid-template-columns:1fr 1fr; gap:14px; align-items:start; }
+  .actions .card { padding:16px; }
+  label { font-size:14px; font-weight:500; }
+  textarea, input[type=date] { font:inherit; font-size:15px; color:var(--fg); background:var(--surface);
+                               padding:8px 10px; border:1px solid var(--rule-strong); border-radius:3px; }
+  textarea { width:100%; min-height:80px; margin-top:4px; }
+  input[type=date] { margin-top:4px; }
+  button { font:inherit; font-weight:600; font-size:15px; padding:11px 22px; border-radius:3px;
+           cursor:pointer; background:var(--ok); color:#fff; border:1px solid var(--ok); }
+  button.secondary { background:var(--surface); color:var(--stop); border-color:var(--stop); }
+  button[disabled] { background:var(--surface); color:var(--fg-muted); border-color:var(--rule);
+                     cursor:not-allowed; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) button:not(.secondary):not([disabled]) { color:#0e1a14; }
+  }
   @media (max-width: 800px) { .actions { grid-template-columns:1fr; } }
+  @media (max-width: 560px) {
+    h1 { font-size:20px; }
+    .queue-row .counts { margin-left:0; width:100%; }
+  }
 </style>
 </head>
 <body>
-<header class="bar">
+<div class="wrap">
+<header class="masthead">
   <nav><a href="/">Purchase orders to review</a></nav>
   <span class="who">Reviewing as {{ reviewer }}</span>
 </header>
 <main>
 {% block content %}{% endblock %}
 </main>
+</div>
 </body>
 </html>

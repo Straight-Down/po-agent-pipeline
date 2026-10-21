@@ -1,43 +1,51 @@
 {% extends "base.html" %}
 {% block title %}PO {{ view.shipment_po.po_number_printed }}{% endblock %}
 
+{# Status is always a WORD; the pill's colour only repeats it. #}
 {% macro status(ln) -%}
   {%- if ln.disposition == "decided" -%}
-    {%- if ln.human_verdict == "REJECTED" -%}<span class="tag t-alarm">Rejected</span> <span class="muted">by {{ ln.verdict_by }}</span>
-    {%- elif ln.human_verdict -%}<span class="tag t-ok">Approved</span> <span class="muted">by {{ ln.verdict_by }}</span>
-    {%- else -%}<span class="muted">Already handled</span>{%- endif -%}
-  {%- elif ln.disposition == "block" -%}<strong>Can't be approved yet</strong>
-  {%- elif ln.disposition == "accept_no_change" -%}No change needed
-  {%- elif ln.flagged -%}<strong>Check, then approve with the PO</strong>
-  {%- else -%}Ready to approve
+    {%- if ln.human_verdict == "REJECTED" -%}<span class="pill p-stop">Rejected</span> <span class="muted by">by {{ ln.verdict_by }}</span>
+    {%- elif ln.human_verdict -%}<span class="pill p-same">Approved</span> <span class="muted by">by {{ ln.verdict_by }}</span>
+    {%- else -%}<span class="pill p-quiet">Already handled</span>{%- endif -%}
+  {%- elif ln.disposition == "block" -%}<span class="pill p-stop">Can't be approved yet</span>
+  {%- elif ln.disposition == "accept_no_change" -%}<span class="pill p-same">No change needed</span>
+  {%- elif ln.flagged -%}<span class="pill p-flag">Check, then approve with the PO</span>
+  {%- else -%}<span class="pill p-change">Ready to approve</span>
   {%- endif -%}
 {%- endmacro %}
 
-{% macro rows(lines) %}
+{# same_block: every line on the PO is blocked for one reason, which is then said
+   once above the tables (see the content block) instead of on every row. #}
+{% macro rows(lines, flagged_group=False, same_block=False) %}
+<div class="table-scroll{{ ' group-flag' if flagged_group }}">
 <table>
   <thead><tr>
-    <th>Item</th><th class="n">NetSuite line</th><th class="n">Ordered</th><th class="n">Received</th>
-    <th class="n">Still to receive</th><th class="n">On this slip</th><th class="n">Proposed total</th>
-    <th>What to do</th><th>Document</th>
+    <th scope="col">Item</th><th scope="col" class="n">NetSuite line</th><th scope="col" class="n">Ordered</th><th scope="col" class="n">Received</th>
+    <th scope="col" class="n">Still to receive</th><th scope="col" class="n">On this slip</th><th scope="col" class="n">Proposed total</th>
+    <th scope="col">What to do</th><th scope="col">Document</th>
   </tr></thead>
-  <tbody>
   {% for ln in lines %}
-    <tr>
-      <td>{{ ln.label }}{% if ln.src_recap_label %}<br><span class="muted">{{ ln.src_recap_label }}</span>{% endif %}</td>
+  {%- set tone = "" if same_block
+                 else "is-flag" if ln.flagged
+                 else "is-change" if ln.disposition == "approve" else "" -%}
+  {%- set show_override = ln.override_protected and ln.disposition in ("approve", "accept_no_change") -%}
+  {%- set show_rejection = ln.disposition == "decided" and ln.human_verdict == "REJECTED" and ln.human_verdict_note -%}
+  {%- set has_why = (ln.plain_reasons and not same_block) or show_override or show_rejection -%}
+  <tbody class="{{ tone }}">
+    <tr{% if has_why %} class="has-why"{% endif %}>
+      <td class="item">{{ ln.label }}{% if ln.src_recap_label %}<br><span class="muted">{{ ln.src_recap_label }}</span>{% endif %}</td>
       <td class="n">{{ ln.ns_line_id or "–" }}</td>
       <td class="n">{{ ln.current_quantity|qty }}</td>
       <td class="n">{{ ln.current_quantity_received|qty }}</td>
       <td class="n">{{ ln.outstanding|qty }}</td>
       <td class="n">{{ ln.src_quantity_text or "–" }}</td>
-      <td class="n"><strong>{{ ln.proposed_quantity|qty }}</strong>
-        {% if ln.accumulation_basis == "ACCUMULATED" %}<br><span class="muted">adds to {{ ln.accumulation_base_quantity|qty }} already recorded</span>{% endif %}</td>
-      <td class="note">
-        <p class="plain">{{ status(ln) }}</p>
-        {% if ln.accumulation_basis == "PRE_EXISTING_RECEIPT" %}<span class="tag t-info">already received in NetSuite</span>
-        {% elif ln.accumulation_basis == "DISPUTED" %}<span class="tag t-alarm">changed in NetSuite since last seen</span>{% endif %}
-        {% for r in ln.plain_reasons %}<p class="plain">{{ r }}</p>{% endfor %}
-        {% if ln.override_protected and ln.disposition in ("approve", "accept_no_change") %}<p class="plain">Someone already set a receipt date on this line in NetSuite, so a date you enter won't be applied to it.</p>{% endif %}
-        {% if ln.disposition == "decided" and ln.human_verdict == "REJECTED" and ln.human_verdict_note %}<p class="plain muted">Reason: {{ ln.human_verdict_note }}</p>{% endif %}
+      <td class="n proposed"><strong>{{ ln.proposed_quantity|qty }}</strong>
+        {% if ln.accumulation_basis == "ACCUMULATED" %}<span class="muted sub">adds to {{ ln.accumulation_base_quantity|qty }} already recorded</span>{% endif %}</td>
+      <td class="status">
+        {% if not same_block %}<div>{{ status(ln) }}</div>{% endif %}
+        {% if same_block %}{# the tag is part of the shared reason, stated above #}
+        {% elif ln.accumulation_basis == "PRE_EXISTING_RECEIPT" %}<div><span class="tag t-info">already received in NetSuite</span></div>
+        {% elif ln.accumulation_basis == "DISPUTED" %}<div><span class="tag t-alarm">changed in NetSuite since last seen</span></div>{% endif %}
         <details class="more"><summary>Details</summary>
           <div class="muted">
             State: {{ ln.state }}{% if ln.accumulation_basis %} · basis: {{ ln.accumulation_basis }}{% endif %}
@@ -49,17 +57,25 @@
           </div>
         </details>
       </td>
-      <td>{% if ln.source_sha256 %}<a href="/source/{{ ln.id }}">Open</a>{% else %}<span class="muted">none on file</span>{% endif %}</td>
+      <td class="doc">{% if ln.source_sha256 %}<a href="/source/{{ ln.id }}">Open</a>{% else %}<span class="muted">none on file</span>{% endif %}</td>
     </tr>
-  {% endfor %}
+    {% if has_why %}
+    <tr class="why-row"><td colspan="9"><div class="why">
+      {% for r in ln.plain_reasons %}<p>{{ r }}</p>{% endfor %}
+      {% if show_override %}<p>Someone already set a receipt date on this line in NetSuite, so a date you enter won't be applied to it.</p>{% endif %}
+      {% if show_rejection %}<p class="verbatim">Reason: {{ ln.human_verdict_note }}</p>{% endif %}
+    </div></td></tr>
+    {% endif %}
   </tbody>
+  {% endfor %}
 </table>
+</div>
 {% endmacro %}
 
 {% block content %}
 {% set po = view.shipment_po %}
-<h1>PO {{ po.po_number_printed }}{% if po.ns_tranid %} <span class="muted">· {{ po.ns_tranid }} in NetSuite</span>{% endif %}</h1>
-<p class="muted">{{ view.shipment.vendor_name or "Vendor not stated" }}
+<h1 class="po-title">PO {{ po.po_number_printed }}{% if po.ns_tranid %} <span class="muted">· {{ po.ns_tranid }} in NetSuite</span>{% endif %}</h1>
+<p class="muted lede">{{ view.shipment.vendor_name or "Vendor not stated" }}
   {% if view.message %} · “{{ view.message.subject }}” · received {{ view.message.received_at }}{% endif %}</p>
 
 {% if view.rows_lost_message %}
@@ -97,19 +113,38 @@
   <ul class="muted">{% for w in view.warnings %}<li>{{ w }}</li>{% endfor %}</ul></details>
 {% endif %}
 
+{#- Presentation only: decided from what each row would already show. Every line
+    blocked, all in one block group, all with the same plain-English reasons and
+    the same tag (accumulation basis). Anything differing keeps it per line. -#}
+{%- set first_line = view.lines[0] if view.lines else none -%}
+{%- set same_block = view.lines|length > 1
+      and view.lines|selectattr("disposition", "ne", "block")|list|length == 0
+      and view.block_explanations|length == 1
+      and view.lines|rejectattr("plain_reasons", "equalto", first_line.plain_reasons)|list|length == 0
+      and view.lines|rejectattr("accumulation_basis", "equalto", first_line.accumulation_basis)|list|length == 0 -%}
+{% if same_block %}
+<div class="card block-all">
+  <p class="plain"><span class="pill p-stop">Can't be approved yet</span>
+    All {{ view.lines|length }} lines on this PO{% if first_line.plain_reasons %}, each for the same reason:{% else %}, for the same reason. It's explained with your decision at the bottom of the page.{% endif %}</p>
+  {% for r in first_line.plain_reasons %}<p class="plain">{{ r }}</p>{% endfor %}
+</div>
+{% endif %}
+
 {% if view.flagged_lines %}
 {% if view.can_approve %}
 <h2>{{ view.flagged_lines|length }} line{{ "s" if view.flagged_lines|length != 1 }} to check before approving</h2>
 <p class="muted">Approving the PO includes these. Each says what to check.</p>
 {% else %}
 <h2>{{ view.flagged_lines|length }} line{{ "s" if view.flagged_lines|length != 1 }} that need attention</h2>
-<p class="muted">Each says why. Your decision is at the bottom of the page.</p>
+<p class="muted">{% if same_block and first_line.plain_reasons %}The reason is the same for every line, so it's given once above. Your decision is at the bottom of the page.
+{%- elif same_block %}The reason is the same for every line; it's given with your decision at the bottom of the page.
+{%- else %}Each says why. Your decision is at the bottom of the page.{% endif %}</p>
 {% endif %}
-<div class="group-flag">{{ rows(view.flagged_lines) }}</div>
+{{ rows(view.flagged_lines, flagged_group=True, same_block=same_block) }}
 {% endif %}
 {% if view.other_lines %}
 <h2>{{ "Other lines" if view.flagged_lines else "Lines" }} ({{ view.other_lines|length }})</h2>
-{{ rows(view.other_lines) }}
+{{ rows(view.other_lines, same_block=same_block) }}
 {% endif %}
 
 {% if view.awaiting %}

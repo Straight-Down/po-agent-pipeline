@@ -11,7 +11,8 @@ the packing slip) is S=9/M=50.
 It also demonstrates Paula's rulings of 2026-08-11 in action:
   - The engine proposes a new QUANTITY and nothing else. It does not propose a
     receipt date; the vendor's ETA travels through as labelled reference only.
-  - Asking for a date write before a human confirms one raises DateNotConfirmed.
+  - No date is ever written (2026-11-02): the write is quantity only, and the
+    NetSuite client refuses a date field outright.
   - NetSuite lines absent from this packing slip produce no records at all.
 
 Run: python demo_matcher.py
@@ -24,11 +25,10 @@ from matcher import (
     STATUS_NEEDS_ATTENTION,
     STATUS_NO_CHANGE,
     STATUS_PENDING_REVIEW,
-    DateNotConfirmed,
     build_proposed_changes,
     unmatched_netsuite_lines,
 )
-from netsuite_client import NetSuiteClient, POLine
+from netsuite_client import NetSuiteClient, NetSuiteError, POLine, normalize_line_fields
 from parse_packing_slip import parse_packing_sheet, parse_shipping_advice_pdf
 
 HERE = Path(__file__).resolve().parent
@@ -116,17 +116,15 @@ for c in pending:
     print(f"    {c.reference_dates_label}")
 
 print()
-print("--- Receipt dates are Paula's to set (ruling 2026-08-11) ---")
+print("--- The write is quantity only; no date is ever written (2026-11-02) ---")
 if pending:
     sample = pending[0]
-    print(f"  quantity-only write : {sample.to_netsuite_fields(include_dates=False)}")
+    print(f"  the write           : {sample.to_netsuite_fields()}")
     try:
-        sample.to_netsuite_fields(include_dates=True)
-    except DateNotConfirmed as exc:
-        print(f"  date write refused  : {type(exc).__name__}")
+        normalize_line_fields({"quantity": 1, "expected_receipt_date": "2026-07-20"})
+    except NetSuiteError as exc:
+        print("  a date field        : refused by the client")
         print(f"                        {str(exc).splitlines()[0][:96]}")
-    sample.confirm_receipt_date("2026-07-20")
-    print(f"  after Paula confirms: {sample.to_netsuite_fields(include_dates=True)}")
 
 print()
 print("--- PO lines not in this shipment (normal: POs ship in batches) ---")

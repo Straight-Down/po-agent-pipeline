@@ -20,10 +20,12 @@ SIZE_ALIASES below normalizes for that; extend it as new vendors appear.
 or suggest a value for `expectedReceiptDate` or `custcol_sd_updatedreceiptdate`.
 Paula determines the actual receipt date herself; no vendor-stated date is
 treated as an answer. The vendor's ETD/ETA travel through as clearly labelled
-*reference* fields for her to read, and `confirmed_receipt_date` stays None until
-a human types one in. `to_netsuite_fields()` physically cannot emit a date field
-before that happens — see `DateNotConfirmed`. This replaces the earlier
-behaviour, which proposed the raw port ETA for all three date fields.
+*reference* fields for her to read. **Since 2026-11-02 this tool writes no date
+at all** (Kiko): `to_netsuite_fields()` builds quantity only, and
+`netsuite_client.normalize_line_fields` refuses every date field. The earlier
+path -- a human-confirmed date written to all three fields, gated by
+`DateNotConfirmed` -- was removed, not left dormant. Before that it proposed the
+raw port ETA for all three date fields.
 
 **Over-shipment is normal.** Shipped exceeding ordered is standard practice and
 is NOT flagged, surfaced as an anomaly, or treated differently in any way.
@@ -54,11 +56,7 @@ from typing import Optional, Sequence
 
 from canonical import canonical
 from netsuite_client import (
-    NS_EXPECTED_RECEIPT_DATE,
-    NS_OVERRIDE_EXPECTED_RECEIPT,
     NS_QUANTITY,
-    NS_UPDATED_RECEIPT_DATE,
-    HumanOverrideProtected,
     NetSuiteClient,
     POLine,
     po_number_key,
@@ -183,17 +181,6 @@ class LineAmbiguous(Exception):
     """
 
 
-class DateNotConfirmed(Exception):
-    """
-    Raised when a write would include a receipt date no human has confirmed.
-
-    This is the enforcement point for Paula's ruling. It exists so the rule is
-    structural rather than a comment someone has to remember: there is no code
-    path that emits `expectedReceiptDate` or `custcol_sd_updatedreceiptdate`
-    from a vendor-stated date.
-    """
-
-
 #: SIZE_ALIASES keyed by canonical form, so " xxl ", "XXL" and a full-width
 #: variant all resolve. Derived rather than hand-maintained, so SIZE_ALIASES stays
 #: the single editable source of truth.
@@ -247,8 +234,7 @@ class ProposedChange:
     Note what is absent: there is no `proposed_expected_receipt_date` or
     `proposed_updated_receipt_date` field. Their existence is what invited the
     engine to guess a date. The vendor's dates live in `vendor_etd`/`vendor_eta`
-    as reference only, and the writable date comes from
-    `confirmed_receipt_date`, which only a human sets.
+    as reference only, and no date is written at all (2026-11-02).
     """
 
     #: The CANONICAL key ("1624"), not the vendor's rendering -- one PO written two
@@ -286,9 +272,6 @@ class ProposedChange:
     # Vendor-stated dates. REFERENCE ONLY — never written, never proposed.
     vendor_etd: Optional[str] = None
     vendor_eta: Optional[str] = None
-
-    # Set only by a human typing an actual receipt date. None = not yet supplied.
-    confirmed_receipt_date: Optional[str] = None
 
     status: str = STATUS_PENDING_REVIEW
     attention_reason: str = ""
@@ -375,15 +358,10 @@ class ProposedChange:
         )
 
     @property
-    def receipt_date_pending(self) -> bool:
-        """True while no human has supplied an actual receipt date."""
-        return not self.confirmed_receipt_date
-
-    @property
     def reference_dates_label(self) -> str:
         """
-        How the review UI should present the vendor's dates: as information,
-        explicitly not as a proposal.
+        How a reviewer should see the vendor's dates: as information, never as a
+        proposal and never as something this tool writes.
         """
         bits = []
         if self.vendor_etd:
@@ -391,38 +369,18 @@ class ProposedChange:
         if self.vendor_eta:
             bits.append(f"vendor ETA {self.vendor_eta}")
         if not bits:
-            return "No vendor date on the shipment documents — enter the receipt date."
-        return (
-            "Reference only, not a proposed value ("
-            + "; ".join(bits)
-            + "). Enter the actual receipt date."
-        )
+            return "No vendor date on the shipment documents."
+        return "Reference only, not a proposed value (" + "; ".join(bits) + ")."
 
     # -- writing ------------------------------------------------------------
 
-    def confirm_receipt_date(self, value: str | dt.date) -> None:
-        """Record the receipt date a human typed in. Validates the format."""
-        if isinstance(value, dt.date):
-            self.confirmed_receipt_date = value.isoformat()
-            return
-        text = str(value).strip()
-        try:
-            self.confirmed_receipt_date = dt.date.fromisoformat(text).isoformat()
-        except ValueError as exc:
-            raise ValueError(f"receipt date must be an ISO date (YYYY-MM-DD), got {value!r}") from exc
-
-    def to_netsuite_fields(self, include_dates: bool = True) -> dict:
+    def to_netsuite_fields(self) -> dict:
         """
-        The NetSuite field dict for this change's approved write.
+        The NetSuite field dict for this change: `quantity` when it changed, and
+        nothing else, ever (2026-11-02). Empty when the quantity already matches.
 
-        Quantity is included whenever it changed. The three date fields are
-        included ONLY if a human has confirmed a receipt date; asking for dates
-        without one raises `DateNotConfirmed` rather than quietly omitting them,
-        so a caller cannot believe it wrote a date that it didn't.
-
-        Pass include_dates=False for the quantity-only approval path, which is
-        the normal case: quantity can be approved on its own without Paula having
-        yet decided the receipt date.
+        Still refuses outright for an ambiguous or closed line, so a write for one
+        cannot even be built.
         """
         if self.status == STATUS_NEEDS_RESOLUTION:
             raise LineAmbiguous(
@@ -443,37 +401,6 @@ class ProposedChange:
         fields: dict = {}
         if self.quantity_changed:
             fields[NS_QUANTITY] = self.proposed_quantity
-
-        if include_dates:
-            # A line whose receipt date a PERSON already overrode keeps it (Kiko,
-            # 2026-09-30): PO 1624's UPS lines 29-44 carry the override flag and
-            # 2026-06-01, set by hand. Checked BEFORE the confirmed-date test, so
-            # Paula is never asked to confirm a date that would then be refused.
-            # These values are the matcher's read -- a SNAPSHOT from match time.
-            # The authority is `update_po_line`, which re-reads the line just
-            # before the PATCH; this check is defence in depth, not a substitute.
-            # Quantity-only writes (include_dates=False) are untouched.
-            if self.current_override_flag or self.current_updated_receipt_date:
-                raise HumanOverrideProtected(
-                    f"PO {self.po_number} {self.style_number} {self.color}-{self.size} (line "
-                    f"{self.line_id}) already carries a human receipt-date override "
-                    f"(override={self.current_override_flag}, updated receipt date="
-                    f"{self.current_updated_receipt_date}). Refusing to build a write to "
-                    f"{NS_OVERRIDE_EXPECTED_RECEIPT} / {NS_UPDATED_RECEIPT_DATE} over it. "
-                    "Use include_dates=False to write the quantity alone."
-                )
-            if self.receipt_date_pending:
-                raise DateNotConfirmed(
-                    f"PO {self.po_number} {self.style_number} {self.color}-{self.size}: refusing to "
-                    "write a receipt date that no human confirmed. Paula sets this value; the "
-                    f"vendor's dates ({self.reference_dates_label}) are reference only. Either "
-                    "call confirm_receipt_date() first or use include_dates=False to write the "
-                    "quantity alone."
-                )
-            fields[NS_EXPECTED_RECEIPT_DATE] = self.confirmed_receipt_date
-            fields[NS_UPDATED_RECEIPT_DATE] = self.confirmed_receipt_date
-            fields[NS_OVERRIDE_EXPECTED_RECEIPT] = True
-
         return fields
 
     def as_dict(self) -> dict:
@@ -813,8 +740,8 @@ def _accumulated_quantity(
     obvious implementation is one line — `line.quantity + slip` — and it is
     wrong for a reason that is invisible from the call site.
 
-    **`quantity` is a field this tool writes.** It is one of the four in
-    `WRITABLE_LINE_FIELDS`. Reading it back as the base for the next write means
+    **`quantity` is a field this tool writes.** It is in
+    `WRITABLE_LINE_FIELDS`, the only field there. Reading it back as the base for the next write means
     the tool's own past output becomes the input to its next decision, and the
     arithmetic drifts in whatever direction its mistakes already pointed, with
     nothing to arrest it — every run makes the next run more confident in the same

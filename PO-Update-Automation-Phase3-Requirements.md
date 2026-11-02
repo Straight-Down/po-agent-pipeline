@@ -44,8 +44,8 @@ The column that matters is the second-to-last: **six of these the build plan doe
 | 7 | Partial-failure semantics | `RUNBOOK.md` §7 · `Schema-Rationale.md` §6 · `Architecture.md` §6.2 | no | **CONFIRMED** 2026-09-16 |
 | 8 | The five figures, and that nothing gates on them | `Schema-Rationale.md` §10 · `schema.py` · `matcher._line_balance` | no | BUILT AND TESTED |
 | 9 | Vendor dates are information, never a proposal | `matcher.reference_dates_label` · `Architecture.md` §6.1, §6.3 | no | BUILT AND TESTED |
-| 10 | Date field optional, forever | Build plan item 1 · `Schema-Rationale.md` §5 · `matcher.to_netsuite_fields` | **yes** | BUILT AND TESTED |
-| 11 | Override flag only when a date is written | Build plan item 1 · `Architecture.md` §6.3 · `matcher.to_netsuite_fields` | **yes** | BUILT AND TESTED |
+| 10 | Date field optional, forever | Build plan item 1 · `Schema-Rationale.md` §5 | **yes** | **SUPERSEDED** 2026-11-02: no date is written |
+| 11 | Override flag only when a date is written | Build plan item 1 · `Architecture.md` §6.3 | **yes** | **SUPERSEDED** 2026-11-02: no date is written |
 | 12 | Multi-batch quantities ACCUMULATE | `Architecture.md` §6.1 · `matcher._accumulated_quantity` · migration 0007 | no | **BUILT AND TESTED** |
 | 13 | Paula is the only approver | `Architecture.md` §7 | no | **CONFIRMED** 2026-09-16 |
 | 14 | Re-read open state at write time; plain WRITE_FAILED if closed | Build plan Phase 4 item 10 | **yes** | DECIDED BUT UNBUILT |
@@ -352,14 +352,22 @@ Two constraints already enforce the human's part:
   name on it.**
 - `ck_proposed_changes_date_scope_needs_date` — a date scope cannot be approved with no date in it.
 
-`matcher.to_netsuite_fields(include_dates=False)` is the quantity-only path; asking for dates
-without a confirmed one raises `DateNotConfirmed` rather than quietly omitting them.
+**SUPERSEDED 2026-11-02 (Kiko): this tool writes no date at all.** The write is `quantity` alone;
+`netsuite_client.normalize_line_fields` refuses every date field and `write_path` refuses them
+again. The `confirmed_receipt_date` / `date_write_status` columns and constraints above still exist,
+and the review app still records a date on Approve, but nothing writes it. Whether Approve should
+keep asking for one is open (RUNBOOK §11, decision 2).
 
 ---
 
 ## 11. The override flag is set ONLY when a date is actually written
 
-**BUILT AND TESTED**, structurally.
+**SUPERSEDED 2026-11-02 (Kiko): no date is written, so the override flag is never set either.**
+`netsuite_client.WRITABLE_LINE_FIELDS` is `("quantity",)`; the code described below
+(`include_dates`, `DateNotConfirmed`, `HumanOverrideProtected`) was removed. Kept for the
+reasoning, should a date write ever be reintroduced (RUNBOOK §12 item 1 then reopens).
+
+**Was: BUILT AND TESTED**, structurally.
 
 > *"Setting the override flag on a quantity-only approval would assert an override with nothing
 > behind it."* — build plan Phase 3 item 1

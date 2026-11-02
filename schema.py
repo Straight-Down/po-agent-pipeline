@@ -966,9 +966,9 @@ write_attempts = Table(
     Column("attempt_no", Integer, nullable=False),
     Column("ns_internal_id", Unicode(40), nullable=False),
     Column("ns_line_id", Unicode(40), nullable=False),
-    # Exactly what was sent. For a date write that is all three fields with the
-    # same value -- NetSuite does not derive expectedReceiptDate from the override
-    # pair (tested 2026-08-12), so the payload proves what was actually asserted.
+    # Exactly what was sent: {"quantity": N}, or {} for a REFUSED attempt. No
+    # date is written (2026-11-02); scope 'DATE' is kept in the CHECK but no code
+    # path produces it.
     Column("payload_json", UNBOUNDED_TEXT, nullable=False),
     Column("idempotency_key", Unicode(64), nullable=False),
     # -- migration 0014. SUCCESS: sent and accepted. FAILED: an error, which may

@@ -31,6 +31,14 @@ permission. `test_phase1_writeback.py` closes that gap, and deliberately
 distinguishes a hard permission error from the nastier failure mode where
 NetSuite accepts the PATCH (204) but silently discards a restricted field.
 
+*** WRITES ARE QUANTITY ONLY, since 2026-11-02 (Kiko) ***
+The four fields above are what NetSuite ACCEPTS; this tool writes one of them.
+`WRITABLE_LINE_FIELDS` is `quantity` alone, so `normalize_line_fields` -- and
+with it `update_po_line` -- refuses `expectedReceiptDate` and both custom date
+fields outright. Production PO 1624's lines 29-44 carry human-entered values in
+the custom pair, and no code path here can reach them. `write_path` keeps its
+own quantity-only guard as a second line of defence.
+
 Mock mode is preserved: NetSuiteClient(mock_data={...}) still works exactly as
 the old stub did, so demo_matcher.py keeps running without live credentials.
 """
@@ -93,27 +101,21 @@ TRANID_PREFIX = "PO"
 TRANID_MIN_DIGITS = 7
 TRANID_PATTERN = re.compile(r"^PO\d{7}$")
 
-#: The four writable target fields, in the order the docs list them.
-WRITABLE_LINE_FIELDS = (
-    NS_QUANTITY,
-    NS_EXPECTED_RECEIPT_DATE,
-    NS_OVERRIDE_EXPECTED_RECEIPT,
-    NS_UPDATED_RECEIPT_DATE,
-)
+#: The ONE field this tool writes (Kiko, 2026-11-02). Was the four confirmed
+#: writable fields; the three date fields were removed, not merely unused, so a
+#: date write cannot be built anywhere -- `normalize_line_fields` refuses it.
+#: Widening this again is a decision, and means re-validating the role
+#: (architecture doc section 6) and revisiting the human-override protection
+#: this narrowing made unnecessary.
+WRITABLE_LINE_FIELDS = (NS_QUANTITY,)
 
-#: Accept the pipeline's snake_case names as well as raw NetSuite field names,
-#: so callers (matcher.py, the future approval handler) don't have to know
-#: NetSuite's spelling. Unknown keys are rejected loudly rather than dropped.
-_FIELD_ALIASES = {
-    "quantity": NS_QUANTITY,
+#: The date fields this tool READS (for display) and refuses to write. Named so
+#: the refusal message can say why, rather than calling them unknown.
+_REFUSED_DATE_FIELDS = {
     "expected_receipt_date": NS_EXPECTED_RECEIPT_DATE,
     "override_expected_receipt": NS_OVERRIDE_EXPECTED_RECEIPT,
     "updated_receipt_date": NS_UPDATED_RECEIPT_DATE,
 }
-
-_DATE_FIELDS = {NS_EXPECTED_RECEIPT_DATE, NS_UPDATED_RECEIPT_DATE}
-_BOOL_FIELDS = {NS_OVERRIDE_EXPECTED_RECEIPT}
-_NUMBER_FIELDS = {NS_QUANTITY}
 
 
 # ---------------------------------------------------------------------------
@@ -125,17 +127,6 @@ _NUMBER_FIELDS = {NS_QUANTITY}
 
 class NetSuiteError(Exception):
     """Base for every NetSuite failure."""
-
-
-class HumanOverrideProtected(NetSuiteError):
-    """
-    A write would overwrite a receipt-date override a HUMAN already set on a line.
-
-    PO 1624's sixteen UPS lines (29-44) carry `custcol_override_expected_receipt
-    = True` and `custcol_sd_updatedreceiptdate = 2026-06-01`, set by hand, on
-    exactly the lines that split the UPS portion off. Overwriting that is
-    destroying someone's deliberate decision, so it is refused in code.
-    """
 
 
 class NetSuiteConfigError(NetSuiteError):
@@ -379,23 +370,6 @@ class NetSuiteConfig:
 # ---------------------------------------------------------------------------
 
 
-def _to_iso_date(value: Any, field_name: str) -> Optional[str]:
-    """NetSuite wants 'YYYY-MM-DD'. Validate strictly -- a malformed date that
-    reaches NetSuite comes back as an opaque error far from its cause."""
-    if value is None:
-        return None
-    if isinstance(value, dt.datetime):
-        return value.date().isoformat()
-    if isinstance(value, dt.date):
-        return value.isoformat()
-    if isinstance(value, str):
-        try:
-            return dt.date.fromisoformat(value.strip()).isoformat()
-        except ValueError as exc:
-            raise NetSuiteError(f"{field_name}: {value!r} is not an ISO date (YYYY-MM-DD)") from exc
-    raise NetSuiteError(f"{field_name}: expected a date or ISO date string, got {type(value).__name__}")
-
-
 def _parse_ns_date(value: Any) -> Optional[dt.date]:
     """Read NetSuite's date back. It returns 'YYYY-MM-DD', but tolerate a
     datetime string rather than crashing the whole PO read on one odd line."""
@@ -594,35 +568,31 @@ def normalize_line_fields(fields: dict) -> dict:
     """
     Translate a caller's field dict into a NetSuite sublist patch body.
 
-    Accepts snake_case pipeline names or raw NetSuite names; coerces dates,
-    booleans and numbers; rejects anything unrecognized. Rejecting rather than
-    ignoring is deliberate -- a typo'd field name that silently no-ops would
-    look like a successful write that changed nothing, which is exactly the
-    failure mode this project can least afford.
+    **Quantity only** (2026-11-02). A date field, by either spelling, is refused
+    with a message saying dates are not written; anything else unrecognised is
+    refused as unknown. Rejecting rather than ignoring is deliberate -- a field
+    that silently no-ops would look like a successful write that changed
+    nothing, which is exactly the failure mode this project can least afford.
     """
     if not fields:
         raise NetSuiteError("No fields supplied -- refusing to send an empty update.")
 
     out: dict[str, Any] = {}
     for key, value in fields.items():
-        ns_key = _FIELD_ALIASES.get(key, key)
-        if ns_key not in WRITABLE_LINE_FIELDS:
+        if key in _REFUSED_DATE_FIELDS or key in _REFUSED_DATE_FIELDS.values():
             raise NetSuiteError(
-                f"Unsupported field {key!r} (resolved to {ns_key!r}). "
-                f"Phase 1 supports exactly: {', '.join(WRITABLE_LINE_FIELDS)} "
-                f"(or their aliases: {', '.join(_FIELD_ALIASES)}). "
-                "Widening this set means re-validating role permissions -- see architecture doc section 6."
+                f"Refusing to write {key!r}: this tool writes quantity only, never a receipt "
+                "date (Kiko, 2026-11-02). Nothing was sent."
             )
-        if ns_key in _DATE_FIELDS:
-            out[ns_key] = _to_iso_date(value, ns_key)
-        elif ns_key in _BOOL_FIELDS:
-            out[ns_key] = _to_bool(value)
-        elif ns_key in _NUMBER_FIELDS:
-            if value is None:
-                raise NetSuiteError(f"{ns_key}: refusing to write None as a quantity.")
-            out[ns_key] = int(value) if float(value).is_integer() else float(value)
-        else:  # unreachable given the guard above; kept explicit
-            out[ns_key] = value
+        if key not in WRITABLE_LINE_FIELDS:
+            raise NetSuiteError(
+                f"Unsupported field {key!r}. This tool writes exactly: "
+                f"{', '.join(WRITABLE_LINE_FIELDS)}. Widening this set means re-validating "
+                "role permissions -- see architecture doc section 6."
+            )
+        if value is None:
+            raise NetSuiteError(f"{key}: refusing to write None as a quantity.")
+        out[key] = int(value) if float(value).is_integer() else float(value)
     return out
 
 
@@ -1128,31 +1098,18 @@ class NetSuiteClient:
         fields: dict,
         by_internal_id: bool = False,
         idempotency_key: Optional[str] = None,
-        overwrite_human_override: bool = False,
     ) -> dict:
         """
-        PATCH one item-sublist line.
+        PATCH one item-sublist line's quantity.
 
-        **Refuses to overwrite a human's receipt-date override** (Kiko,
-        2026-09-30). A write touching `custcol_override_expected_receipt` or
-        `custcol_sd_updatedreceiptdate` first reads the line, and raises
-        `HumanOverrideProtected` if it already has the override ticked or an
-        updated receipt date set. Enforced HERE, for every caller, not only for
-        proposals (`ProposedChange.to_netsuite_fields` refuses too).
-        `overwrite_human_override=True` exists for one caller only: the Phase 1
-        write/verify/revert test, restoring a line's own prior values after its
-        own test write. Nothing on the proposal path may pass it.
-
-        **Best-effort, not atomic.** The read and the PATCH are two requests, so a
-        person ticking the override in the gap between them would still be
-        overwritten. At this tool's volume (Paula-approved, a few writes a week)
-        that window is small; whether NetSuite's REST record API offers a
-        conditional write (If-Match / a revision check) that could close it is
-        UNVERIFIED. This fresh read, not the matcher's snapshot, is the authority.
+        **Quantity only** (2026-11-02): `normalize_line_fields` refuses any date
+        field before anything is sent. That is what protects the human-entered
+        receipt-date overrides on production PO 1624's lines 29-44 -- the
+        read-then-refuse guard that stood here until then (`HumanOverrideProtected`,
+        2026-09-30) became unreachable and was removed with the date path.
 
         Confirmed working shape (live sandbox test, architecture doc section 6):
-        target the line by its `line` number inside `item.items[]` and send all
-        four fields in a single call.
+        target the line by its `line` number inside `item.items[]`.
 
         Deliberately does NOT send the `replace` query parameter. `replace=item`
         would replace the entire sublist rather than merging this one line --
@@ -1173,18 +1130,6 @@ class NetSuiteClient:
         body_fields = normalize_line_fields(fields)
         internal_id = str(po_number) if by_internal_id else self.resolve_po_internal_id(str(po_number))
         line_number = int(line_id)
-
-        touches_override = {NS_OVERRIDE_EXPECTED_RECEIPT, NS_UPDATED_RECEIPT_DATE} & set(body_fields)
-        if touches_override and not overwrite_human_override:
-            current = self.get_po_line(internal_id, line_number, by_internal_id=True)
-            if current.override_expected_receipt or current.updated_receipt_date:
-                raise HumanOverrideProtected(
-                    f"PO {internal_id} line {line_number} already carries a receipt-date "
-                    f"override set by a person ({NS_OVERRIDE_EXPECTED_RECEIPT}="
-                    f"{current.override_expected_receipt}, {NS_UPDATED_RECEIPT_DATE}="
-                    f"{current.updated_receipt_date}). Refusing to write "
-                    f"{', '.join(sorted(touches_override))} over it. Nothing was sent."
-                )
 
         payload = {"item": {"items": [{"line": line_number, **body_fields}]}}
         logger.info("PATCH purchaseOrder/%s line %s: %s", internal_id, line_number, body_fields)

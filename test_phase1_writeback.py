@@ -12,7 +12,7 @@ Why that difference is the entire point (architecture doc section 6, final
 bullet): the CFO test proved the REST API *mechanically* supports these sublist
 writes. It did not prove this role is *permitted* to make them. NetSuite custom
 fields can carry field-level access restrictions independent of record-level
-Edit permission, so `custcol_override_expected_receipt` and
+Edit permission, so (in the four-field era) `custcol_override_expected_receipt` and
 `custcol_sd_updatedreceiptdate` are the fields most likely to behave
 differently here.
 
@@ -22,6 +22,12 @@ Two distinct failure modes are checked, because only one of them is loud:
      quietly drops a field it won't let this role write, leaving the old value
      in place. This is the dangerous one: without reading the record back
      field-by-field it looks like a clean success. Step 3 below catches it.
+
+**Quantity only since 2026-11-02.** The 2026-08 runs wrote and verified all four
+fields; the tool now writes `quantity` alone and the client refuses every date
+field, so this test writes, verifies and reverts quantity alone. It proves what
+the tool actually does, which is the only thing worth re-proving after a role
+change. The four-field result stays on record in architecture doc section 6.
 
 Neither is worked around here. If either happens the test fails loudly and
 tells you what to ask NetSuite support about -- widening the role's permissions
@@ -51,17 +57,12 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import logging
 import sys
 import traceback
 
 from netsuite_client import (
-    NS_EXPECTED_RECEIPT_DATE,
-    NS_OVERRIDE_EXPECTED_RECEIPT,
     NS_QUANTITY,
-    NS_UPDATED_RECEIPT_DATE,
-    HumanOverrideProtected,
     NetSuiteAPIError,
     NetSuiteClient,
     NetSuiteConfig,
@@ -80,11 +81,8 @@ EXPECTED_STYLE = "M120246"
 EXPECTED_COLOR = "TID"
 EXPECTED_SIZE = "3X"
 
-# Target date from the documented test (the shipment's real port ETA).
-TARGET_DATE = dt.date(2026, 6, 27)
 TARGET_QUANTITY = 99
 FALLBACK_QUANTITY = 98  # if the line already sits at 99, a no-op proves nothing
-FALLBACK_DATE = dt.date(2026, 6, 26)
 
 
 class CheckFailed(Exception):
@@ -123,41 +121,22 @@ def describe_line(line: POLine) -> None:
 
 
 def snapshot(line: POLine) -> dict:
-    """The four target fields, in the pipeline's snake_case vocabulary."""
-    return {
-        "quantity": line.quantity,
-        "expected_receipt_date": line.expected_receipt_date,
-        "override_expected_receipt": line.override_expected_receipt,
-        "updated_receipt_date": line.updated_receipt_date,
-    }
+    """The field this tool writes. Quantity only since 2026-11-02."""
+    return {"quantity": line.quantity}
 
 
-#: snake_case -> the NetSuite field name, for error messages that need to name
-#: the actual field a NetSuite admin would look up.
-NS_NAMES = {
-    "quantity": NS_QUANTITY,
-    "expected_receipt_date": NS_EXPECTED_RECEIPT_DATE,
-    "override_expected_receipt": NS_OVERRIDE_EXPECTED_RECEIPT,
-    "updated_receipt_date": NS_UPDATED_RECEIPT_DATE,
-}
+#: The NetSuite field name, for error messages that need to name the actual
+#: field a NetSuite admin would look up.
+NS_NAMES = {"quantity": NS_QUANTITY}
 
 
 def build_target_values(original: dict) -> dict:
     """
-    Pick target values that mirror the documented test but are guaranteed to
-    differ from what's currently there -- writing a value that's already set
-    would pass vacuously and prove nothing about permissions.
+    A quantity guaranteed to differ from what's currently there -- writing a
+    value that's already set would pass vacuously and prove nothing.
     """
     return {
         "quantity": TARGET_QUANTITY if original["quantity"] != TARGET_QUANTITY else FALLBACK_QUANTITY,
-        "expected_receipt_date": (
-            TARGET_DATE if original["expected_receipt_date"] != TARGET_DATE else FALLBACK_DATE
-        ),
-        # Flip it, whichever way it currently sits.
-        "override_expected_receipt": not original["override_expected_receipt"],
-        "updated_receipt_date": (
-            TARGET_DATE if original["updated_receipt_date"] != TARGET_DATE else FALLBACK_DATE
-        ),
     }
 
 
@@ -293,7 +272,7 @@ def run(args: argparse.Namespace) -> int:
     target = build_target_values(original)
 
     print()
-    print("  Planned change (all four fields in a single PATCH, mirroring the CFO-role test):")
+    print("  Planned change (quantity only -- the one field this tool writes):")
     for key in original:
         print(f"    {key:<28} {original[key]!r}  ->  {target[key]!r}")
 
@@ -317,7 +296,7 @@ def run(args: argparse.Namespace) -> int:
     write_succeeded = False
     exit_code = 1
     try:
-        section("STEP 3 -- Write all four fields in one PATCH, then read back")
+        section("STEP 3 -- Write the quantity in one PATCH, then read back")
         try:
             result = client.update_po_line(
                 args.po_internal_id, args.line, target, by_internal_id=True
@@ -332,21 +311,8 @@ def run(args: argparse.Namespace) -> int:
             print("  'PO Update' role cannot. Do NOT widen the role to make it pass.")
             print("  What to take to your NetSuite admin:")
             print("    - does the 'PO Update' role need Transactions > Purchase Order = Edit")
-            print("      at a higher LEVEL (not just Edit), or an additional permission?")
-            print(f"    - do the custom columns {NS_OVERRIDE_EXPECTED_RECEIPT} and")
-            print(f"      {NS_UPDATED_RECEIPT_DATE} have field-level access restrictions")
-            print("      (Customization > Lists,Records,&Fields > Transaction Line Fields >")
-            print("      [field] > Access tab) that exclude this role?\n")
+            print("      at a higher LEVEL (not just Edit), or an additional permission?\n")
             return 3
-        except HumanOverrideProtected as exc:
-            # The guard working, not a harness bug: this line already carries a
-            # receipt-date override a person set. Nothing was written, so there is
-            # nothing to revert.
-            section("REFUSED: THIS LINE ALREADY CARRIES A HUMAN OVERRIDE")
-            print(f"\n{exc}\n")
-            print("  Nothing was written. Pick a test line whose override is unticked and")
-            print("  whose Updated Receipt Date is empty, and re-run.\n")
-            return 4
 
         print()
         readback = client.get_po_line(args.po_internal_id, args.line, by_internal_id=True)
@@ -369,12 +335,12 @@ def run(args: argparse.Namespace) -> int:
             print("  quietly doing nothing.")
             print()
             print("  This is a real finding. Do NOT widen the role's permissions to make it")
-            print("  pass. Take to your NetSuite admin: Customization > Lists,Records,&Fields >")
-            print("  Transaction Line Fields > [field] > Access tab, and check whether the")
-            print("  'PO Update' role has Edit access to each custom column above.")
+            print("  pass. Take to your NetSuite admin: the 'PO Update' role's Transactions >")
+            print("  Purchase Order level, and any workflow or script on the PO that resets")
+            print("  the line quantity after a REST edit.")
             exit_code = 3
         else:
-            print("  All four fields took. Write-path confirmed under this role.")
+            print("  The quantity took. Write-path confirmed under this role.")
             exit_code = 0
 
     except Exception:
@@ -387,12 +353,8 @@ def run(args: argparse.Namespace) -> int:
         if write_succeeded:
             section("STEP 4 -- Revert to the original values (always runs)")
             try:
-                # The ONE sanctioned overwrite of an override: this restores the
-                # line's own prior values over THIS script's test write, which set
-                # the override moments ago. The guard would otherwise (correctly)
-                # refuse and leave the sandbox line dirty.
                 client.update_po_line(args.po_internal_id, args.line, original,
-                                      by_internal_id=True, overwrite_human_override=True)
+                                      by_internal_id=True)
                 reverted = client.get_po_line(args.po_internal_id, args.line, by_internal_id=True)
                 print()
                 leftover = compare(original, snapshot(reverted), phase="revert")
@@ -423,9 +385,8 @@ def run(args: argparse.Namespace) -> int:
         print("  Confirmed under the least-privilege 'PO Update' role, M2M/JWT auth:")
         print("    - authenticated with no browser login, no refresh token")
         print(f"    - read PO internal id {args.po_internal_id} line {args.line}")
-        print("    - wrote quantity, expectedReceiptDate, custcol_override_expected_receipt")
-        print("      and custcol_sd_updatedreceiptdate together in a single PATCH")
-        print("    - verified every field field-by-field, then reverted and verified the revert")
+        print("    - wrote the quantity in a single PATCH (the only field this tool writes)")
+        print("    - verified it by reading back, then reverted and verified the revert")
         print()
         print(f"  PO lookup strategy that worked: {client.last_lookup_strategy or 'n/a (internal id given directly)'}")
         print()

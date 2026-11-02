@@ -2426,54 +2426,24 @@ def test_matcher_paula_rulings(tmp: Path) -> None:
     check(not hasattr(c, "proposed_updated_receipt_date"), "and no proposed_updated_receipt_date")
     check(c.vendor_eta == "2026-08-16" and c.vendor_etd == "2026-08-05",
           "vendor ETD/ETA carried as reference", f"{c.vendor_etd} / {c.vendor_eta}")
-    check(c.receipt_date_pending, "receipt date starts pending -- nobody has typed one")
     check("Reference only, not a proposed value" in c.reference_dates_label,
           "review UI label says reference, not proposal", c.reference_dates_label[:60])
 
-    qty_only = c.to_netsuite_fields(include_dates=False)
-    check(set(qty_only) == {"quantity"}, "quantity-only write contains ONLY quantity", str(set(qty_only)))
-    check(qty_only["quantity"] == 110, "quantity replaces the ordered amount", str(qty_only["quantity"]))
-    expect_raises(
-        mt.DateNotConfirmed,
-        lambda: c.to_netsuite_fields(include_dates=True),
-        "writing dates before a human confirms one RAISES",
-    )
+    # No date is written at all (2026-11-02): the write is quantity, and there is no
+    # way to ask for a date -- no parameter, no confirm step, no date field.
+    write = c.to_netsuite_fields()
+    check(write == {"quantity": 110}, "the write contains ONLY quantity", str(write))
+    check(not hasattr(c, "confirm_receipt_date") and not hasattr(c, "confirmed_receipt_date"),
+          "ProposedChange has no way to carry or confirm a receipt date")
 
-    c.confirm_receipt_date("2026-09-10")
-    with_dates = c.to_netsuite_fields(include_dates=True)
-    check(with_dates["expectedReceiptDate"] == "2026-09-10", "confirmed date written to expectedReceiptDate")
-    check(with_dates["custcol_sd_updatedreceiptdate"] == "2026-09-10", "and to the updated-receipt custom field")
-    check(with_dates["custcol_override_expected_receipt"] is True, "override flag set alongside")
-    check(
-        with_dates["expectedReceiptDate"] != c.vendor_eta,
-        "the written date is Paula's, NOT the vendor ETA",
-        f"wrote {with_dates['expectedReceiptDate']}, vendor ETA was {c.vendor_eta}",
-    )
-    expect_raises(ValueError, lambda: c.confirm_receipt_date("09/10/2026"), "non-ISO confirmed date rejected")
-
-    # A line a PERSON already overrode keeps its date (Kiko, 2026-09-30): PO 1624's
-    # UPS lines 29-44 carry the override flag and 2026-06-01, set by hand.
+    # A line a PERSON already overrode (PO 1624's UPS lines 29-44 in production) gets
+    # the same quantity-only write: nothing it builds can touch the override.
     import copy
 
-    from netsuite_client import HumanOverrideProtected
-
-    for flag, date, what in ((True, None, "the override flag ticked"),
-                             (False, "2026-06-01", "an updated receipt date set")):
-        overridden = copy.deepcopy(c)
-        overridden.current_override_flag, overridden.current_updated_receipt_date = flag, date
-        expect_raises(HumanOverrideProtected,
-                      lambda o=overridden: o.to_netsuite_fields(include_dates=True),
-                      f"a date write over a line with {what} RAISES, even with Paula's date")
-        check(overridden.to_netsuite_fields(include_dates=False) == {"quantity": 110},
-              f"and the quantity-only write on that line is unaffected ({what})")
-    unconfirmed = copy.deepcopy(c)
-    unconfirmed.confirmed_receipt_date = None
-    unconfirmed.current_override_flag = True
-    check(unconfirmed.receipt_date_pending, "premise: no date confirmed on this copy")
-    expect_raises(HumanOverrideProtected,
-                  lambda: unconfirmed.to_netsuite_fields(include_dates=True),
-                  "the override refusal comes FIRST -- Paula is not asked to confirm a date "
-                  "the tool would then refuse to write")
+    overridden = copy.deepcopy(c)
+    overridden.current_override_flag, overridden.current_updated_receipt_date = True, "2026-06-01"
+    check(overridden.to_netsuite_fields() == {"quantity": 110},
+          "a line carrying a human receipt-date override gets the quantity alone")
 
     # RULING 6 -- over-shipment is normal and must not be flagged.
     over = mt.build_proposed_changes(
@@ -2482,7 +2452,7 @@ def test_matcher_paula_rulings(tmp: Path) -> None:
     check(over.status == mt.STATUS_PENDING_REVIEW,
           "shipped 500 vs ordered 100 is a plain PENDING_REVIEW", over.status)
     check(over.attention_reason == "", "no attention flag raised for over-shipment", repr(over.attention_reason))
-    check(over.to_netsuite_fields(include_dates=False)["quantity"] == 500, "over-ship quantity replaces as-is")
+    check(over.to_netsuite_fields()["quantity"] == 500, "over-ship quantity replaces as-is")
 
     # RULING 7 -- a PO line absent from the packing list is a silent no-op.
     check(len(changes) == 1, "the untouched 'L' line produced NO change record")
@@ -2512,7 +2482,7 @@ def test_matcher_paula_rulings(tmp: Path) -> None:
     # No change at all when the quantity already matches.
     same = mt.build_proposed_changes([{**vendor[0], "quantity": 100}], client)[0]
     check(same.status == mt.STATUS_NO_CHANGE, "matching quantity -> NO_CHANGE", same.status)
-    check(same.to_netsuite_fields(include_dates=False) == {}, "and produces an empty write")
+    check(same.to_netsuite_fields() == {}, "and produces an empty write")
 
     # Size normalization still spans both conventions.
     check(mt._normalize_size("XXL") == "2X" and mt._normalize_size("2XL") == "2X",
@@ -2558,14 +2528,8 @@ def test_closed_po_line(tmp: Path) -> None:
     # The write path must refuse it outright, even if something upstream tried.
     expect_raises(
         mt.LineClosed,
-        lambda: closed.to_netsuite_fields(include_dates=False),
+        lambda: closed.to_netsuite_fields(),
         "building a write for a closed line RAISES LineClosed",
-    )
-    closed.confirm_receipt_date("2026-09-10")
-    expect_raises(
-        mt.LineClosed,
-        lambda: closed.to_netsuite_fields(include_dates=True),
-        "still refuses even with a confirmed date",
     )
 
     # An open line alongside it is unaffected -- one closed line must not poison
@@ -2573,8 +2537,8 @@ def test_closed_po_line(tmp: Path) -> None:
     open_line = changes["L"]
     check(open_line.status == mt.STATUS_PENDING_REVIEW, "the open line still proposes normally", open_line.status)
     check(not open_line.line_closed, "and is not marked closed")
-    check(open_line.to_netsuite_fields(include_dates=False) == {"quantity": 60},
-          "and builds its write fine", str(open_line.to_netsuite_fields(include_dates=False)))
+    check(open_line.to_netsuite_fields() == {"quantity": 60},
+          "and builds its write fine", str(open_line.to_netsuite_fields()))
 
 
 def test_duplicate_key_resolution(tmp: Path) -> None:
@@ -2632,9 +2596,9 @@ def test_duplicate_key_resolution(tmp: Path) -> None:
           "PO0001514 shape: identical dates, one open line -> normal change", c.status)
     check(c.line_id == "31" and c.current_quantity == 3,
           "targets the open line; 20 + 3 is never staged as 23", f"{c.line_id}/{c.current_quantity}")
-    check(c.to_netsuite_fields(include_dates=False) == {"quantity": 9},
+    check(c.to_netsuite_fields() == {"quantity": 9},
           "and the write is a plain quantity update on that one line",
-          str(c.to_netsuite_fields(include_dates=False)))
+          str(c.to_netsuite_fields()))
 
     # -- PO0001649: the genuinely ambiguous one. 50 units received 0, 200 units
     #    received 100, both open, both due the same day. The tool must not choose.
@@ -2685,14 +2649,8 @@ def test_duplicate_key_resolution(tmp: Path) -> None:
     # A write must be structurally impossible, not merely discouraged.
     expect_raises(
         mt.LineAmbiguous,
-        lambda: c.to_netsuite_fields(include_dates=False),
+        lambda: c.to_netsuite_fields(),
         "building a write for an unresolved change RAISES LineAmbiguous",
-    )
-    c.confirm_receipt_date("2026-09-10")
-    expect_raises(
-        mt.LineAmbiguous,
-        lambda: c.to_netsuite_fields(include_dates=True),
-        "still refuses once a receipt date has been confirmed",
     )
 
     # -- Three open lines resolve the same way as two.
@@ -2727,7 +2685,7 @@ def test_duplicate_key_resolution(tmp: Path) -> None:
           "and still reads as closed, not merely 'not open'", c.attention_reason[:80])
     expect_raises(
         mt.LineClosed,
-        lambda: c.to_netsuite_fields(include_dates=False),
+        lambda: c.to_netsuite_fields(),
         "and to_netsuite_fields still raises LineClosed",
     )
 
@@ -2797,8 +2755,8 @@ def test_line_balance_context(tmp: Path) -> None:
                              "quantity_received": 0.0, "slip_quantity": 128.0,
                              "outstanding": 300.0},
           "and carries all five figures", str(c.line_balance))
-    check(c.to_netsuite_fields(include_dates=False) == {"quantity": 128},
-          "the write is unaffected", str(c.to_netsuite_fields(include_dates=False)))
+    check(c.to_netsuite_fields() == {"quantity": 128},
+          "the write is unaffected", str(c.to_netsuite_fields()))
 
     # 2. NO_CHANGE carries it too -- Paula still wants to see the arithmetic on a
     #    line whose quantity happens to already be right.
@@ -3235,49 +3193,30 @@ def test_scope_boundaries(tmp: Path) -> None:
           "a vendor line with no NetSuite line flags -- it does not become a new line",
           orphan.status)
 
-    # 2. The tool NEVER derives a date from a vendor document. The vendor's ETD/ETA
-    #    are carried as reference text only; a write that would include a date no
-    #    human confirmed raises rather than quietly omitting it.
+    # 2. The tool NEVER writes a date (2026-11-02), let alone one derived from a
+    #    vendor document. The vendor's ETD/ETA are carried as reference text only.
     dated = mt.build_proposed_changes([vendor], client, eta="2026/7/1 08:00", etd="2026/6/20 08:00")[0]
     check(dated.vendor_eta == "2026-07-01" and dated.vendor_etd == "2026-06-20",
           "vendor dates are carried for display", f"{dated.vendor_etd}/{dated.vendor_eta}")
     check(not any("proposed" in f and "date" in f for f in mt.asdict(dated)),
           "ProposedChange has no proposed_*_date field for a date to leak into",
           str([f for f in mt.asdict(dated) if "date" in f]))
-    expect_raises(
-        mt.DateNotConfirmed,
-        lambda: dated.to_netsuite_fields(include_dates=True),
-        "a date write with only vendor dates available RAISES DateNotConfirmed",
-    )
-    check(dated.to_netsuite_fields(include_dates=False) == {"quantity": 20},
-          "the quantity-only write carries no date field of any kind",
-          str(dated.to_netsuite_fields(include_dates=False)))
+    check(dated.to_netsuite_fields() == {"quantity": 20},
+          "the write carries no date field of any kind, vendor dates or not",
+          str(dated.to_netsuite_fields()))
+    from netsuite_client import NetSuiteError, normalize_line_fields
 
-    # Once Paula confirms a date, the override mechanism is what gets written:
-    # custcol_override_expected_receipt = True plus custcol_sd_updatedreceiptdate.
-    dated.confirm_receipt_date("2026-09-10")
-    fields = dated.to_netsuite_fields(include_dates=True)
-    check(fields.get(mt.NS_OVERRIDE_EXPECTED_RECEIPT) is True,
-          "confirmed date sets custcol_override_expected_receipt = True")
-    check(fields.get(mt.NS_UPDATED_RECEIPT_DATE) == "2026-09-10",
-          "and writes the confirmed date to custcol_sd_updatedreceiptdate",
-          str(fields.get(mt.NS_UPDATED_RECEIPT_DATE)))
-    # SETTLED 2026-08-12 by sandbox test, no longer an open question: NetSuite does
-    # NOT derive expectedReceiptDate from the override pair. PO 8489541 line 18 was
-    # PATCHed with the override flag and updated date ONLY, and expectedReceiptDate
-    # stayed at its old value. So all three must be written together with the same
-    # value -- omitting it would leave the field NetSuite actually schedules against
-    # stale while the flag claimed otherwise. See architecture doc section 6.
-    check(fields.get(mt.NS_EXPECTED_RECEIPT_DATE) == "2026-09-10",
-          "expectedReceiptDate is written too -- NetSuite does not derive it from the pair",
-          str(fields.get(mt.NS_EXPECTED_RECEIPT_DATE)))
+    try:
+        normalize_line_fields({"quantity": 20, "expectedReceiptDate": dated.vendor_eta})
+        check(False, "a date field handed to the client is refused", "accepted")
+    except NetSuiteError:
+        check(True, "a date field handed to the client is refused before it is sent")
 
     # 3. The tool NEVER touches custcol_sd_fg_excluderepspark. Paula manages it by
     #    hand. It is not read, not written, not displayed -- including on the
     #    resolution payload, where it would be the obvious thing to show.
     for label, payload in (("the staged change", mt.asdict(c)),
-                           ("the write dict", dated.to_netsuite_fields(include_dates=True)),
-                           ("the quantity-only write", c.to_netsuite_fields(include_dates=False))):
+                           ("the write", c.to_netsuite_fields())):
         check(all("repspark" not in str(k).lower() for k in payload),
               f"no repspark field in {label}", str(list(payload)[:4]))
     check("repspark" not in str(ns.raw).lower() and not hasattr(ns, "exclude_repspark"),

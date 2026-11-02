@@ -470,14 +470,17 @@ not as history - a rule without its failure mode gets rationalised away.
   carton + PO 1721's first are neighbours in the carton list). PDFs are gridded
   by `pdf_carton_grid` from word positions, anchored on a LETTER size header -
   a numeric carton row like `17 10 2 4 16 1` otherwise reads as a header.
-- **Never write a receipt date over a HUMAN override** (Kiko, 2026-09-30).
+- **This tool writes NO receipt date, anywhere** (Kiko, 2026-11-02; superseding
+  the 2026-09-30 "never over a human override" rule, which it makes total).
   Production PO 1624's UPS lines 29-44 carry `custcol_override_expected_receipt`
-  and `custcol_sd_updatedreceiptdate = 2026-06-01`, set by hand. Both
-  `to_netsuite_fields(include_dates=True)` and `update_po_line` raise
-  `HumanOverrideProtected` on a line that already has either; quantity-only
-  writes are unaffected. `overwrite_human_override=True` exists ONLY for
-  `test_phase1_writeback.py`'s revert of its own test write - never pass it on
-  the proposal path.
+  and `custcol_sd_updatedreceiptdate = 2026-06-01`, set by hand.
+  `netsuite_client.WRITABLE_LINE_FIELDS` is `("quantity",)` and
+  `normalize_line_fields` refuses every date field by either spelling, so no
+  caller can build a date write; `write_path._assert_quantity_only` is a second
+  line of defence. Do not reintroduce a date path (`DateNotConfirmed`,
+  `confirm_receipt_date`, `include_dates`, `HumanOverrideProtected` were removed,
+  not parked) without a decision recorded first: it reopens the human-override
+  problem and the untested `expectedReceiptDate`-alone write (RUNBOOK §12 item 1).
 - **Grade the tool against PRODUCTION, read-only, never sandbox** (RUNBOOK §8
   lesson 31). Sandbox reads PO 1624 lines 5/6 as 44/44 and 22/22; production
   reads 44/52 and 22/23. The tool's 52 and 23 are right, and would have scored

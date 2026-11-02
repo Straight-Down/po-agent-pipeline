@@ -92,7 +92,7 @@ An unresolved change **cannot** be approved or written. The "null FK plus a comm
 
 **How the schema satisfies it.** Two independent approval column-groups on `proposed_changes` — `approved_quantity` / `quantity_approved_by` / `quantity_approved_at` / `quantity_write_status`, and `confirmed_receipt_date` / `date_approved_by` / `date_approved_at` / `date_write_status`. A line can be quantity-`WRITTEN` with `date_write_status = 'NONE'` **indefinitely**; that is a legal resting place, not a pending task.
 
-When the forwarder's date arrives weeks later, the change moves `WRITTEN → APPROVED` (see §12) and only the date scope is written, as its own `write_attempts` row.
+When the forwarder's date arrives weeks later, the change moves `WRITTEN → APPROVED` (see §12) and only the date scope is written, as its own `write_attempts` row. **Superseded 2026-11-02: no date scope is ever written** (§11). The date columns, constraints and the `WRITTEN → APPROVED` edge remain in the schema, and the review app still records a date on approval; nothing sends it to NetSuite.
 
 **Two guards worth naming:**
 
@@ -116,7 +116,7 @@ The lines that succeeded keep `WRITTEN` **and their original approval timestamps
 
 `error_kind` exists because the HTTP status cannot decide retry policy on its own: **NetSuite returns permission denials as HTTP 400**, so a status-code rule would retry a permission failure and never surface it. `TRANSIENT` is retryable; `PERMISSION` and `LINE_CLOSED` never are.
 
-`payload_json` stores exactly what was sent. For a date write that is all three fields with the same value — see §10.
+`payload_json` stores exactly what was sent: `{"quantity": N}`, or `{}` for a REFUSED attempt that sent nothing (migration 0014). No date is written (§11).
 
 ---
 
@@ -175,7 +175,7 @@ Four boundaries, each asserted by a test in `test_schema.py` rather than only wr
 
 - **The tool never creates PO lines.** There is no new-line state, no table for lines to be created, and no create path in the client. The only line reference is `ns_line_id`, always to something NetSuite already has. A vendor line with no counterpart is a flag. *Who* creates a second duplicate-key line, and why, is explicitly out of this tool's scope.
 - **Dates never come from a vendor document.** `vendor_etd` / `vendor_eta` live on `shipments`, deliberately away from the line, and there is no `proposed_*_date` column anywhere for a derived date to occupy. `ck_proposed_changes_date_needs_human` makes the boundary structural.
-- **A date write is always the triple**, same value: `expectedReceiptDate` + `custcol_override_expected_receipt = true` + `custcol_sd_updatedreceiptdate`. Tested 2026-08-12 in sandbox: NetSuite does **not** derive `expectedReceiptDate` from the override pair, so writing only the pair leaves the field NetSuite actually schedules against stale. `write_attempts.payload_json` records what was sent, so this is auditable after the fact.
+- **No date is written at all** (Kiko, 2026-11-02). The write is `quantity` alone, refused otherwise in `netsuite_client.normalize_line_fields` and again in `write_path`; `write_attempts.payload_json` records exactly what was sent, so that is auditable after the fact. *Superseded rule, kept for its evidence:* a date write was to be the triple, same value (`expectedReceiptDate` + `custcol_override_expected_receipt = true` + `custcol_sd_updatedreceiptdate`), because NetSuite does **not** derive `expectedReceiptDate` from the override pair (sandbox, 2026-08-12).
 - **`custcol_sd_fg_excluderepspark` appears nowhere** — not read, not written, not stored, not displayed. Paula manages it by hand. A test introspects every column in every table and asserts no name matches `%repspark%`.
 
 ---

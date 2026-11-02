@@ -33,7 +33,6 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from types import SimpleNamespace
 
 import netsuite_client as nc
 from netsuite_client import (
@@ -273,28 +272,26 @@ def test_line_mapping() -> None:
 
 
 def test_field_normalization() -> None:
-    section("field normalization / validation")
-    out = normalize_line_fields(
-        {
-            "quantity": 99,
-            "expected_receipt_date": dt.date(2026, 6, 27),
-            "override_expected_receipt": True,
-            "updated_receipt_date": "2026-06-27",
-        }
-    )
-    check(set(out) == set(nc.WRITABLE_LINE_FIELDS), "snake_case aliases resolve to NetSuite names", ", ".join(out))
-    check(out[nc.NS_EXPECTED_RECEIPT_DATE] == "2026-06-27", "date object -> ISO string", out[nc.NS_EXPECTED_RECEIPT_DATE])
-    check(out[nc.NS_UPDATED_RECEIPT_DATE] == "2026-06-27", "ISO string passes through validated")
-    check(out[nc.NS_OVERRIDE_EXPECTED_RECEIPT] is True, "bool preserved")
-    check(out[nc.NS_QUANTITY] == 99 and isinstance(out[nc.NS_QUANTITY], int), "quantity is an int")
+    section("field normalization / validation: quantity only (2026-11-02)")
+    check(nc.WRITABLE_LINE_FIELDS == ("quantity",), "quantity is the only writable field",
+          str(nc.WRITABLE_LINE_FIELDS))
+    out = normalize_line_fields({"quantity": 99})
+    check(out == {nc.NS_QUANTITY: 99} and isinstance(out[nc.NS_QUANTITY], int),
+          "quantity passes through as an int", str(out))
+    check(normalize_line_fields({"quantity": 12.5}) == {nc.NS_QUANTITY: 12.5},
+          "a fractional quantity stays fractional")
 
-    # Raw NetSuite names must work too, for callers that already speak NetSuite.
-    raw = normalize_line_fields({nc.NS_QUANTITY: 5, nc.NS_OVERRIDE_EXPECTED_RECEIPT: "true"})
-    check(raw[nc.NS_QUANTITY] == 5, "raw NetSuite field names accepted")
-    check(raw[nc.NS_OVERRIDE_EXPECTED_RECEIPT] is True, "'true' string coerced to bool")
-
-    check(normalize_line_fields({"updated_receipt_date": None})[nc.NS_UPDATED_RECEIPT_DATE] is None,
-          "None clears a date field (matches NetSuite's null)")
+    # Every date field, by either spelling, is refused -- with a message that says
+    # dates are not written, not that the field is unknown.
+    for field in ("expected_receipt_date", "override_expected_receipt", "updated_receipt_date",
+                  nc.NS_EXPECTED_RECEIPT_DATE, nc.NS_OVERRIDE_EXPECTED_RECEIPT,
+                  nc.NS_UPDATED_RECEIPT_DATE):
+        try:
+            normalize_line_fields({"quantity": 99, field: "2026-06-27"})
+            check(False, f"{field} is refused", "accepted")
+        except NetSuiteError as exc:
+            check("quantity only" in str(exc), f"{field} is refused as a date write",
+                  str(exc)[:70])
 
     expect_raises(NetSuiteError, lambda: normalize_line_fields({}), "empty field dict rejected")
     expect_raises(
@@ -305,12 +302,12 @@ def test_field_normalization() -> None:
     expect_raises(
         NetSuiteError,
         lambda: normalize_line_fields({"rate": 12.50}),
-        "field outside the validated four rejected",
+        "a field other than quantity rejected",
     )
     expect_raises(
         NetSuiteError,
-        lambda: normalize_line_fields({"expected_receipt_date": "06/27/2026"}),
-        "non-ISO date rejected before it reaches NetSuite",
+        lambda: normalize_line_fields({"custcol_sd_fg_excluderepspark": True}),
+        "custcol_sd_fg_excluderepspark rejected",
     )
     expect_raises(
         NetSuiteError, lambda: normalize_line_fields({"quantity": None}), "None quantity rejected"
@@ -335,26 +332,8 @@ def test_update_payload_shape() -> None:
         return FakeResponse()
 
     client._request = fake_request  # bypass HTTP only; payload construction is real
-    # The override guard reads the line before a date write; this one is clean.
-    reads: list = []
 
-    def clean_line(po, line, by_internal_id=False):
-        reads.append((po, line))
-        return SimpleNamespace(override_expected_receipt=False, updated_receipt_date=None)
-
-    client.get_po_line = clean_line
-
-    result = client.update_po_line(
-        "8489541",
-        18,
-        {
-            "quantity": 99,
-            "expected_receipt_date": dt.date(2026, 6, 27),
-            "override_expected_receipt": True,
-            "updated_receipt_date": dt.date(2026, 6, 27),
-        },
-        by_internal_id=True,
-    )
+    result = client.update_po_line("8489541", 18, {"quantity": 99}, by_internal_id=True)
 
     body = captured["json"]
     check(captured["method"] == "PATCH", "uses PATCH", captured["method"])
@@ -364,11 +343,8 @@ def test_update_payload_shape() -> None:
 
     sent = body["item"]["items"][0]
     check(sent["line"] == 18 and isinstance(sent["line"], int), "line targeted by integer `line` number", repr(sent["line"]))
-    check(
-        all(f in sent for f in nc.WRITABLE_LINE_FIELDS),
-        "all four confirmed fields in ONE call",
-        ", ".join(k for k in sent if k != "line"),
-    )
+    check(sent == {"line": 18, "quantity": 99}, "the line number and quantity, nothing else",
+          json.dumps(sent))
 
     # The dangerous parameter. `replace=item` would blow away every other line
     # on the PO instead of merging this one.
@@ -382,31 +358,22 @@ def test_update_payload_shape() -> None:
         lambda: client.update_po_line("8489541", 18, {"amount": 1}, by_internal_id=True),
         "unsupported field rejected before any HTTP call",
     )
-    check(reads == [("8489541", 18)], "a date write reads the line first (override guard)",
-          str(reads))
 
-    # A line a PERSON already overrode -- PO 1624's UPS lines 29-44 in production.
-    section("a human receipt-date override is never overwritten")
+    # PO 1624's UPS lines 29-44 in production carry human-entered receipt-date
+    # overrides. No date write can be built at all, so none can reach them.
+    section("no date field reaches NetSuite, whatever the caller passes")
     captured.clear()
-    client.get_po_line = lambda po, line, by_internal_id=False: SimpleNamespace(
-        override_expected_receipt=True, updated_receipt_date=dt.date(2026, 6, 1))
-    for fields, what in (({"override_expected_receipt": False}, "the override flag"),
-                         ({"updated_receipt_date": dt.date(2026, 6, 19)},
-                          "the updated receipt date")):
+    for fields in ({"override_expected_receipt": False},
+                   {"updated_receipt_date": dt.date(2026, 6, 19)},
+                   {"quantity": 1, "expected_receipt_date": dt.date(2026, 6, 19)}):
         expect_raises(
-            nc.HumanOverrideProtected,
+            NetSuiteError,
             lambda fields=fields: client.update_po_line("8309219", 29, fields,
                                                         by_internal_id=True),
-            f"writing {what} over a human override is refused")
+            f"update_po_line refuses {sorted(fields)}")
     check(not captured, "and nothing was sent", str(captured.get("method")))
     client.update_po_line("8309219", 29, {"quantity": 1}, by_internal_id=True)
-    check(captured.get("method") == "PATCH",
-          "a quantity-only write to the same line is unaffected")
-    captured.clear()
-    client.update_po_line("8309219", 29, {"override_expected_receipt": False},
-                          by_internal_id=True, overwrite_human_override=True)
-    check(captured.get("method") == "PATCH",
-          "overwrite_human_override=True (the Phase 1 revert only) is the one way through")
+    check(captured.get("method") == "PATCH", "a quantity write to the same line goes through")
 
 
 def test_error_translation() -> None:

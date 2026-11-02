@@ -241,9 +241,10 @@ Then the real thing:
 ```
 
 It authenticates via signed JWT (no browser), reads PO `8489541` line 18,
-confirms it's still the `M120246`/`TID`/`3X` line, writes all four fields in one
-PATCH, reads back and checks each field individually, then reverts and verifies
-the revert.
+confirms it's still the `M120246`/`TID`/`3X` line, writes the quantity in one
+PATCH, reads it back, then reverts and verifies the revert. (Until 2026-11-02 it
+wrote all four fields; the tool now writes quantity only, and the client refuses
+every date field.)
 
 Exit codes: `0` pass · `1` fail · `2` config/refused · `3` **permission finding**.
 

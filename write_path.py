@@ -185,6 +185,12 @@ def write_approved_quantity(
                                       f"written. {_plain_error(exc, after_send=False)}")
 
     line = next((ln for ln in lines if ln.line_id == str(row.ns_line_id)), None)
+    # LOAD-BEARING. NetSuite treats a PATCH entry with an unknown line number as
+    # ADDING a new line: `{"line": 9999, "quantity": 5}` failed in sandbox
+    # (2026-11-02) only because a new line needs an Amount. This check is what
+    # stops the tool creating PO lines. Anything that widens the payload -- more
+    # fields, or a batch -- must still send only lines present on the fresh read.
+    # Phase 3 requirements section 14.
     if line is None:
         return attempt.refused("OTHER", previous=None, message=(
             f"{po} no longer has a line {row.ns_line_id} in NetSuite, so nothing was written."))

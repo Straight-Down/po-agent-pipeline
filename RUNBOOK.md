@@ -1536,7 +1536,32 @@ Decided, not proposed. **Built so far: decision 2's write function and the narro
 - **Supersedes** the architecture doc's "confirms success/failure back to Paula -- email or Teams" and the build plan's Phase 3 "confirmation notification on success/failure". Success and failure are now shown on screen at the moment of approval (decision 2); email carries only the waiting-changes digest.
 
 **2. Writes happen while she waits.** Approve pushes to NetSuite synchronously and shows a per-line result -- **written, refused, or failed** -- before the page returns. Writes are not queued for a later run.
-- **Why:** one approver and low volume, so there is nothing to batch; and the re-read-before-write guard (the write path re-reads each line and refuses one that has closed since processing; CLAUDE.md gotchas) only helps if she is there to be told what it refused.
+- **Why:** one approver and low volume, so there is nothing to queue; and the re-read-before-write guard (the write path re-reads each line and refuses one that has closed since processing; CLAUDE.md gotchas) only helps if she is there to be told what it refused.
+- **One batch PATCH per PO, not one request per line** (Kiko, 2026-11-02, from the measurements below). About 7 s per PATCH regardless of line count and about 2 s per full PO read, so about **11 s for a PO of any size** (read, PATCH, read). Written line by line it would be about 9 s a line, **about 6 minutes for a 40-line PO**.
+- **The sequence:**
+  1. Re-read the PO.
+  2. Exclude blocked lines, and any line the re-read refuses: closed, not open, gone, or edited since the proposal.
+  3. Send **one** PATCH carrying every remaining changed line.
+  4. **Re-read the PO again and report what actually landed**, line by line. Never infer success from the 204.
+- **On a 400:** NetSuite rejects the **whole** batch, applies nothing, and names the offending line in the error path (`o:errorPath`, e.g. `item.items[?(@.line==3)]`), all in under a second. Drop that line, record it as failed with NetSuite's message, and resend the rest. **Fall back to per-line writes only if the error names no line.** This satisfies the 2026-09-16 partial-failure ruling (below): the lines that can be written stand, and the failing one is handled on its own.
+- **Timeouts:** a 60-second timeout occurred on roughly **1 request in 15** on 2026-11-02. It hit production reads as well as sandbox writes, so it is a NetSuite or network characteristic, not a sandbox one.
+  - The client's retries reuse the idempotency key (`_request` keeps the caller's headers).
+  - A timed-out attempt may still have landed. The closing re-read is what establishes the truth.
+  - **The screen must show progress and a timeout message**, never appear frozen. A whole PO can legitimately take over a minute when one request times out.
+- **Consequence for what is built:** `write_path.write_approved_quantity` is per line. The batch is new work. It will change the one function the review app may call, and with it the signature `test_review_app_never_imports_netsuite_client` pins. Change the pinned signature on purpose when the batch function lands; never loosen the test to make room. The per-line refusal checks, the quantity-only guard and the attempt recording carry over unchanged.
+- **The evidence (2026-11-02, sandbox PO 1662 / internal id 8489541, 41 lines; scratch scripts, nothing committed):**
+
+  | Request | Measured |
+  |---|---|
+  | Single-line PATCH, 10 runs (5 write + 5 revert of line 18) | 6.90, 7.21, 7.11, 7.11, 7.16, 7.07, 7.29, 7.56, 8.20, 10.15 s (median about 7.2) |
+  | Same, earlier in the day | 31 s once (the outlier); one revert attempt timed out at 60 s and its retry succeeded |
+  | Three-line PATCH (lines 1-3) | 8.51 s write, 7.71 s revert; all three changed, no other line moved (all 41 compared) |
+  | Full PO read (`GET ?expandSubResources=true`) | 1.71-3.93 s normally; once 8.70 s; once a 60.01 s timeout, retry 2.30 s |
+  | Batch with a nonexistent line 9999 | `400 USER_ERROR`, path `item.items[?(@.line==9999)]`, 0.87 s, **nothing applied** |
+  | Batch with a non-numeric quantity on line 3 | `400 INVALID_VALUE`, path `item.items[?(@.line==3)]`, 0.84 s, **nothing applied** |
+  | Production read of PO 1662 (account 1321665, GET only, enforced in code) | 60.01 s timeout, retry 2.50 s |
+
+  Timeouts: 3 in about 45 sandbox requests that day, plus the production read. One production sample cannot show production is faster than sandbox. Its quick answer (2.5 s) matches sandbox's.
 - **Holds unchanged:** the partial-failure ruling (Paula, 2026-09-16; Phase 3 requirements §7). Successes stand, each failure is reported with its reason and retried per line, with no rollback. With no background run, a retry is one she triggers from the screen.
 - **Requires the "review app must not import the NetSuite client" rule to be NARROWED, not removed** (Kiko, 2026-10-21). Today the app must never import `netsuite_client` (or `matcher`/`ingest`), and `test_review_app_never_imports_netsuite_client` fails if it does. Under this decision the app may call **one write function with a defined signature, and nothing else** from the write side. `test_review_app_never_imports_netsuite_client` is **rewritten to enforce exactly that**: the one permitted call is allowed, and any other import or use of the client, matcher or ingest still fails. Deleting the test, or loosening it to "imports allowed", does not satisfy this decision.
 - **Built 2026-11-02 (function only, not wired):** `write_path.write_approved_quantity(engine, change_id, *, client=None, now=None)`. Per line it re-reads the line from NetSuite; refuses a line that is closed, not open, gone, or whose quantity no longer equals the proposal's `current_quantity` (someone else's edit); sends `quantity` and nothing else (no date field, `expectedReceiptDate` included; Kiko, 2026-11-02); and records every attempt that reached NetSuite in `write_attempts` as SUCCESS, REFUSED or FAILED, with the re-read value in `previous_quantity` (migration 0014). Refusals and NetSuite errors are returned as a displayable per-line result, never raised; a write NetSuite accepted but the database could not record comes back as `WRITTEN_NOT_RECORDED`. Two calls racing on one line cannot drop a real write from the accumulation base. A production account is refused unless `PO_AGENT_ALLOW_PRODUCTION_WRITES` names it (§12 item 5). A refusal or failure leaves the line WRITE_FAILED, retryable without re-approval. The import rule is narrowed as above: `test_review_app_never_imports_netsuite_client` pins the import, the call's keywords and the signature. Tests: `test_write_path.py`, run on SQLite and on the Azure SQL test database.

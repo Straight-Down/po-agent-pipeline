@@ -48,7 +48,7 @@ The column that matters is the second-to-last: **six of these the build plan doe
 | 11 | Override flag only when a date is written | Build plan item 1 · `Architecture.md` §6.3 | **yes** | **SUPERSEDED** 2026-11-02: no date is written |
 | 12 | Multi-batch quantities ACCUMULATE | `Architecture.md` §6.1 · `matcher._accumulated_quantity` · migration 0007 | no | **BUILT AND TESTED** |
 | 13 | Paula is the only approver | `Architecture.md` §7 | no | **CONFIRMED** 2026-09-16 |
-| 14 | Re-read open state at write time; plain WRITE_FAILED if closed | Build plan Phase 4 item 10 | **yes** | DECIDED BUT UNBUILT |
+| 14 | Re-read open state at write time; plain WRITE_FAILED if closed | Build plan Phase 4 item 10 | **yes** | BUILT AND TESTED 2026-11-02 (per line) |
 
 ---
 
@@ -529,7 +529,18 @@ name — and because this ruling can change.
 
 ## 14. The write path re-reads every line and confirms it is still OPEN
 
-**DECIDED BUT UNBUILT, 2026-09-30.** Build plan Phase 4 item 10 carries it with the full reasoning.
+**BUILT 2026-11-02** in `write_path.write_approved_quantity` (per line; the per-PO batch of RUNBOOK
+§11 decision 2 is not built yet). Decided 2026-09-30; build plan Phase 4 item 10 carries the full
+reasoning.
+
+**The existence check is what stops the tool creating PO lines (measured 2026-11-02).** NetSuite
+treats a PATCH entry whose `line` number does not exist on the PO as an attempt to ADD a new line.
+Sandbox PO 8489541 with `{"line": 9999, "quantity": 5}` came back `400 USER_ERROR` "Please enter a
+value for Amount" — it failed only because a new line requires an Amount, not because NetSuite
+rejected an unknown line number. So the refusal of a line missing from the fresh read
+(`write_path`, "no longer has a line N") is load-bearing, and the quantity-only payload is a second,
+accidental barrier. **Anything that widens the payload — more fields, or a batch built from more
+than the re-read lines — must keep the check that every line sent exists on the fresh read.**
 
 Before writing any line, re-read it from NetSuite and confirm it is still open — never trust the
 open state stored at processing time. A write refused because the line is no longer open becomes
@@ -579,7 +590,7 @@ the last of them**, including the two this document had raised as proposals:
 **What is left is work, not decisions.** Entries 1, 4 and 5 are built in review_app v1 (2026-09-30).
 Entry 3 (assignment groups) is still DECIDED BUT UNBUILT: v1 REFUSES to render a PO holding one,
 and NEEDS_RESOLUTION, rather than guess at a picker no real data has exercised. Entry 14 (re-read
-open state at write time) is DECIDED BUT UNBUILT and belongs to the write path. Entry 12 is the only
+open state at write time) is built in `write_path` (2026-11-02), per line; the per-PO batch is not. Entry 12 is the only
 one of the four rulings that needed code, and it has it.
 
 **One thing to carry into the build rather than rediscover:** §13 means the queue has no drain while

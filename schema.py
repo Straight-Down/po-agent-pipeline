@@ -971,7 +971,16 @@ write_attempts = Table(
     # pair (tested 2026-08-12), so the payload proves what was actually asserted.
     Column("payload_json", UNBOUNDED_TEXT, nullable=False),
     Column("idempotency_key", Unicode(64), nullable=False),
+    # -- migration 0014. SUCCESS: sent and accepted. FAILED: an error, which may
+    # -- have come after the PATCH left (a timeout), so "nothing changed" is not
+    # -- implied. REFUSED: the re-read found the line closed, gone, or edited
+    # -- since the proposal, and NOTHING was sent -- payload_json is then '{}'.
     Column("outcome", Unicode(16), nullable=False),
+    # -- migration 0014: the quantity the write path re-read from NetSuite just
+    # -- before deciding -- the "previous" in "previous -> new". Never the
+    # -- proposal-time `current_quantity`, which can be days stale. NULL when the
+    # -- re-read itself failed.
+    Column("previous_quantity", Numeric(12, 3)),
     Column("http_status", Integer),
     # Retry policy hangs off this: TRANSIENT is retryable, PERMISSION and
     # LINE_CLOSED never are. NetSuite returns permission denials as 400s, so the
@@ -981,7 +990,7 @@ write_attempts = Table(
     Column("attempted_at", DateTime, nullable=False),
     UniqueConstraint("change_id", "scope", "attempt_no", name="uq_write_attempts_attempt"),
     CheckConstraint("scope IN ('QUANTITY','DATE')", name="scope"),
-    CheckConstraint("outcome IN ('SUCCESS','FAILED')", name="outcome"),
+    CheckConstraint("outcome IN ('SUCCESS','FAILED','REFUSED')", name="outcome"),
     CheckConstraint(
         "error_kind IS NULL OR error_kind IN "
         "('PERMISSION','TRANSIENT','CONFLICT','LINE_CLOSED','VALIDATION','OTHER')",

@@ -605,25 +605,117 @@ def test_the_wording_map_tracks_what_the_matcher_writes() -> None:
           and "It may belong" in one, "and is grammatical for a single line", one[:60])
 
 
+#: The ONE thing the review app may take from the write side (RUNBOOK section 11,
+#: Phase 4 decision 2): this function, imported under this exact name, called
+#: with this signature, and never handed a client. NARROWED from "nothing at all"
+#: on 2026-11-02, not removed. Widening it is a decision, made here on purpose.
+PERMITTED_MODULE, PERMITTED_FUNCTION = "write_path", "write_approved_quantity"
+PERMITTED_SIGNATURE = (
+    ("engine", "POSITIONAL_OR_KEYWORD", "<none>"),
+    ("change_id", "POSITIONAL_OR_KEYWORD", "<none>"),
+    ("client", "KEYWORD_ONLY", None),
+    ("now", "KEYWORD_ONLY", None),
+)
+#: The keywords the app may pass. `client` is for tests: an app that builds its
+#: own client has reached past the one function.
+PERMITTED_KEYWORDS = {"now"}
+WRITE_SIDE = ("netsuite_client", "matcher", "ingest", PERMITTED_MODULE)
+
+
+def _write_side_reach(name: str, source: str) -> list[str]:
+    """Every way `source` reaches the write side beyond the one permitted function."""
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        where = f"{name}:{getattr(node, 'lineno', '?')}"
+        if isinstance(node, ast.Import):
+            found += [f"{where}: import {a.name}" for a in node.names
+                      if a.name.split(".")[0] in WRITE_SIDE]
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] in WRITE_SIDE:
+            for a in node.names:
+                if not (node.module == PERMITTED_MODULE and node.level == 0
+                        and a.name == PERMITTED_FUNCTION and a.asname is None):
+                    found.append(f"{where}: from {node.module} import {a.name}"
+                                 + (f" as {a.asname}" if a.asname else ""))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            called = (func.id if isinstance(func, ast.Name)
+                      else func.attr if isinstance(func, ast.Attribute) else "")
+            if called in ("import_module", "__import__"):
+                found.append(f"{where}: dynamic import")
+            if called == PERMITTED_FUNCTION:
+                extra = [k.arg or "**" for k in node.keywords if k.arg not in PERMITTED_KEYWORDS]
+                if extra or len(node.args) > 2 or any(isinstance(a, ast.Starred)
+                                                      for a in node.args):
+                    found.append(f"{where}: {PERMITTED_FUNCTION} called with "
+                                 f"{extra or 'extra positional arguments'}")
+    return found
+
+
 def test_review_app_never_imports_netsuite_client() -> None:
-    section("the review app cannot reach NetSuite: not imported, directly or transitively")
+    section("the review app reaches NetSuite through ONE function, and nothing else")
     package = HERE / "review_app"
-    direct = []
+    reach = []
     for path in package.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            names = ([a.name for a in node.names] if isinstance(node, ast.Import)
-                     else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
-            direct += [f"{path.name}: {n}" for n in names
-                       if n.split(".")[0] in ("netsuite_client", "matcher", "ingest")]
-    check(not direct, "no module in review_app imports netsuite_client (or matcher/ingest, "
-          "which import it)", str(direct or "none"))
-    probe = ("import sys; import review_app.app, review_app.data, review_app.__main__; "
-             "print(sorted(m for m in ('netsuite_client','matcher','ingest') if m in sys.modules))")
+        reach += _write_side_reach(path.name, path.read_text(encoding="utf-8"))
+    check(not reach, f"review_app takes nothing from netsuite_client, matcher or ingest, and "
+          f"only {PERMITTED_FUNCTION} from {PERMITTED_MODULE}", str(reach or "none"))
+
+    # The scanner must be able to fail, on every widening it exists to catch.
+    permitted = (f"from {PERMITTED_MODULE} import {PERMITTED_FUNCTION}\n"
+                 f"{PERMITTED_FUNCTION}(engine, change_id, now=now)\n")
+    widenings = {
+        "the client module": "import netsuite_client",
+        "a name from the client": "from netsuite_client import NetSuiteClient",
+        "the matcher": "import matcher",
+        "ingest": "from ingest import ingest_shipment",
+        "the whole write module": f"import {PERMITTED_MODULE}",
+        "a second name": f"from {PERMITTED_MODULE} import {PERMITTED_FUNCTION}, _live_client",
+        "an alias": f"from {PERMITTED_MODULE} import {PERMITTED_FUNCTION} as w",
+        "a client passed in": permitted.replace("now=now", "client=c"),
+        "keywords splatted": permitted.replace("now=now", "**kw"),
+        "a dynamic import": "importlib.import_module('netsuite_client')",
+    }
+    missed = [label for label, src in widenings.items() if not _write_side_reach("x", src)]
+    check(not _write_side_reach("x", permitted) and not missed,
+          "the scanner passes the permitted call and catches each widening",
+          f"missed: {missed}" if missed else f"{len(widenings)} widenings caught")
+
+    import inspect
+
+    import write_path
+
+    params = tuple((p.name, p.kind.name,
+                    "<none>" if p.default is inspect.Parameter.empty else p.default)
+                   for p in inspect.signature(write_path.write_approved_quantity)
+                   .parameters.values())
+    check(params == PERMITTED_SIGNATURE,
+          f"{PERMITTED_FUNCTION} has exactly the pinned signature: no way to pass fields",
+          str(params))
+    own = [r for r in _write_side_reach("write_path.py",
+                                        (HERE / "write_path.py").read_text(encoding="utf-8"))
+           if "matcher" in r or "ingest" in r]
+    check(not own, f"{PERMITTED_MODULE} imports neither matcher nor ingest, so the "
+          "permitted import cannot carry them in", str(own or "none"))
+
+    probe = (
+        "import sys\n"
+        "import review_app.app, review_app.data, review_app.__main__\n"
+        "def loaded(): return sorted(m for m in ('netsuite_client','matcher','ingest',"
+        "'write_path') if m in sys.modules)\n"
+        "app = loaded()\n"
+        "import write_path\n"
+        "print(app)\n"
+        "print(loaded())\n")
     out = subprocess.run([sys.executable, "-c", probe], cwd=HERE, capture_output=True,
                          text=True, timeout=120)
-    check(out.returncode == 0 and out.stdout.strip() == "[]",
-          "and a fresh interpreter importing the whole app never loads it transitively",
-          (out.stdout.strip() or out.stderr.strip())[-200:])
+    app_loaded = (out.stdout.splitlines() or [""])[0]
+    check(out.returncode == 0 and "matcher" not in out.stdout and "ingest" not in out.stdout,
+          "a fresh interpreter loading the whole app, and then the write function as the "
+          "wired app will, never loads matcher or ingest", (out.stdout.strip()
+                                                            or out.stderr.strip())[-200:])
+    check(("netsuite_client" in app_loaded) == ("write_path" in app_loaded),
+          "and the client is loaded by the app only by way of the write function",
+          app_loaded)
 
 
 def main() -> int:

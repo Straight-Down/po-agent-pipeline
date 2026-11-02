@@ -175,13 +175,17 @@ heavily than the code it can read. Known drift as of 2026-09-14:
   `ingest.py`, `schema.py`, `extraction_schema.py`, `claude_extractor.py`,
   `document_parsers.py`, `attachment_classifier.py`, `size_vocabulary.py`,
   `canonical.py`, `config.py`, `carton_backing.py`, alembic migrations
-  0001-0013, and eight test
-  modules — plus, since Phase 2 closed on 2026-09-14, the mailbox intake:
+  0001-0014, and ten test
+  modules as of 2026-11-02 — plus, since Phase 2 closed on 2026-09-14, the mailbox intake:
   `graph_client.py` (a four-method Graph interface with a mock and a real
   client), `poller.py` (the polling job and the content-addressed attachment
   store) and `extract_pending.py` (the ingest -> extraction driver, a separate
   command by design). Since 2026-09-30, `review_app/`: the Phase 3 review UI
   v1 (local FastAPI, 127.0.0.1, no auth; approving sets APPROVED and stops).
+  Since 2026-11-02, `write_path.py` (`write_approved_quantity`: one approved
+  line's quantity to NetSuite, re-read first, refusals returned, every attempt
+  recorded) and `test_write_path.py` -- built and tested, not yet wired to
+  Approve.
 - "Nothing here has touched production data" should be re-confirmed rather
   than assumed, given how much has been built since.
 
@@ -478,14 +482,24 @@ not as history - a rule without its failure mode gets rationalised away.
   lesson 31). Sandbox reads PO 1624 lines 5/6 as 44/44 and 22/22; production
   reads 44/52 and 22/23. The tool's 52 and 23 are right, and would have scored
   as false positives against the stale copy.
-- **The review app must never import `netsuite_client`** - nor `matcher` or
-  `ingest`, which import it. Approving sets APPROVED and stops; the write path
-  is separate work. `test_review_app_never_imports_netsuite_client` checks the
-  source AND a fresh interpreter's `sys.modules`, so a transitive import fails too.
-  **Planned narrowing, not removal** (RUNBOOK §11, Phase 4 decision 2): when
-  Approve starts writing synchronously, the app may call ONE write function with a
-  defined signature and nothing else, and this test is rewritten to enforce exactly
-  that. Until then the rule stands as written; never delete the test to make room.
+- **The review app reaches NetSuite through ONE function and nothing else**
+  (narrowed 2026-11-02, RUNBOOK §11 Phase 4 decision 2): `from write_path import
+  write_approved_quantity`, under that name, called without `client=`. Never
+  `netsuite_client`, `matcher` or `ingest`, never `import write_path`, never a
+  second name. `test_review_app_never_imports_netsuite_client` pins the import,
+  the call's keywords AND the function's signature, checks a fresh
+  interpreter's `sys.modules`, and self-tests its scanner against ten widenings.
+  Widening any of that is a decision: change `PERMITTED_*` in the test on purpose,
+  never delete the test to make room. Not wired yet: Approve still sets APPROVED
+  and stops.
+- **The write path sends `quantity` and nothing else** (2026-11-02). No date
+  field, `expectedReceiptDate` included; `custcol_sd_fg_excluderepspark` never.
+  `write_path._assert_quantity_only` raises before sending otherwise. It
+  re-reads the line first and REFUSES (records `outcome='REFUSED'`, sends
+  nothing) a line that is closed, not open, gone, or whose quantity no longer
+  equals the proposal's `current_quantity`. Do not "fix" a refusal of a line
+  already at the new value by recording it as SUCCESS: that claims a write the
+  tool cannot prove it made, and it becomes the accumulation base.
 - **"Is any line open?" must read `change_candidates` as well as the row.** A
   line with no chosen target (NEEDS_RESOLUTION) has `ns_line_is_open` NULL and
   its open candidates in `change_candidates` (Requirements §2). Reading the row

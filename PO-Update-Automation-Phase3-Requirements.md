@@ -217,6 +217,8 @@ already models it (`shipment_pos` sits between `shipments` and `proposed_changes
 **Note for whoever designs the email flow:** a per-PO *approve button* is not sufficient on its own
 for any PO carrying a date — §9 and §10 require an input, not a decision. `Architecture.md` §4.1:
 *"An email-link flow needs a lightweight form for this… not a bare Approve button."*
+**Superseded 2026-11-02:** no date is recorded or written, so approval needs no input beyond the
+decision (RUNBOOK §4, "The receipt-date columns are unused").
 
 ---
 
@@ -282,7 +284,8 @@ Three things confirm the model was anticipated at the schema level:
 
 **And no rollback edge exists, which matches the proposal rather than contradicting it.** The only
 transition out of `WRITTEN` is `WRITTEN → APPROVED`, triggered by *"date supplied after the quantity
-was written"* — an additive follow-up, not an undo. Building rollback would mean **adding** a
+was written"* — an additive follow-up, not an undo. (That edge is **unused since 2026-11-02**: no
+date is recorded or written, so in practice nothing leaves `WRITTEN` at all.) Building rollback would mean **adding** a
 transition. The proposal is not to.
 
 ---
@@ -355,8 +358,8 @@ Two constraints already enforce the human's part:
 **SUPERSEDED 2026-11-02 (Kiko): this tool writes no date at all.** The write is `quantity` alone;
 `netsuite_client.normalize_line_fields` refuses every date field and `write_path` refuses them
 again. The `confirmed_receipt_date` / `date_write_status` columns and constraints above still exist,
-and the review app still records a date on Approve, but nothing writes it. Whether Approve should
-keep asking for one is open (RUNBOOK §11, decision 2).
+unused: the receipt-date field was removed from Approve the same day, so nothing records a date
+either (RUNBOOK §4, "The receipt-date columns are unused").
 
 ---
 

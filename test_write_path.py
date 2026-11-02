@@ -253,7 +253,8 @@ def test_a_write_sends_quantity_and_nothing_else() -> None:
 
 
 def test_a_date_approved_with_it_is_not_sent() -> None:
-    section("a receipt date approved alongside: quantity still goes alone")
+    section("a row approved with a date before 2026-11-02: quantity alone, and it ends WRITTEN")
+    # The review app no longer records a date; only an older row can carry one.
     engine, change, ns = world(confirmed_receipt_date=dt.date(2026, 12, 1),
                                date_approved_by=REVIEWER, date_approved_at=NOW,
                                date_write_status="APPROVED")
@@ -263,13 +264,14 @@ def test_a_date_approved_with_it_is_not_sent() -> None:
           "the PATCH still carries only line and quantity", str(sorted(sent)))
     check(ns.lines[18]["expectedReceiptDate"] == "2026-07-15",
           "expectedReceiptDate in NetSuite is unchanged")
-    check("receipt date approved with it was not written" in result.message,
+    check("receipt date recorded with it was not written" in result.message,
           "the result says the date was not written", result.message)
     row = change_row(engine, change)
-    check(row.quantity_write_status == "WRITTEN" and row.date_write_status == "APPROVED"
-          and row.state == sc.STATE_APPROVED,
-          "quantity WRITTEN, date scope still APPROVED, so the change is not WRITTEN",
+    check(row.quantity_write_status == "WRITTEN" and row.state == sc.STATE_WRITTEN,
+          "the change is WRITTEN: never left APPROVED with nothing a write could send",
           f"{row.state} q={row.quantity_write_status} d={row.date_write_status}")
+    check(row.date_write_status == "APPROVED" and str(row.confirmed_receipt_date) == "2026-12-01",
+          "and its recorded date is left as it was, unused")
 
     again = write(engine, change, ns)
     check(again.status == wp.REFUSED and "already written" in again.message

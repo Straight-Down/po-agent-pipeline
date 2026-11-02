@@ -232,7 +232,8 @@ def write_approved_quantity(
 
     message = f"{where}: quantity {_fmt(previous)} → {_fmt(new)}."
     if row.date_write_status not in ("NONE", "WRITTEN"):
-        message += (" The receipt date approved with it was not written: this tool does "
+        # Only a row approved before 2026-11-02 can carry one.
+        message += (" A receipt date recorded with it was not written: this tool does "
                     "not write dates to NetSuite.")
     return attempt.succeeded(previous, sent, response.get("status_code"), message)
 
@@ -264,10 +265,10 @@ def _precondition_refusal(row, where: str) -> Optional[str]:
     """A reason not to contact NetSuite at all, or None. Nothing is recorded for these."""
     if row.quantity_write_status == "WRITTEN":
         return f"{where} was already written, so nothing was sent again."
-    # APPROVED or WRITE_FAILED only. WRITTEN is excluded even with a fresh
-    # approval on it: approving moves a row to APPROVED (WRITTEN -> APPROVED is
-    # the legal edge), so a WRITTEN row with an approved scope is inconsistent,
-    # and failing it would need WRITTEN -> WRITE_FAILED, which is not legal.
+    # APPROVED or WRITE_FAILED only. A WRITTEN row with an approved scope is
+    # inconsistent -- nothing re-approves a WRITTEN row since the date scope went
+    # (2026-11-02) -- and failing it would need WRITTEN -> WRITE_FAILED, which is
+    # not legal.
     if (row.quantity_write_status not in ("APPROVED", "FAILED")
             or row.state not in (sc.STATE_APPROVED, sc.STATE_WRITE_FAILED)
             or row.approved_quantity is None or not row.quantity_approved_by):
@@ -363,8 +364,8 @@ class _Attempt:
         it, because another call may have recorded since (two tabs, a double
         click). Two rules make the outcome order-independent:
 
-        - **A SUCCESS always lands.** NetSuite holds the value; the row must say
-          WRITTEN or the accumulation base (`ingest._line_history`, which needs
+        - **A SUCCESS always lands, as WRITTEN.** NetSuite holds the value; the row
+          must say so or the accumulation base (`ingest._line_history`, which needs
           `quantity_write_status = 'WRITTEN'`) loses a real write.
         - **A non-success never overwrites a WRITTEN status.** The attempt row is
           kept as history, and the state is left as the successful call set it.
@@ -375,15 +376,16 @@ class _Attempt:
         row, wa, pc = self.row, write_attempts, proposed_changes
         with self.engine.begin() as conn:
             now_row = conn.execute(
-                select(pc.c.state, pc.c.quantity_write_status, pc.c.date_write_status)
+                select(pc.c.state, pc.c.quantity_write_status)
                 .where(pc.c.id == row.id)).one()
             from_state, from_status = now_row.state, now_row.quantity_write_status
             if outcome == "SUCCESS":
-                to_status = "WRITTEN"
-                # WRITTEN means every approved scope is written. A date scope
-                # approved with it is never written by this path, so it stays APPROVED.
-                date_pending = now_row.date_write_status not in ("NONE", "WRITTEN")
-                to_state = sc.STATE_APPROVED if date_pending else sc.STATE_WRITTEN
+                # Always WRITTEN. A date scope can only exist on a row approved
+                # before 2026-11-02 (the review app no longer records one), and no
+                # date is ever written, so keeping such a row APPROVED would leave
+                # it approved with nothing writable, forever. Its date columns stay
+                # as recorded, unused (RUNBOOK section 4).
+                to_status, to_state = "WRITTEN", sc.STATE_WRITTEN
             elif from_status == "WRITTEN":
                 to_status, to_state = from_status, from_state
             else:

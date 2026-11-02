@@ -28,9 +28,8 @@
   {%- set tone = "" if same_block
                  else "is-flag" if ln.flagged
                  else "is-change" if ln.disposition == "approve" else "" -%}
-  {%- set show_override = ln.override_protected and ln.disposition in ("approve", "accept_no_change") -%}
   {%- set show_rejection = ln.disposition == "decided" and ln.human_verdict == "REJECTED" and ln.human_verdict_note -%}
-  {%- set has_why = (ln.plain_reasons and not same_block) or show_override or show_rejection -%}
+  {%- set has_why = (ln.plain_reasons and not same_block) or show_rejection -%}
   <tbody class="{{ tone }}">
     <tr{% if has_why %} class="has-why"{% endif %}>
       <td class="item">{{ ln.label }}{% if ln.src_recap_label %}<br><span class="muted">{{ ln.src_recap_label }}</span>{% endif %}</td>
@@ -62,7 +61,6 @@
     {% if has_why %}
     <tr class="why-row"><td colspan="9"><div class="why">
       {% for r in ln.plain_reasons %}<p>{{ r }}</p>{% endfor %}
-      {% if show_override %}<p>Someone already set a receipt date on this line in NetSuite, so a date you enter won't be applied to it.</p>{% endif %}
       {% if show_rejection %}<p class="verbatim">Reason: {{ ln.human_verdict_note }}</p>{% endif %}
     </div></td></tr>
     {% endif %}
@@ -105,7 +103,7 @@
 <div class="card ref">
   {% if view.shipment.vendor_etd or view.shipment.vendor_eta %}
   <p class="plain">The vendor says it {% if view.shipment.vendor_etd %}leaves {{ view.shipment.vendor_etd }}{% endif %}{% if view.shipment.vendor_etd and view.shipment.vendor_eta %} and {% endif %}{% if view.shipment.vendor_eta %}arrives {{ view.shipment.vendor_eta }}{% endif %}.
-  That's for your reference only. If you enter a receipt date below, use your own.</p>
+  That's for your reference only.</p>
   {% else %}<p class="plain">The vendor didn't give shipping dates.</p>{% endif %}
 </div>
 
@@ -156,13 +154,6 @@
     <input type="hidden" name="csrf_token" value="{{ csrf }}">
     <input type="hidden" name="fingerprint" value="{{ view.fingerprint }}">
     {% if view.can_approve %}
-      <p><label>Receipt date (optional)<br>
-        <input type="date" name="receipt_date" value=""></label><br>
-        <span class="muted">Leave it empty to approve the quantities now and add the date later.</span></p>
-      {% if view.override_protected_covered %}
-        <p class="plain">Someone already set a receipt date in NetSuite on {{ view.override_protected_covered|length }} of these lines, so a date you enter won't be applied to {{ "them" if view.override_protected_covered|length != 1 else "it" }}:
-        {{ view.override_protected_covered|map(attribute="label")|join(", ") }}.</p>
-      {% endif %}
       <button type="submit">{{ view.approve_label }}</button>
       <p class="muted">This records your approval. Nothing changes in NetSuite yet.</p>
     {% else %}

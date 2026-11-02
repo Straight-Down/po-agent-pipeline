@@ -563,6 +563,10 @@ CHANGE_STATE_TRANSITIONS: tuple[tuple[str, str, str, str], ...] = (
     (STATE_NEEDS_ASSIGNMENT, STATE_APPROVED, "human assigned this row to a line", "HUMAN"),
     (STATE_NEEDS_ASSIGNMENT, STATE_DISCARDED, "closed without writing", "HUMAN"),
     (STATE_NEEDS_ASSIGNMENT, STATE_SUPERSEDED, "re-proposed by a later shipment", "SYSTEM"),
+    # UNUSED since 2026-11-02, with WRITTEN -> APPROVED below: both existed only
+    # for a receipt date, and this tool records and writes none (RUNBOOK section 4).
+    # Kept because the table is seeded data and removing a row needs a migration.
+    # Nothing may start using either edge again without that decision.
     (STATE_NO_CHANGE, STATE_APPROVED, "quantity fine, a receipt date is still wanted", "HUMAN"),
     (STATE_NO_CHANGE, STATE_DISCARDED, "closed without writing", "HUMAN"),
     (STATE_NO_CHANGE, STATE_SUPERSEDED, "re-proposed by a later shipment", "SYSTEM"),
@@ -574,9 +578,9 @@ CHANGE_STATE_TRANSITIONS: tuple[tuple[str, str, str, str], ...] = (
     (STATE_WRITE_FAILED, STATE_WRITTEN, "retry succeeded", "SYSTEM"),
     (STATE_WRITE_FAILED, STATE_APPROVED, "re-queued for retry", "SYSTEM"),
     (STATE_WRITE_FAILED, STATE_DISCARDED, "given up on", "HUMAN"),
-    # The one backwards edge, and the reason WRITTEN is not terminal: quantity is
-    # knowable from the packing slip immediately, the receipt date waits on the
-    # freight forwarder and may arrive weeks later.
+    # The one backwards edge, for a receipt date arriving weeks after the quantity.
+    # UNUSED since 2026-11-02 (see NO_CHANGE -> APPROVED above): no date is
+    # recorded or written. Kept as seeded data; no migration removes it.
     (STATE_WRITTEN, STATE_APPROVED, "date supplied after the quantity was written", "HUMAN"),
 )
 
@@ -764,6 +768,9 @@ proposed_changes = Table(
     Column("quantity_approved_by", Unicode(320)),
     Column("quantity_approved_at", DateTime),
     Column("quantity_write_status", Unicode(16), nullable=False, default="NONE"),
+    # -- the DATE scope: UNUSED since 2026-11-02. Nothing records or writes a
+    # -- receipt date (RUNBOOK section 4, "The receipt-date columns are unused").
+    # -- Kept, not dropped, to avoid a migration; older rows may still hold values.
     Column("confirmed_receipt_date", Date),  # Paula's, never a vendor document's
     Column("date_approved_by", Unicode(320)),
     Column("date_approved_at", DateTime),

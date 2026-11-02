@@ -92,7 +92,7 @@ An unresolved change **cannot** be approved or written. The "null FK plus a comm
 
 **How the schema satisfies it.** Two independent approval column-groups on `proposed_changes` — `approved_quantity` / `quantity_approved_by` / `quantity_approved_at` / `quantity_write_status`, and `confirmed_receipt_date` / `date_approved_by` / `date_approved_at` / `date_write_status`. A line can be quantity-`WRITTEN` with `date_write_status = 'NONE'` **indefinitely**; that is a legal resting place, not a pending task.
 
-When the forwarder's date arrives weeks later, the change moves `WRITTEN → APPROVED` (see §12) and only the date scope is written, as its own `write_attempts` row. **Superseded 2026-11-02: no date scope is ever written** (§11). The date columns, constraints and the `WRITTEN → APPROVED` edge remain in the schema, and the review app still records a date on approval; nothing sends it to NetSuite.
+When the forwarder's date arrives weeks later, the change moves `WRITTEN → APPROVED` (see §12) and only the date scope is written, as its own `write_attempts` row. **Superseded 2026-11-02: no date scope is ever written** (§11). The date columns, constraints and the `WRITTEN → APPROVED` / `NO_CHANGE → APPROVED` edges remain in the schema, unused: the review app no longer records a date either (RUNBOOK §4, "The receipt-date columns are unused").
 
 **Two guards worth naming:**
 
@@ -189,7 +189,7 @@ Kept as **data** — `change_states` and `change_state_transitions`, seeded by m
 | State | Terminal | Meaning |
 |---|---|---|
 | `PENDING_REVIEW` | no | Matched one open line, quantity differs, waiting on a human. |
-| `NO_CHANGE` | no | Matched, quantity already correct. **Not** terminal — a receipt date may still be wanted. |
+| `NO_CHANGE` | no | Matched, quantity already correct. **Not** terminal — a receipt date may still be wanted. *(Unused reason since 2026-11-02: no date is recorded or written. Approving leaves it NO_CHANGE with a verdict.)* |
 | `NEEDS_ATTENTION` | no | Cannot propose: no match, no open line, closed line, missing PO or quantity, low confidence. |
 | `NEEDS_RESOLUTION` | no | Several open lines match. Candidates recorded, no target, a human picks. |
 | `MANUAL_ENTRY_REQUIRED` | no | No acceptable size-level source document. Paula keys it herself. |
@@ -217,7 +217,7 @@ Kept as **data** — `change_states` and `change_state_transitions`, seeded by m
 | `PENDING_REVIEW` | `NEEDS_ATTENTION` | SYSTEM | re-check before write found a problem |
 | `NEEDS_ATTENTION` | `APPROVED` | HUMAN | human named the target line |
 | `NEEDS_RESOLUTION` | `APPROVED` | HUMAN | human selected a candidate line |
-| `NO_CHANGE` | `APPROVED` | HUMAN | quantity fine, a receipt date is still wanted |
+| `NO_CHANGE` | `APPROVED` | HUMAN | quantity fine, a receipt date is still wanted — **UNUSED since 2026-11-02** (RUNBOOK §4) |
 | `MANUAL_ENTRY_REQUIRED` | `DISCARDED` | HUMAN | keyed into NetSuite by hand |
 | any non-terminal | `DISCARDED` | HUMAN | closed without writing |
 | any non-terminal | `SUPERSEDED` | SYSTEM | re-proposed by a later shipment |

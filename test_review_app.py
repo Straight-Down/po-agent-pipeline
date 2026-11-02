@@ -211,8 +211,9 @@ def test_the_po_page() -> None:
               "a flagged line says what to do; the extractor's own note is under Details (§5)")
         check("That's for your reference only." in html and "arrives 2026/6/27 16:45" in html,
               "vendor dates shown as reference (§9)")
-        check('name="receipt_date" value=""' in html and 'value="2026' not in html,
-              "and never pre-filled into the date field (§9/§10)")
+        check("receipt_date" not in html and 'type="date"' not in html
+              and "receipt date" not in html.lower() and 'value="2026' not in html,
+              "and there is no receipt date to enter at all (2026-11-02)")
         # PO 1662: S 9 vs 12, M 50 vs 71, L 30 vs 30 -- under on both that differ.
         check("This packing slip ships 89 units against 113 ordered on these lines: less than "
               "ordered on every line that differs." in html
@@ -265,29 +266,36 @@ def test_a_flagged_line_that_already_matches_is_still_approved() -> None:
               f"{after['state']} / {after['quantity_write_status']}")
 
 
-def test_the_date_skips_a_human_override() -> None:
-    section("the optional date: applied, except where a person already set one")
+def test_approve_records_no_receipt_date() -> None:
+    section("approve is quantity only: no date recorded, nothing APPROVED without a quantity")
     with _World() as w:
-        with w.engine.begin() as conn:
+        with w.engine.begin() as conn:  # a line a person already dated in NetSuite
             conn.execute(proposed_changes.update()
                          .where(proposed_changes.c.id == w.lines("1662")["M"]["id"])
                          .values(current_override_flag=True))
         c = w.client()
         html = c.get(f"/po/{w.po_id('1662')}").text
-        check("a date you enter won't be applied to it" in html,
-              "the protected line is named on the page before approving")
+        check("receipt date" not in html.lower() and "won't be applied" not in html,
+              "no date field and no override warning, even on a line a person dated")
+        # A stale form, or a hand-made request, still posting a date is ignored.
         c.post(f"/po/{w.po_id('1662')}/approve",
                data={**w.form(c, "1662"), "receipt_date": "2026-10-15"})
         lines = w.lines("1662")
-        check(str(lines["S"]["confirmed_receipt_date"]) == "2026-10-15"
-              and lines["S"]["date_approved_by"] == REVIEWER
-              and lines["S"]["date_write_status"] == "APPROVED",
-              "the date lands on an ordinary line, with the reviewer's name on it")
-        check(lines["M"]["confirmed_receipt_date"] is None
-              and lines["M"]["date_write_status"] == "NONE",
-              "and is NOT applied to the line carrying a human override")
-        check(lines["L"]["state"] == "APPROVED" and str(lines["L"]["confirmed_receipt_date"])
-              == "2026-10-15", "an unchanged line given a date becomes APPROVED for the date")
+        check(all(ln["confirmed_receipt_date"] is None and ln["date_write_status"] == "NONE"
+                  and ln["date_approved_by"] is None for ln in lines.values()),
+              "no line gets a receipt date, whatever the form posts")
+        check(lines["L"]["state"] == "NO_CHANGE" and lines["L"]["human_verdict"] == "ACCEPTED",
+              "an unchanged line is accepted and keeps NO_CHANGE, as before the date field")
+        with w.engine.connect() as conn:
+            stranded = conn.execute(
+                select(proposed_changes.c.id).where(proposed_changes.c.state == "APPROVED")
+                .where((proposed_changes.c.quantity_write_status != "APPROVED")
+                       | proposed_changes.c.approved_quantity.is_(None))).all()
+            approved = conn.execute(select(proposed_changes.c.id).where(
+                proposed_changes.c.state == "APPROVED")).all()
+        check(approved and not stranded,
+              "every APPROVED line has a quantity approved for writing: none is approved with "
+              "nothing writable", f"{len(approved)} approved, {len(stranded)} stranded")
 
 
 def test_reject_needs_a_reason() -> None:
@@ -517,10 +525,6 @@ def main_text(html: str) -> str:
 def test_no_internal_detail_outside_the_details_toggle() -> None:
     section("the rule: nothing internal in the main text of any page Paula sees")
     with _World() as w:
-        with w.engine.begin() as conn:  # make the override message appear too
-            conn.execute(proposed_changes.update()
-                         .where(proposed_changes.c.id == w.lines("1662")["M"]["id"])
-                         .values(current_override_flag=True))
         c = w.client()
         pages = {
             "queue": c.get("/").text,

@@ -94,11 +94,11 @@ def create_app(settings: Settings, engine=None, now=None) -> FastAPI:
 
     @app.post("/po/{shipment_po_id}/approve")
     def approve(request: Request, shipment_po_id: str, csrf_token: str = Form(""),
-                fingerprint: str = Form(""), receipt_date: str = Form("")):
+                fingerprint: str = Form("")):
         try:
             check_csrf(csrf_token)
             data.approve(engine, shipment_po_id, reviewer=settings.reviewer,
-                         receipt_date=receipt_date, fingerprint=fingerprint, now=clock())
+                         fingerprint=fingerprint, now=clock())
         except data.ReviewRefused as exc:
             return refuse(request, exc)
         return RedirectResponse(f"/po/{shipment_po_id}", status_code=303)

@@ -107,11 +107,6 @@ class Line:
             self.row["current_quantity_received"] or 0)
 
     @property
-    def override_protected(self) -> bool:
-        """A person already overrode this line's receipt date (2026-09-30 guard)."""
-        return bool(self.row["current_override_flag"] or self.row["current_updated_receipt_date"])
-
-    @property
     def plain_reasons(self) -> list[str]:
         """What Paula reads about this line; the raw reason goes under Details."""
         return wording.reasons(self.row["attention_reason"], self.row)
@@ -255,10 +250,6 @@ class PoView:
     @property
     def other_lines(self) -> list[Line]:
         return [ln for ln in self.shown_lines if not ln.flagged]
-
-    @property
-    def override_protected_covered(self) -> list[Line]:
-        return [ln for ln in self.covered if ln.override_protected]
 
     @property
     def summary(self) -> Summary:
@@ -427,27 +418,20 @@ def _load_for_decision(conn, shipment_po_id: str, fingerprint: str) -> PoView:
     return view
 
 
-def parse_receipt_date(text: str) -> Optional[dt.date]:
-    text = (text or "").strip()
-    if not text:
-        return None
-    try:
-        return dt.date.fromisoformat(text)
-    except ValueError as exc:
-        raise ReviewRefused("That receipt date doesn't look right. Pick it with the date "
-                            "picker and try again.", 400,
-                            detail=f"expected YYYY-MM-DD, got {text!r}") from exc
-
-
-def approve(engine, shipment_po_id: str, *, reviewer: str, receipt_date: str,
-            fingerprint: str, now: dt.datetime) -> dict:
+def approve(engine, shipment_po_id: str, *, reviewer: str, fingerprint: str,
+            now: dt.datetime) -> dict:
     """
     Record Paula's approval of one PO. Sets states and verdicts; writes NOTHING
     anywhere else. Every covered line gets a verdict (Requirements §1), including
     NO_CHANGE lines accepted as they are.
+
+    **Quantity only** (2026-11-02). A line with a quantity to approve gets the
+    QUANTITY scope and goes APPROVED; a NO_CHANGE line gets its verdict and keeps
+    NO_CHANGE. There is no receipt date: this tool writes none, and approving
+    one used to leave lines APPROVED with nothing a write could ever send. So a
+    line reaches APPROVED here only with `approved_quantity` set.
     """
-    date = parse_receipt_date(receipt_date)
-    counts = {"approved": 0, "accepted_unchanged": 0, "date_applied": 0, "date_skipped": []}
+    counts = {"approved": 0, "accepted_unchanged": 0}
     with engine.begin() as conn:
         view = _load_for_decision(conn, shipment_po_id, fingerprint)
         if not view.can_approve:
@@ -470,18 +454,6 @@ def approve(engine, shipment_po_id: str, *, reviewer: str, receipt_date: str,
                               quantity_approved_by=reviewer, quantity_approved_at=now,
                               quantity_write_status="APPROVED")
                 scopes.append("QUANTITY")
-            skipped = None
-            if date is not None:
-                if line.override_protected:
-                    skipped = (f"line already carries a human override (override="
-                               f"{row['current_override_flag']}, updated receipt date="
-                               f"{row['current_updated_receipt_date']}); date not applied")
-                    counts["date_skipped"].append(line.label)
-                else:
-                    values.update(confirmed_receipt_date=date, date_approved_by=reviewer,
-                                  date_approved_at=now, date_write_status="APPROVED")
-                    scopes.append("DATE")
-                    counts["date_applied"] += 1
             to_state = sc.STATE_APPROVED if scopes else row["state"]
             if to_state != row["state"]:
                 sc.assert_transition(conn, row["state"], to_state)
@@ -491,8 +463,7 @@ def approve(engine, shipment_po_id: str, *, reviewer: str, receipt_date: str,
             _audit(conn, now=now, reviewer=reviewer, event="REVIEW_APPROVED", line=line,
                    to_state=to_state, detail={
                        "scopes": scopes, "approved_quantity": values.get("approved_quantity"),
-                       "receipt_date": date.isoformat() if date and "DATE" in scopes else None,
-                       "date_skipped": skipped, "flagged": line.flagged,
+                       "flagged": line.flagged,
                        "attention_reason": row["attention_reason"],
                    })
             counts["approved" if scopes else "accepted_unchanged"] += 1

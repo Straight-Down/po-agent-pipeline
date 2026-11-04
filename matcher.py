@@ -757,7 +757,10 @@ def _accumulated_quantity(
 
     So the base is `history.written_quantity` -- what the tool's own audit trail
     says it last successfully wrote, from `proposed_changes` joined to a
-    successful `write_attempts` row. That record exists independently of NetSuite
+    settling `write_attempts` row (SUCCESS; ALREADY_PRESENT: the line found
+    holding exactly what an earlier, unconfirmed attempt of the same proposal
+    sent; or CONFIRMED: the line already held the approved figure, so nothing was
+    sent). That record exists independently of NetSuite
     and cannot be contaminated by what NetSuite currently holds.
 
     ## What NetSuite's value IS used for

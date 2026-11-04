@@ -92,6 +92,46 @@ def load_env_file(dotenv_path: Union[str, Path, None] = ".env") -> bool:
     return bool(load_dotenv(path, override=False))
 
 
+#: Where `write_path` appends a write whose RECORDING failed: one JSON object per
+#: line. A write that reached NetSuite with no `write_attempts` row is the worst
+#: outcome this system has (the accumulation base never learns of it), and the
+#: database is the thing that just failed -- so the record goes to a file instead.
+#: The review app's queue shows a banner while this file lists one. Clear it by
+#: archiving the file once each entry has been reconciled (RUNBOOK section 9).
+UNRECORDED_WRITES_ENV = "PO_AGENT_UNRECORDED_WRITES"
+
+
+def unrecorded_writes_path() -> Path:
+    """The file, from `PO_AGENT_UNRECORDED_WRITES`, else beside the keys, outside OneDrive."""
+    raw = (os.environ.get(UNRECORDED_WRITES_ENV) or "").strip()
+    return Path(raw) if raw else Path.home() / ".po-agent" / "unrecorded-writes.jsonl"
+
+
+def read_unrecorded_writes(path: Union[str, Path, None]) -> list:
+    """Every entry in the file, oldest first, each a dict. A missing file is no
+    entries. A line that is not a JSON object, or a file that cannot be read, is
+    kept as `{"unparsed": <text>}` rather than dropped or raised: the page that
+    warns about this file must not be the thing a damaged file takes down."""
+    import json
+
+    if not path or not Path(path).is_file():
+        return []
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return [{"unparsed": f"the file could not be read: {exc}"}]
+    entries = []
+    for text in lines:
+        if not text.strip():
+            continue
+        try:
+            value = json.loads(text)
+        except ValueError:
+            value = None
+        entries.append(value if isinstance(value, dict) else {"unparsed": text})
+    return entries
+
+
 def _require(name: str, *, reason: str = "") -> str:
     """One required variable, or an error that names it."""
     value = (os.environ.get(name) or "").strip()

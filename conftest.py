@@ -44,6 +44,45 @@ def pytest_addoption(parser):
     )
 
 
+def _isolate_unrecorded_writes_file() -> None:
+    """
+    Point the unrecorded-writes file (config.UNRECORDED_WRITES_ENV) at a temp file
+    for the whole session, unconditionally. Tests break recording on purpose, and
+    an entry in the REAL file puts a banner on the review app saying a write
+    reached NetSuite with no record -- a false alarm about production data. That
+    happened once, on 2026-11-02, before this existed.
+    """
+    import os
+    import tempfile
+
+    from config import UNRECORDED_WRITES_ENV
+
+    os.environ[UNRECORDED_WRITES_ENV] = str(
+        Path(tempfile.mkdtemp(prefix="po-agent-test-")) / "unrecorded-writes.jsonl")
+
+
+def _no_live_netsuite() -> None:
+    """
+    Make the write path's default client one it REFUSES, for the whole session.
+
+    The review app's Approve calls `write_po_batch` without a client (it may not
+    pass one), which builds a live client from `.env` -- the sandbox. A test that
+    approves must never write there. A stand-in with no config is refused by
+    `write_path._account_refusal` before any request; a test that wants writes
+    installs a fake NetSuite as `write_path._live` and puts this back after.
+    """
+    import write_path
+
+    write_path._live = NO_LIVE_NETSUITE
+
+
+#: The stand-in `write_path._live` for tests: no config, so every write is refused
+#: before anything is sent. Tests restore it after installing a fake.
+import types as _types  # noqa: E402
+
+NO_LIVE_NETSUITE = _types.SimpleNamespace(config=None)
+
+
 def pytest_configure(config):
     """
     `--mssql` asserts the dual-dialect run is real; it does not arrange one.
@@ -55,6 +94,8 @@ def pytest_configure(config):
     the run you did not want (RUNBOOK section 8 lesson 18). Passing `--mssql` turns
     "I meant to test the production dialect" into something that can fail.
     """
+    _isolate_unrecorded_writes_file()
+    _no_live_netsuite()
     if not config.getoption("--mssql"):
         # Deliberately do NOT read `.env` here. The connection string lives there,
         # so loading it unconditionally would put PO_AGENT_TEST_DB_URL in the

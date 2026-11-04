@@ -683,8 +683,13 @@ def _line_history(engine, po_keys: Sequence[str]) -> dict:
     Two queries because they answer two different questions:
 
     - **What did we WRITE?** A `proposed_changes` row with
-      `quantity_write_status = 'WRITTEN'` *and* a successful QUANTITY
-      `write_attempts` row. Both are required: the status column is the intent and
+      `quantity_write_status = 'WRITTEN'` *and* a QUANTITY `write_attempts` row
+      settling it: SUCCESS, or ALREADY_PRESENT (migration 0015 -- the line was
+      found holding exactly what an earlier, unconfirmed attempt of the same
+      proposal sent; settled, though the tool cannot prove it made the change),
+      or CONFIRMED (migration 0016 -- the line already held the approved figure,
+      so nothing was sent; the approved figure is still the line's settled value,
+      so the next slip accumulates onto it). Both are required: the status column is the intent and
       the attempt row is the evidence, and a row claiming one without the other is
       not something to do arithmetic on. This is also what excludes a proposal
       that was rejected, discarded, or approved but never written -- none of them
@@ -744,7 +749,7 @@ def _line_history(engine, po_keys: Sequence[str]) -> dict:
             .where(pc.c.quantity_write_status == "WRITTEN")
             .where(pc.c.approved_quantity.is_not(None))
             .where(wa.c.scope == "QUANTITY")
-            .where(wa.c.outcome == "SUCCESS")
+            .where(wa.c.outcome.in_(("SUCCESS", "ALREADY_PRESENT", "CONFIRMED")))
             .order_by(wa.c.attempted_at)
         ):
             key = (row.po_number_key, str(row.ns_line_id))

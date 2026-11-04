@@ -973,15 +973,29 @@ write_attempts = Table(
     Column("attempt_no", Integer, nullable=False),
     Column("ns_internal_id", Unicode(40), nullable=False),
     Column("ns_line_id", Unicode(40), nullable=False),
-    # Exactly what was sent: {"quantity": N}, or {} for a REFUSED attempt. No
+    # Exactly what was sent: {"quantity": N}, or {} when nothing was -- a REFUSED
+    # attempt, or a FAILED one the client proved never left the machine
+    # (`netsuite_client.request_was_sent` False; only a sent FAILED row can
+    # justify ALREADY_PRESENT). No
     # date is written (2026-11-02); scope 'DATE' is kept in the CHECK but no code
     # path produces it.
     Column("payload_json", UNBOUNDED_TEXT, nullable=False),
     Column("idempotency_key", Unicode(64), nullable=False),
     # -- migration 0014. SUCCESS: sent and accepted. FAILED: an error, which may
     # -- have come after the PATCH left (a timeout), so "nothing changed" is not
-    # -- implied. REFUSED: the re-read found the line closed, gone, or edited
-    # -- since the proposal, and NOTHING was sent -- payload_json is then '{}'.
+    # -- implied. REFUSED: NOT APPLIED -- either the re-read found the line
+    # -- closed, gone, or edited since the proposal and nothing was sent
+    # -- (payload_json '{}'), or NetSuite rejected the line inside a batch, which
+    # -- applies nothing (payload_json is what was sent for it, http_status 400).
+    # -- ALREADY_PRESENT (migration 0015): a retry's re-read found the line holding
+    # -- exactly what an EARLIER attempt of the same proposal sent, unconfirmed.
+    # -- "The line holds the intended value; the tool cannot prove it made the
+    # -- change." Nothing sent (payload_json '{}'). Settles the line like SUCCESS
+    # -- does, and is never recorded as SUCCESS.
+    # -- CONFIRMED (migration 0016): the re-read found the line, unchanged since
+    # -- the proposal, already holding the approved figure. Nothing sent
+    # -- (payload_json '{}'). Settles the line like SUCCESS does -- the approved
+    # -- figure is its value -- and is never recorded or shown as a write.
     Column("outcome", Unicode(16), nullable=False),
     # -- migration 0014: the quantity the write path re-read from NetSuite just
     # -- before deciding -- the "previous" in "previous -> new". Never the
@@ -997,7 +1011,9 @@ write_attempts = Table(
     Column("attempted_at", DateTime, nullable=False),
     UniqueConstraint("change_id", "scope", "attempt_no", name="uq_write_attempts_attempt"),
     CheckConstraint("scope IN ('QUANTITY','DATE')", name="scope"),
-    CheckConstraint("outcome IN ('SUCCESS','FAILED','REFUSED')", name="outcome"),
+    CheckConstraint(
+        "outcome IN ('SUCCESS','FAILED','REFUSED','ALREADY_PRESENT','CONFIRMED')",
+        name="outcome"),
     CheckConstraint(
         "error_kind IS NULL OR error_kind IN "
         "('PERMISSION','TRANSIENT','CONFLICT','LINE_CLOSED','VALIDATION','OTHER')",

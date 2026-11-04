@@ -376,6 +376,50 @@ def test_update_payload_shape() -> None:
     check(captured.get("method") == "PATCH", "a quantity write to the same line goes through")
 
 
+def test_batch_payload_shape() -> None:
+    section("update_po_lines: several lines, one PATCH, quantity only")
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 204
+        text = ""
+
+        def json(self):
+            return {}
+
+    client = NetSuiteClient(config=FAKE_CONFIG)
+
+    def fake_request(method, url, **kwargs):
+        captured.update(method=method, url=url, **kwargs)
+        return FakeResponse()
+
+    client._request = fake_request
+    result = client.update_po_lines("8489541", {18: {"quantity": 50}, "19": {"quantity": 9}},
+                                    idempotency_key="k-1")
+    check(captured["method"] == "PATCH" and captured["url"].endswith("/purchaseOrder/8489541"),
+          "one PATCH to the PO record")
+    check(captured["json"] == {"item": {"items": [{"line": 18, "quantity": 50},
+                                                  {"line": 19, "quantity": 9}]}},
+          "every line in one item.items[], line numbers as integers",
+          json.dumps(captured["json"]))
+    check("replace" not in (captured.get("params") or {}), "no `replace` parameter")
+    check(captured["headers"]["X-NetSuite-Idempotency-Key"] == "k-1",
+          "the caller's idempotency key is sent")
+    check(result["sent"] == {"18": {"quantity": 50}, "19": {"quantity": 9}},
+          "the result says exactly what was sent per line")
+    captured.clear()
+    expect_raises(NetSuiteError,
+                  lambda: client.update_po_lines("8489541", {18: {"quantity": 50},
+                                                             19: {"expectedReceiptDate": "x"}}),
+                  "a date field on ANY line refuses the whole batch")
+    expect_raises(NetSuiteError, lambda: client.update_po_lines("8489541", {}),
+                  "an empty batch is refused")
+    check(not captured, "and nothing was sent for either")
+    expect_raises(NetSuiteConfigError,
+                  lambda: NetSuiteClient(mock_data={}).update_po_lines("1", {1: {"quantity": 1}}),
+                  "mock mode refuses the batch write too")
+
+
 def test_error_translation() -> None:
     section("error translation (permission finding vs. bad request)")
 
@@ -450,6 +494,158 @@ def test_error_translation() -> None:
     token_error = Resp(400, {"error": "invalid_client", "error_description": "invalid_client"})
     msg = nc._explain_token_failure(token_error, FAKE_CONFIG)
     check("NS_CERTIFICATE_ID" in msg, "invalid_client explanation points at the certificate id")
+
+
+def test_request_was_sent_is_precise() -> None:
+    section("request_was_sent: False only when the PATCH provably never left the machine")
+    import requests.exceptions as rex
+    from urllib3.exceptions import MaxRetryError, NewConnectionError
+
+    class Resp:
+        def __init__(self, status, payload=None):
+            self.status_code, self._payload = status, payload or {}
+            self.text = json.dumps(self._payload)
+
+        def json(self):
+            return self._payload
+
+    class Session:
+        def __init__(self, outcomes):
+            self.outcomes = list(outcomes)
+
+        def request(self, method, url, **kwargs):
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    def client_with(outcomes):
+        client = NetSuiteClient(config=FAKE_CONFIG)
+        client._access_token, client._token_expires_at = "fake-token", time.time() + 3600
+        client._session = Session(outcomes)
+        client.TRANSIENT_BACKOFF_SECONDS = 0
+        return client
+
+    def refused_connection():
+        return rex.ConnectionError(MaxRetryError(None, "https://example/x",
+                                                 reason=NewConnectionError(None, "refused")))
+
+    def sent_flag(fn):
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 -- the flag is what is checked
+            return nc.request_was_sent(exc)
+        return "nothing raised"
+
+    patch = {18: {"quantity": 50}}
+    cases = [
+        ("mock mode", False,
+         lambda: NetSuiteClient(mock_data={}).update_po_lines("1", patch)),
+        ("a date field normalize_line_fields refuses", False,
+         lambda: client_with([]).update_po_lines("1", {18: {"expectedReceiptDate": "x"}})),
+        ("an empty batch", False, lambda: client_with([]).update_po_lines("1", {})),
+        ("a connect timeout on every try", False,
+         lambda: client_with([rex.ConnectTimeout("t")] * 3).update_po_lines("1", patch)),
+        ("a refused connection (DNS / refused) on every try", False,
+         lambda: client_with([refused_connection()] * 3).update_po_lines("1", patch)),
+        ("the per-line write, connect timeout on every try", False,
+         lambda: client_with([rex.ConnectTimeout("t")] * 3).update_po_line(
+             "1", 18, {"quantity": 50}, by_internal_id=True)),
+        ("a read timeout on every try (the request went out)", True,
+         lambda: client_with([rex.ReadTimeout("t")] * 3).update_po_lines("1", patch)),
+        ("a connect timeout, then a read timeout, then a connect timeout", True,
+         lambda: client_with([rex.ConnectTimeout("t"), rex.ReadTimeout("t"),
+                              rex.ConnectTimeout("t")]).update_po_lines("1", patch)),
+        ("a 503 on every try (NetSuite answered)", True,
+         lambda: client_with([Resp(503, {"title": "x"})] * 3).update_po_lines("1", patch)),
+        ("a 400 (NetSuite answered)", True,
+         lambda: client_with([Resp(400, {"title": "Bad"})]).update_po_lines("1", patch)),
+        ("a reset after connecting", True,
+         lambda: client_with([rex.ConnectionError("Connection aborted")] * 3)
+         .update_po_lines("1", patch)),
+    ]
+    def no_token(force=False):
+        raise nc.NetSuiteAuthError("token endpoint unreachable")
+
+    def with_auth(client, authenticate):
+        client.authenticate = authenticate
+        return client
+
+    def resolving_get_went_out(po_number):
+        exc = nc.NetSuiteTransientError("GET failed")
+        nc._mark_sent(exc, True)  # the resolving GET itself did go out
+        raise exc
+
+    def resolve_fails():
+        client = client_with([])
+        client.resolve_po_internal_id = resolving_get_went_out
+        return client.update_po_line("1662", 18, {"quantity": 50}, by_internal_id=False)
+
+    cases += [
+        ("no access token on the first try", False,
+         lambda: with_auth(client_with([]), no_token).update_po_lines("1", patch)),
+        ("a 401, then the re-minted request fails to connect every try", True,
+         lambda: with_auth(client_with([Resp(401)] + [rex.ConnectTimeout("t")] * 3),
+                           lambda force=False: "tok").update_po_lines("1", patch)),
+        ("a TLS failure (not ruled out)", True,
+         lambda: client_with([rex.SSLError("handshake")]).update_po_lines("1", patch)),
+        ("resolving the PO number failed, even though that GET went out", False,
+         resolve_fails),
+    ]
+    for label, expected, fn in cases:
+        got = sent_flag(fn)
+        check(got is expected, f"{'sent' if expected else 'not sent'}: {label}", repr(got))
+    got = sent_flag(lambda: client_with([KeyboardInterrupt()]).update_po_lines("1", patch))
+    check(got is None, "an interrupt mid-send is left unknown (None), never False", repr(got))
+
+    # request_may_have_applied: narrower -- a try answered 4xx applied nothing, but
+    # an EARLIER try that timed out after sending may have landed.
+    def applied_flag(fn):
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001
+            return nc.request_may_have_applied(exc)
+        return "nothing raised"
+
+    def expires_after_first_try(client):
+        calls = {"n": 0}
+
+        def authenticate(force=False):
+            calls["n"] += 1
+            if force or calls["n"] > 1:
+                raise nc.NetSuiteAuthError("token expired and could not be refreshed")
+            return "tok"
+        client.authenticate = authenticate
+        return client
+
+    applied_cases = [
+        ("a 400 on the only try", False,
+         lambda: client_with([Resp(400, {"title": "Bad"})]).update_po_lines("1", patch)),
+        ("a 401, then the refresh fails", False,
+         lambda: expires_after_first_try(client_with([Resp(401)])).update_po_lines("1", patch)),
+        ("a connect timeout on every try", False,
+         lambda: client_with([rex.ConnectTimeout("t")] * 3).update_po_lines("1", patch)),
+        ("a read timeout, then the token cannot be refreshed", True,
+         lambda: expires_after_first_try(client_with([rex.ReadTimeout("t")]))
+         .update_po_lines("1", patch)),
+        ("a read timeout, then a 400", True,
+         lambda: client_with([rex.ReadTimeout("t"), Resp(400, {"title": "Bad"})])
+         .update_po_lines("1", patch)),
+        ("a 503 on every try", True,
+         lambda: client_with([Resp(503, {"title": "x"})] * 3).update_po_lines("1", patch)),
+        ("a 401, then the re-minted request times out after sending", True,
+         lambda: with_auth(client_with([Resp(401)] + [rex.ReadTimeout("t")] * 3),
+                           lambda force=False: "tok").update_po_lines("1", patch)),
+        ("a 503, then a 401, then the refresh fails", True,
+         lambda: expires_after_first_try(client_with([Resp(503, {"title": "x"}), Resp(401)]))
+         .update_po_lines("1", patch)),
+    ]
+    for label, expected, fn in applied_cases:
+        got = applied_flag(fn)
+        check(got is expected,
+              f"{'may have applied' if expected else 'applied nothing'}: {label}", repr(got))
+    check(nc.request_was_sent(ValueError("not from the client")) is None,
+          "an exception that did not come through the client is unknown (None)")
 
 
 def test_transient_retry() -> None:
@@ -883,7 +1079,9 @@ def main() -> int:
         test_line_mapping,
         test_field_normalization,
         test_update_payload_shape,
+        test_batch_payload_shape,
         test_error_translation,
+        test_request_was_sent_is_precise,
         test_transient_retry,
         test_sublist_truncation_guard,
         test_tranid_transformation,

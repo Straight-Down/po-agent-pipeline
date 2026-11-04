@@ -45,6 +45,7 @@ the old stub did, so demo_matcher.py keeps running without live credentials.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import logging
 import os
@@ -674,6 +675,12 @@ class NetSuiteClient:
         if self._session is None:
             import requests
 
+            # A PLAIN session, deliberately: no `HTTPAdapter(max_retries=...)`.
+            # `_failed_before_connecting` reads the exception of the ONE try it
+            # made; a retrying adapter could hide an earlier try that went out
+            # behind a final connect error, and `request_was_sent` would then say
+            # False for a request that may have reached NetSuite. Retries live in
+            # `_request_tries`, where every try is classified.
             self._session = requests.Session()
         return self._session
 
@@ -770,7 +777,26 @@ class NetSuiteClient:
 
         After the attempt budget is spent, raises `NetSuiteTransientError` so the
         audit log can distinguish an outage from a bad request.
+
+        Every exception it raises says whether the request may have reached
+        NetSuite on any try (`request_was_sent`).
         """
+        state = {"sent": False, "may_have_applied": False}
+        try:
+            return self._request_tries(method, url, state, retry_auth=retry_auth, **kwargs)
+        except Exception as exc:  # noqa: BLE001 -- tagged and re-raised, never swallowed
+            # `Exception`, not `BaseException`: an interrupt raised mid-send is not
+            # classified by `_request_tries`, so it stays untagged -- None, "unknown",
+            # treated as sent -- rather than wrongly False.
+            _mark_sent(exc, state["sent"])
+            _mark_may_have_applied(exc, state["may_have_applied"])
+            raise
+
+    def _request_tries(self, method: str, url: str, state: dict, *, retry_auth: bool,
+                       **kwargs):
+        """`_request`'s body. Sets `state["sent"]` once any try may have gone out, and
+        `state["may_have_applied"]` once any try may have changed NetSuite: sent and
+        NOT answered with a 4xx (a 4xx applies nothing)."""
         config = self._require_live(f"{method} {url}")
         # Keep the caller's own headers so they survive a retry -- losing them
         # would silently drop `Prefer: transient` on SuiteQL or the idempotency
@@ -792,11 +818,18 @@ class NetSuiteClient:
                     method, url, headers=headers, timeout=config.timeout, **kwargs
                 )
             except Exception as exc:  # network-level: timeout, connection reset, DNS
+                if not _failed_before_connecting(exc):
+                    # Out on an established connection with no answer: it may have
+                    # been received AND applied (a read timeout, a reset).
+                    state["sent"] = state["may_have_applied"] = True
                 if not _is_transient_exception(exc):
                     raise
                 last_error = f"{type(exc).__name__}: {exc}"
                 last_status = None
             else:
+                state["sent"] = True  # NetSuite answered, whatever the status
+                if not 400 <= response.status_code < 500:
+                    state["may_have_applied"] = True  # a 2xx did; a 5xx may have
                 if response.status_code == 401 and retry_auth:
                     logger.info("Got 401; re-minting token and retrying once")
                     self.authenticate(force=True)
@@ -1120,16 +1153,19 @@ class NetSuiteClient:
         successful PATCH with 204 No Content). Always read the line back to
         confirm; see the silent-discard caveat in the module docstring.
         """
-        if self.is_mock:
-            raise NetSuiteConfigError(
-                "update_po_line() is a live-only operation; this client is in mock mode. "
-                "Mock mode exists for matcher/diff testing (demo_matcher.py), which must never write."
-            )
+        with _before_the_patch():
+            if self.is_mock:
+                raise NetSuiteConfigError(
+                    "update_po_line() is a live-only operation; this client is in mock mode. "
+                    "Mock mode exists for matcher/diff testing (demo_matcher.py), which must "
+                    "never write."
+                )
 
-        config = self._require_live("update_po_line()")
-        body_fields = normalize_line_fields(fields)
-        internal_id = str(po_number) if by_internal_id else self.resolve_po_internal_id(str(po_number))
-        line_number = int(line_id)
+            config = self._require_live("update_po_line()")
+            body_fields = normalize_line_fields(fields)
+            internal_id = (str(po_number) if by_internal_id
+                           else self.resolve_po_internal_id(str(po_number)))
+            line_number = int(line_id)
 
         payload = {"item": {"items": [{"line": line_number, **body_fields}]}}
         logger.info("PATCH purchaseOrder/%s line %s: %s", internal_id, line_number, body_fields)
@@ -1149,6 +1185,49 @@ class NetSuiteClient:
             "line": line_number,
             "sent": body_fields,
         }
+
+    def update_po_lines(
+        self,
+        po_internal_id: str,
+        lines: dict,
+        idempotency_key: Optional[str] = None,
+    ) -> dict:
+        """
+        PATCH several item-sublist lines of ONE PO in a single request.
+
+        `lines` maps line number -> field dict; every field dict goes through
+        `normalize_line_fields`, so the batch is quantity only exactly as a single
+        line is. Same shape as `update_po_line`, with more entries in
+        `item.items[]`, and no `replace` parameter.
+
+        Measured in sandbox (2026-11-02, RUNBOOK section 11 decision 2): about
+        the same time as a one-line PATCH, and **all or nothing** -- a 400 on any
+        entry applies none of them and names the entry in `o:errorPath`.
+
+        An entry whose line number is not on the PO is treated by NetSuite as a
+        NEW line. The caller must send only lines it has just read
+        (`write_path.write_po_batch` checks); this method cannot know.
+        """
+        with _before_the_patch():
+            if self.is_mock:
+                raise NetSuiteConfigError(
+                    "update_po_lines() is a live-only operation; this client is in mock mode."
+                )
+            config = self._require_live("update_po_lines()")
+            if not lines:
+                raise NetSuiteError("No lines supplied -- refusing to send an empty batch.")
+            sent = {str(int(ln)): normalize_line_fields(fields) for ln, fields in lines.items()}
+        payload = {"item": {"items": [{"line": int(ln), **fields} for ln, fields in sent.items()]}}
+        logger.info("PATCH purchaseOrder/%s, %d lines: %s", po_internal_id, len(sent), sent)
+
+        response = self._request(
+            "PATCH",
+            f"{config.record_base}/purchaseOrder/{po_internal_id}",
+            json=payload,
+            headers={"X-NetSuite-Idempotency-Key": idempotency_key or str(uuid.uuid4())},
+        )
+        return {"ok": True, "status_code": response.status_code,
+                "po_internal_id": str(po_internal_id), "sent": sent}
 
     def get_item_colour_name(
         self, item_internal_id: Union[int, str], cache: Optional[dict] = None
@@ -1296,6 +1375,108 @@ def _is_transient_exception(exc: BaseException) -> bool:
     except ImportError:  # pragma: no cover
         pass
     return isinstance(exc, (TimeoutError, ConnectionError))
+
+
+#: The attribute every exception out of `_request`, `update_po_line` and
+#: `update_po_lines` carries. Read it through `request_was_sent`.
+_REQUEST_SENT = "request_sent"
+
+
+def request_was_sent(exc: BaseException) -> Optional[bool]:
+    """
+    Whether a failed request may have reached NetSuite, as this client recorded it
+    on the exception it raised. The write path records a failed write as "sent"
+    from this, and only a sent attempt can later justify ALREADY_PRESENT (Kiko,
+    2026-11-04: a local error cannot be evidence that our write landed).
+
+    - **False -- provably not sent.** On EVERY try, the failure came before a
+      connection to NetSuite was established for it: a local error (mock mode, no
+      configuration, the access token could not be obtained, a payload
+      `normalize_line_fields` refused, an empty batch, resolving the PO number for
+      a write), or a connect-phase network failure (a connect timeout, a DNS
+      failure, a refused connection -- urllib3's `NewConnectionError`).
+    - **True -- may have been sent.** On at least one try the request went out on
+      an established connection: NetSuite answered (any status, a 4xx included),
+      the read timed out, or the connection dropped after it was made. Anything
+      not ruled out counts here, a TLS failure included.
+    - **None -- unknown.** The exception did not come through this client. A
+      caller treats that as True: overstating "may have been sent" is the safe
+      direction for every reader of it.
+    """
+    return getattr(exc, _REQUEST_SENT, None)
+
+
+def _mark_sent(exc: BaseException, sent: bool, *, overwrite: bool = False) -> None:
+    """Record `sent` on `exc`. Without `overwrite`, True is sticky: a nested
+    request (the 401 re-mint) that went out is not undone by a later failure."""
+    try:
+        if overwrite:
+            setattr(exc, _REQUEST_SENT, sent)
+        else:
+            setattr(exc, _REQUEST_SENT, bool(getattr(exc, _REQUEST_SENT, False)) or sent)
+    except Exception:  # noqa: BLE001 -- an exception type that refuses attributes
+        pass  # reads back as None: "unknown", treated as sent
+
+
+_MAY_HAVE_APPLIED = "request_may_have_applied"
+
+
+def request_may_have_applied(exc: BaseException) -> Optional[bool]:
+    """
+    Whether ANY try of a failed request may have changed NetSuite, as this client
+    recorded it. Narrower than `request_was_sent`: a try NetSuite answered with a
+    4xx applied nothing, so a request whose every sent try was answered 4xx -- or
+    whose token could not be refreshed after a 401 -- is False.
+
+    It exists because the LAST answer is not the whole story. A first try can time
+    out after it was sent and land; the retry can then hit an expired token, a 401
+    or a 400. That final error says "nothing applied" about ITS try only. The write
+    path believes a nothing-applied error only when this is not True (Kiko,
+    2026-11-04).
+
+    None: the exception did not come through `_request` -- unknown. A caller
+    treats that as True, as with `request_was_sent`.
+    """
+    return getattr(exc, _MAY_HAVE_APPLIED, None)
+
+
+def _mark_may_have_applied(exc: BaseException, applied: bool) -> None:
+    """Sticky True, like `_mark_sent`: an outer request's earlier try is not undone
+    by a nested request (the 401 re-mint) that applied nothing."""
+    try:
+        setattr(exc, _MAY_HAVE_APPLIED,
+                bool(getattr(exc, _MAY_HAVE_APPLIED, False)) or applied)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _failed_before_connecting(exc: BaseException) -> bool:
+    """A transport error that provably came before a connection was established:
+    a connect timeout, or a connection that could not be made (DNS, refused).
+    Anything else -- a read timeout, a reset, a TLS failure -- is not ruled out."""
+    try:
+        import requests.exceptions as rex
+        from urllib3.exceptions import NewConnectionError
+    except ImportError:  # pragma: no cover
+        return False
+    if isinstance(exc, rex.ConnectTimeout):
+        return True
+    if isinstance(exc, rex.ConnectionError) and not isinstance(exc, rex.SSLError):
+        inner = exc.args[0] if exc.args else None
+        return isinstance(getattr(inner, "reason", inner), NewConnectionError)
+    return False
+
+
+@contextlib.contextmanager
+def _before_the_patch():
+    """Wraps everything a write method does before its PATCH: whatever is raised
+    in here, the PATCH was not sent -- even if a GET made on the way (resolving
+    the PO number) did go out and marked its exception sent."""
+    try:
+        yield
+    except BaseException as exc:
+        _mark_sent(exc, False, overwrite=True)
+        raise
 
 
 def _raise_for_response(response, method: str, url: str) -> None:

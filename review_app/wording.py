@@ -120,12 +120,28 @@ BLOCK_MESSAGES = {
     "no_quantity": (
         "The packing slip gives no quantity for these lines, so there is nothing to "
         "approve. Reject this PO here if nothing further is expected."),
+    "choice": (
+        "These items could go to more than one line on this PO in NetSuite, and choosing "
+        "between them isn't built yet. Change them in NetSuite yourself if they need it."),
+}
+
+#: The same reasons in a few words, for one line in a list (the result page, the
+#: lines Approve leaves out).
+EXCLUSION_SHORT = {
+    "pre_existing": "already received in NetSuite, and the figures disagree",
+    "disputed": "changed in NetSuite since the tool last saw it",
+    "not_updatable": "no open line in NetSuite to update",
+    "manual": "sizes couldn't be read; enter it in NetSuite by hand",
+    "no_quantity": "no quantity on the packing slip",
+    "choice": "could go to more than one NetSuite line; choosing isn't built yet",
 }
 
 
 def block_kind(line) -> str:
-    """Which BLOCK_MESSAGES entry a blocking line belongs to."""
+    """Which BLOCK_MESSAGES entry a line Approve leaves out belongs to."""
     row = line.row
+    if row["state"] in ("NEEDS_RESOLUTION", "NEEDS_ASSIGNMENT"):
+        return "choice"
     if row["state"] == "MANUAL_ENTRY_REQUIRED":
         return "manual"
     if row["ns_line_id"] is None or not row["ns_line_is_open"]:

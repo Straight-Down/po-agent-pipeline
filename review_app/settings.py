@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 REVIEWER_ENV = "PO_AGENT_REVIEWER"
 
@@ -23,6 +24,10 @@ class Settings:
     #: the only attribution the audit trail gets, and a default would put a real
     #: person's name on clicks they did not make.
     reviewer: str
+    #: The unrecorded-writes file (`config.unrecorded_writes_path`). While it lists
+    #: a write that reached NetSuite with no record, the queue page says so. None
+    #: shows nothing -- tests pass a file explicitly.
+    unrecorded_writes: Optional[Path] = None
 
 
 def reviewer_from_env() -> str:

@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 def main(argv=None) -> int:
+    from config import unrecorded_writes_path
     from review_app.settings import Settings, SettingsError, reviewer_from_env
 
     ap = argparse.ArgumentParser(description=__doc__)
@@ -23,7 +24,8 @@ def main(argv=None) -> int:
         if not args.db:
             raise SettingsError("no database: pass --db or set PO_AGENT_DB_URL")
         settings = Settings(db_url=args.db, blob_root=Path(args.blob_root),
-                            reviewer=reviewer_from_env())
+                            reviewer=reviewer_from_env(),
+                            unrecorded_writes=unrecorded_writes_path())
     except SettingsError as exc:
         print(f"REFUSED TO START: {exc}", file=sys.stderr)
         return 2

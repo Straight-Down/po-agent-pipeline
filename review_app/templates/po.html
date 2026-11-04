@@ -7,7 +7,7 @@
     {%- if ln.human_verdict == "REJECTED" -%}<span class="pill p-stop">Rejected</span> <span class="muted by">by {{ ln.verdict_by }}</span>
     {%- elif ln.human_verdict -%}<span class="pill p-same">Approved</span> <span class="muted by">by {{ ln.verdict_by }}</span>
     {%- else -%}<span class="pill p-quiet">Already handled</span>{%- endif -%}
-  {%- elif ln.disposition == "block" -%}<span class="pill p-stop">Can't be approved yet</span>
+  {%- elif ln.disposition in ("block", "refused") -%}<span class="pill p-stop">Can't be changed here</span>
   {%- elif ln.disposition == "accept_no_change" -%}<span class="pill p-same">No change needed</span>
   {%- elif ln.flagged -%}<span class="pill p-flag">Check, then approve with the PO</span>
   {%- else -%}<span class="pill p-change">Ready to approve</span>
@@ -76,6 +76,14 @@
 <p class="muted lede">{{ view.shipment.vendor_name or "Vendor not stated" }}
   {% if view.message %} · “{{ view.message.subject }}” · received {{ view.message.received_at }}{% endif %}</p>
 
+{% if view.unwritten %}{% set u = view.unwritten|length %}
+<div class="card info"><p class="plain">{{ u }} approved line{{ "s" if u != 1 }} {{ "haven't" if u != 1 else "hasn't" }} been written to NetSuite yet.
+  <a href="/po/{{ view.id }}/result">See what happened and what you can do</a>.</p></div>
+{% elif has_results %}
+<div class="card ref"><p class="plain">This PO has been sent to NetSuite.
+  <a href="/po/{{ view.id }}/result">See what changed, line by line</a>.</p></div>
+{% endif %}
+
 {% if view.rows_lost_message %}
 <div class="card info">
   <p class="plain">{{ view.rows_lost_message }}</p>
@@ -124,7 +132,7 @@
       and shown|rejectattr("accumulation_basis", "equalto", first_line.accumulation_basis)|list|length == 0 -%}
 {% if same_block %}
 <div class="card block-all">
-  <p class="plain"><span class="pill p-stop">Can't be approved yet</span>
+  <p class="plain"><span class="pill p-stop">Can't be changed here</span>
     All {{ shown|length }} lines on this PO{% if first_line.plain_reasons %}, each for the same reason:{% else %}, for the same reason. It's explained with your decision at the bottom of the page.{% endif %}</p>
   {% for r in first_line.plain_reasons %}<p class="plain">{{ r }}</p>{% endfor %}
 </div>
@@ -150,17 +158,37 @@
 {% if view.awaiting %}
 <h2>Your decision</h2>
 <div class="actions">
-  <form class="card" method="post" action="/po/{{ view.id }}/approve">
+  <form class="card" method="post" action="/po/{{ view.id }}/approve" data-writes>
     <input type="hidden" name="csrf_token" value="{{ csrf }}">
     <input type="hidden" name="fingerprint" value="{{ view.fingerprint }}">
     {% if view.can_approve %}
+      {% if view.changing %}
+      <p class="plain"><strong>Approving updates NetSuite straight away.</strong>
+      Every line that can be changed is set to its proposed total:
+      the quantity the factory says it shipped, not a count of what has arrived.</p>
+      {% elif view.writable %}
+      <p class="plain">NetSuite already holds every figure on this PO, so nothing changes
+      and nothing is sent. Approving confirms the lines as they are.</p>
+      {% else %}
+      <p class="plain">Nothing on this PO needs changing in NetSuite. Approving records that the lines are right as they are.</p>
+      {% endif %}
+      {% if view.excluded %}{% set x = view.excluded|length %}
+      <p class="plain">{{ x }} line{{ "s" if x != 1 }} can't be changed here, so {{ "they're" if x != 1 else "it's" }} left out and stay{{ "s" if x == 1 }} as {{ "they are" if x != 1 else "it is" }} in NetSuite:</p>
+      <ul class="plain">{% for ln in view.excluded %}<li>{{ ln.label }}{% if ln.ns_line_id %} (line {{ ln.ns_line_id }}){% endif %}: {{ ln.exclusion_short }}</li>{% endfor %}</ul>
+      <p class="muted">{{ "They stay" if x != 1 else "It stays" }} on this PO after you approve. Then reject {{ "them" if x != 1 else "it" }} here to clear the PO from your list, or change {{ "them" if x != 1 else "it" }} in NetSuite yourself. Don't reject before approving: that would reject the whole PO.</p>
+      {% endif %}
       <button type="submit">{{ view.approve_label }}</button>
-      <p class="muted">This records your approval. Nothing changes in NetSuite yet.</p>
+      <p class="muted">There's no undo button. To reverse a change later, edit the quantity back
+      in NetSuite. The page that opens next shows each line's previous quantity.</p>
+      <p class="working" role="status" aria-live="polite" hidden></p>
+      <noscript><p class="muted">Updating NetSuite usually takes about ten seconds, and can take
+      several minutes when NetSuite is slow. Wait for the page to change.</p></noscript>
     {% else %}
+      <p class="plain">There's nothing on this PO that can be approved.</p>
       {% for message, count in view.block_explanations %}<p class="plain">{{ message }}</p>{% endfor %}
       <button type="submit" disabled>Approve</button>
       <details class="more"><summary>Details</summary><ul class="muted">
-        {% for ln in view.blocking %}<li>{{ ln.label }}: {{ ln.block_reason }}</li>{% endfor %}</ul></details>
+        {% for ln in view.excluded %}<li>{{ ln.label }}: {{ ln.block_reason or ln.state }}</li>{% endfor %}</ul></details>
     {% endif %}
   </form>
   <form class="card" method="post" action="/po/{{ view.id }}/reject">
@@ -175,6 +203,6 @@
 {% elif view.no_action_lines and not view.shown_lines %}
 <div class="card">Every line on this packing slip was already received in NetSuite, and the figures agree. Nothing to do.</div>
 {% else %}
-<div class="card">This PO has been decided. Nothing to do.</div>
+<div class="card">This PO has been decided. Nothing to do.{% if has_results %} <a href="/po/{{ view.id }}/result">See what changed in NetSuite</a>.{% endif %}</div>
 {% endif %}
 {% endblock %}

@@ -149,6 +149,12 @@
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) button:not(.secondary):not([disabled]) { color:#0e1a14; }
   }
+  .working { margin:10px 0 0; padding:10px 12px; border-left:4px solid var(--accent);
+             background:var(--surface); font-size:15px; }
+  ul.results { list-style:none; margin:0; padding:0; }
+  ul.results li { padding:8px 0; border-top:1px solid var(--rule); }
+  ul.results li:first-child { border-top:0; }
+  ul.results .arrow { font-variant-numeric:tabular-nums; }
   @media (max-width: 800px) { .actions { grid-template-columns:1fr; } }
   @media (max-width: 560px) {
     h1 { font-size:20px; }
@@ -163,8 +169,44 @@
   <span class="who">Reviewing as {{ reviewer }}</span>
 </header>
 <main>
+{% if unrecorded %}{% set n = unrecorded|length %}{% set unsure = unrecorded|selectattr("reached_netsuite", "equalto", "unknown")|list %}
+<div class="card warn" role="alert">
+  <p class="plain"><strong>{{ n }} change{{ "s" if n != 1 }} {{ "reached, or may have reached," if unsure or unrecorded|selectattr("unparsed", "defined")|list else "reached" }} NetSuite, but the tool couldn't record {{ "them" if n != 1 else "it" }}:</strong>
+  {% for e in unrecorded %}{% if e.unparsed is defined %}an entry the tool couldn't read{% elif e.reached_netsuite == "unknown" %}{{ e.po }} line {{ e.line }} (may now be {{ e.new_quantity }}){% else %}{{ e.po }} line {{ e.line }} (now {{ e.new_quantity }}){% endif %}{{ "; " if not loop.last else "." }}{% endfor %}</p>
+  <p class="plain">Don't approve {{ "those POs" if n != 1 else "that PO" }} again until Kiko has checked {{ "them" if n != 1 else "it" }} in NetSuite.</p>
+  <details class="more"><summary>Details</summary>
+    <ul class="muted">{% for e in unrecorded %}<li>{% if e.unparsed is defined %}unreadable: {{ e.unparsed }}{% else %}{{ e.at }} · change {{ e.change_id }} · sent {{ e.sent }} · {{ e.error }}{% endif %}</li>{% endfor %}</ul>
+    <p class="muted">Listed in {{ unrecorded_file }}. Archive that file once each entry is reconciled.</p>
+  </details>
+</div>
+{% endif %}
 {% block content %}{% endblock %}
 </main>
 </div>
+<script>
+/* A form marked data-writes updates NetSuite while the page waits: about ten
+   seconds, and several minutes if NetSuite times out (it retries before giving
+   up). So the page says what is happening instead of looking frozen, and the
+   button cannot be pressed twice. */
+(function () {
+  var stages = [
+    [0, "Updating NetSuite. This usually takes about ten seconds. Please keep this page open."],
+    [20000, "Still waiting for NetSuite, which is slower than usual right now. This can take a minute or two. Please keep this page open."],
+    [75000, "NetSuite is taking much longer than usual. The tool keeps trying for a few more minutes, then shows you which lines were changed and which weren't. Closing this page won't undo anything already written."]
+  ];
+  document.querySelectorAll("form[data-writes]").forEach(function (form) {
+    form.addEventListener("submit", function () {
+      var button = form.querySelector("button[type=submit]");
+      var status = form.querySelector(".working");
+      if (button) { button.disabled = true; button.textContent = "Updating NetSuite…"; }
+      if (!status) { return; }
+      status.hidden = false;
+      stages.forEach(function (stage) {
+        setTimeout(function () { status.textContent = stage[1]; }, stage[0]);
+      });
+    });
+  });
+})();
+</script>
 </body>
 </html>

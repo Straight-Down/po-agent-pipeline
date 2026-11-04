@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from types import SimpleNamespace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -25,13 +26,23 @@ from sqlalchemy import select
 
 import dialect_target as dt_target
 import schema as sc
-from schema import audit_log, message_attachments, proposed_changes, shipment_pos
+from schema import (audit_log, message_attachments, proposed_changes, shipment_pos,
+                    write_attempts)
 
 HERE = Path(__file__).resolve().parent
 #: UTC, stored naive -- the database's convention (`ingest._utcnow`).
 NOW = dt.datetime(2026, 9, 30, 12, 0, 0, tzinfo=dt.timezone.utc).replace(tzinfo=None)
 REVIEWER = "Paula Test"
 _results: list[tuple[bool, str, str]] = []
+
+#: Approve now writes to NetSuite, through a client the app cannot pass in. So the
+#: write path's default client is one it refuses (no config), here as well as in
+#: conftest -- `python test_review_app.py` loads no conftest. A test that wants a
+#: write installs a fake with `World.netsuite`; `_World` puts this back after.
+NO_LIVE_NETSUITE = SimpleNamespace(config=None)
+import write_path as _write_path  # noqa: E402
+
+_write_path._live = NO_LIVE_NETSUITE
 
 
 def check(ok: bool, name: str, detail: str = "") -> bool:
@@ -125,13 +136,32 @@ class World:
                                 ).mappings().all()
         return {r["src_size_text"]: dict(r) for r in rows}
 
-    def client(self) -> TestClient:
+    def client(self, unrecorded_writes=None) -> TestClient:
         from review_app.app import create_app
         from review_app.settings import Settings
 
-        settings = Settings(db_url="unused", blob_root=self.tmp, reviewer=REVIEWER)
+        settings = Settings(db_url="unused", blob_root=self.tmp, reviewer=REVIEWER,
+                            unrecorded_writes=unrecorded_writes)
         self.app = create_app(settings, engine=self.engine, now=lambda: NOW)
         return TestClient(self.app)
+
+    def netsuite(self, key: str, internal_id: str = "8489541", line_overrides=None):
+        """A fake NetSuite holding this PO's matched lines as the database last saw
+        them, installed as the write path's client. Approve writes to it."""
+        import write_path
+        from test_write_path import FakeNetSuite, client_for, ns_line as fake_line
+
+        with self.engine.begin() as conn:
+            conn.execute(shipment_pos.update().where(shipment_pos.c.id == self.po_id(key))
+                         .values(ns_internal_id=internal_id))
+        # float: NetSuite sends JSON numbers, and the fake JSON-encodes its replies.
+        lines = [fake_line(int(r["ns_line_id"]), float(r["current_quantity"]),
+                           **{"isOpen": bool(r["ns_line_is_open"]),
+                              **(line_overrides or {}).get(int(r["ns_line_id"]), {})})
+                 for r in self.lines(key).values() if r["ns_line_id"]]
+        self.fake = FakeNetSuite(lines)
+        write_path._live = client_for(self.fake)
+        return self.fake
 
     def form(self, client: TestClient, key: str) -> dict:
         """The hidden fields a real page load would give the browser."""
@@ -152,6 +182,9 @@ class _World:
         return self.w
 
     def __exit__(self, *exc) -> None:
+        import write_path
+
+        write_path._live = NO_LIVE_NETSUITE  # whatever a test installed, never live
         self.w.engine.dispose()
         self.td.cleanup()
 
@@ -203,8 +236,9 @@ def test_the_po_page() -> None:
         html = w.client().get(f"/po/{w.po_id('1662')}").text
         check(html.index("1 line to check before approving") < html.index("Other lines"),
               "NEEDS_ATTENTION lines are grouped above the clean ones")
-        check("Approve 3 lines (1 flagged)" in html,
-              "the button says exactly what it covers", "Approve 3 lines (1 flagged)")
+        check("Approve: 2 lines change in NetSuite, 1 stays as it is (1 flagged)" in html,
+              "the button counts changes and acceptances separately",
+              re.search(r'<button type="submit"[^>]*>([^<]+)<', html).group(1))
         check("The tool had to work out part of this line itself. Check it against the "
               "packing slip before approving." in html
               and "Extractor's note: PO carried forward from the row above" in html,
@@ -248,6 +282,38 @@ def test_approve_records_a_verdict_on_every_line() -> None:
                                        for e in events), "one HUMAN audit row per line")
 
 
+def test_the_approve_label_counts_changes_and_acceptances_apart() -> None:
+    section("Approve's label: lines that change in NetSuite, counted apart from the rest")
+    from review_app import data as rdata
+
+    def line(disposition, proposed=None, current=None, state="PENDING_REVIEW"):
+        return rdata.Line({"state": state, "human_verdict": None, "accumulation_basis": None,
+                           "proposed_quantity": proposed, "current_quantity": current},
+                          disposition)
+
+    def label(*lines):
+        return rdata.PoView({"id": "x"}, {}, None, list(lines)).approve_label
+
+    change = line("approve", "9", "12")
+    same = line("approve", "5", "5.000")  # approved at what NetSuite holds
+    no_change = line("accept_no_change", "30", "30", state="NO_CHANGE")
+    flagged = line("approve", "50", "71", state="NEEDS_ATTENTION")
+    blocked = line("block")
+    cases = [
+        ((change,), "Approve: 1 line changes in NetSuite"),
+        ((change, flagged), "Approve: 2 lines change in NetSuite (1 flagged)"),
+        ((same,), "Approve: 1 line stays as it is"),
+        ((same, no_change), "Approve: 2 lines stay as they are"),
+        ((change, same), "Approve: 1 line changes in NetSuite, 1 stays as it is"),
+        ((change, flagged, same, no_change, blocked),
+         "Approve: 2 lines change in NetSuite, 2 stay as they are (1 flagged) — 1 can't be changed"),
+        ((change, line("approve", "7", None)), "Approve: 2 lines change in NetSuite"),
+    ]
+    for lines, expected in cases:
+        got = label(*lines)
+        check(got == expected, f"label: {expected}", got)
+
+
 def test_a_flagged_line_that_already_matches_is_still_approved() -> None:
     section("a flagged line whose figure already matches NetSuite is APPROVED, not stranded")
     with _World() as w:
@@ -256,6 +322,14 @@ def test_a_flagged_line_that_already_matches_is_still_approved() -> None:
               and float(before["proposed_quantity"]) == float(before["current_quantity"]) == 5.0,
               "premise: NEEDS_ATTENTION with proposed == current (5 = 5)")
         c = w.client()
+        html = c.get(f"/po/{w.po_id('1900')}").text
+        check("Approve: 1 line stays as it is (1 flagged)" in html
+              and "change in NetSuite" not in html and "changes in NetSuite" not in html,
+              "its button does not count it as a change: NetSuite already holds 5",
+              re.search(r'<button type="submit"[^>]*>([^<]+)<', html).group(1))
+        check("Approving updates NetSuite straight away" not in html
+              and "nothing changes and nothing is sent" in " ".join(main_text(html).split()),
+              "and the copy says nothing changes and nothing is sent")
         c.post(f"/po/{w.po_id('1900')}/approve", data=w.form(c, "1900"))
         after = w.lines("1900")["S"]
         check(after["state"] == "APPROVED" and after["human_verdict"] == "ACCEPTED"
@@ -264,6 +338,59 @@ def test_a_flagged_line_that_already_matches_is_still_approved() -> None:
               "APPROVED with its quantity scope -- it used to keep NEEDS_ATTENTION with a "
               "verdict, drop out of the queue, and never be approved",
               f"{after['state']} / {after['quantity_write_status']}")
+
+
+def test_a_line_already_at_its_figure_is_confirmed_not_written() -> None:
+    section("approved figure == NetSuite's: confirmed, nothing sent, never shown as a write")
+    import ingest as ing
+
+    with _World() as w:
+        ns = w.netsuite("1900")  # NetSuite holds 5.0; the approved figure is 5.000
+        c = w.client()
+        c.post(f"/po/{w.po_id('1900')}/approve", data=w.form(c, "1900"))
+        check("PATCH" not in [m for m, _u, _k in ns.requests],
+              "nothing is sent to NetSuite", str([m for m, _u, _k in ns.requests]))
+        line = w.lines("1900")["S"]
+        with w.engine.connect() as conn:
+            outcomes = [r.outcome for r in conn.execute(
+                select(write_attempts.c.outcome).where(write_attempts.c.change_id == line["id"]))]
+        check(outcomes == ["CONFIRMED"] and line["state"] == "WRITTEN",
+              "recorded CONFIRMED, and the line is settled", f"{outcomes} / {line['state']}")
+        history = ing._line_history(w.engine, ["1900"])
+        check(history[("1900", str(line["ns_line_id"]))].written_quantity == 5.0,
+              "the accumulation base counts it, as it does ALREADY_PRESENT")
+        groups = sections(c.get(f"/po/{w.po_id('1900')}/result").text)
+        confirmed = groups.get("Confirmed: NetSuite already had the approved figure", "")
+        check("Written to NetSuite" not in groups and "→" not in confirmed
+              and "nothing was sent" in confirmed,
+              "never under Written, never '5 → 5': its own group, saying nothing was sent",
+              str(list(groups)))
+
+
+def test_a_reason_not_sent_survives_a_restart() -> None:
+    section("refused before NetSuite was contacted: the reason is in the audit, not memory")
+    from review_app.app import create_app
+    from review_app.settings import Settings
+
+    with _World() as w:
+        c = w.client()
+        # No `w.netsuite(...)`: the stand-in has no config -> refused before contact.
+        c.post(f"/po/{w.po_id('1662')}/approve", data=w.form(c, "1662"))
+        with w.engine.connect() as conn:
+            events = conn.execute(select(audit_log.c.event)
+                                  .where(audit_log.c.change_id == w.lines("1662")["S"]["id"])
+                                  .where(audit_log.c.event == "QUANTITY_WRITE_NOT_SENT")).all()
+        check(len(events) == 1, "the refusal is recorded as an audit event", str(len(events)))
+        # A restart: a new app, a new process's memory, the same database.
+        fresh = TestClient(create_app(Settings(db_url="unused", blob_root=Path("."),
+                                               reviewer=REVIEWER), engine=w.engine))
+        groups = sections(fresh.get(f"/po/{w.po_id('1662')}/result").text)
+        waiting = groups.get("Approved, not sent to NetSuite yet", "")
+        # This world's PO has no NetSuite record id, so the recorded reason is that
+        # database precondition; a missing connection is recorded the same way.
+        check("has no NetSuite record id on file, so nothing was sent" in waiting
+              and "Approved, but not sent to NetSuite yet." not in waiting,
+              "after a restart the page still says WHY it was not sent", waiting[:200])
 
 
 def test_approve_records_no_receipt_date() -> None:
@@ -298,6 +425,345 @@ def test_approve_records_no_receipt_date() -> None:
               "nothing writable", f"{len(approved)} approved, {len(stranded)} stranded")
 
 
+def test_a_write_with_no_record_is_shown_on_the_queue() -> None:
+    section("a write that reached NetSuite with no record: a banner on the landing page")
+    with _World() as w:
+        check("couldn't record" not in w.client().get("/").text,
+              "no file configured: no banner")
+        log = w.tmp / "unrecorded-writes.jsonl"
+        check("couldn't record" not in w.client(unrecorded_writes=log).get("/").text,
+              "a configured file that does not exist yet: no banner")
+        log.write_text("\n".join(json.dumps(e) for e in (
+            {"at": "2026-11-02T09:00:00", "outcome": "SUCCESS", "reached_netsuite": True,
+             "change_id": "c-1", "po": "PO 1662", "line": "18", "new_quantity": 50,
+             "sent": {"quantity": 50}, "error": "OperationalError: link failure"},
+            # Did not reach NetSuite: logged and filed, but not the alarm.
+            {"at": "2026-11-02T09:01:00", "outcome": "REFUSED", "reached_netsuite": False,
+             "change_id": "c-2", "po": "PO 1662", "line": "19", "new_quantity": 9,
+             "sent": {}, "error": "OperationalError: link failure"},
+        )) + "\n", encoding="utf-8")
+        html = w.client(unrecorded_writes=log).get("/").text
+        main = main_text(html)
+        check("1 change reached NetSuite, but the tool couldn't record it:" in main
+              and "PO 1662 line 18 (now 50)." in main and "line 19" not in main,
+              "the banner names the write that landed, and only that one", main[:200])
+        check("Don't approve that PO again until Kiko has checked it in NetSuite." in main,
+              "and says what to do")
+        check("OperationalError" not in main and "OperationalError" in html,
+              "the technical detail sits behind the Details toggle")
+        check(not INTERNAL.findall(main), "nothing internal leaks into the banner",
+              str(INTERNAL.findall(main)))
+        po_page = main_text(w.client(unrecorded_writes=log).get(f"/po/{w.po_id('1662')}").text)
+        check("PO 1662 line 18 (now 50)." in po_page,
+              "the banner is on every page, a PO page included -- not only the queue")
+
+        # A timed-out write whose FAILED row also failed to record MAY have landed.
+        unsure = {"at": "2026-11-02T09:02:00", "outcome": "FAILED",
+                  "reached_netsuite": "unknown", "change_id": "c-3", "po": "PO 1700",
+                  "line": "4", "new_quantity": 12, "sent": {"quantity": 12},
+                  "error": "OperationalError: link failure"}
+        log.write_text(log.read_text(encoding="utf-8") + json.dumps(unsure) + "\n",
+                       encoding="utf-8")
+        main = main_text(w.client(unrecorded_writes=log).get("/").text)
+        check("2 changes reached, or may have reached, NetSuite" in main
+              and "PO 1700 line 4 (may now be 12)." in main,
+              "a write that MAY have landed is alarmed too, worded as such", main[:220])
+
+        # Damaged lines: not JSON, and JSON that is not an object. Neither may take
+        # down the page that warns about them.
+        log.write_text(log.read_text(encoding="utf-8") + "{not json\n5\n", encoding="utf-8")
+        response = w.client(unrecorded_writes=log).get("/")
+        check(response.status_code == 200
+              and "4 changes reached, or may have reached, NetSuite" in main_text(response.text),
+              "an entry that will not parse counts too, and the page still renders",
+              str(response.status_code))
+
+
+def sections(html: str) -> dict:
+    """The result page's groups: heading text -> that group's visible text."""
+    import html as htmllib
+
+    out = {}
+    for chunk in html.split("<h2>")[1:]:
+        heading, _, rest = chunk.partition("</h2>")
+        out[htmllib.unescape(re.sub(r"\s*\(\d+\)$", "", heading.strip()))] = \
+            htmllib.unescape(main_text(rest.split("<h2>")[0]))
+    return out
+
+
+def test_approve_writes_to_netsuite_and_shows_what_changed() -> None:
+    section("Approve writes to NetSuite, then shows every line's before and after")
+    with _World() as w:
+        ns = w.netsuite("1662")
+        c = w.client()
+        r = c.post(f"/po/{w.po_id('1662')}/approve", data=w.form(c, "1662"),
+                   follow_redirects=False)
+        check(r.status_code == 303
+              and r.headers["location"] == f"/po/{w.po_id('1662')}/result",
+              "approving redirects to the PO's result page", r.headers.get("location", ""))
+        check([b for b, _k in ns.patches()]
+              == [{"item": {"items": [{"line": 18, "quantity": 9}, {"line": 19, "quantity": 50}]}}],
+              "one PATCH, with the two lines that change; the unchanged line is not sent",
+              json.dumps([b for b, _k in ns.patches()]))
+        lines = w.lines("1662")
+        check(lines["S"]["state"] == lines["M"]["state"] == "WRITTEN"
+              and lines["L"]["state"] == "NO_CHANGE" and lines["L"]["human_verdict"] == "ACCEPTED",
+              "the two are WRITTEN, the unchanged one accepted as it was")
+
+        page_one = c.get(f"/po/{w.po_id('1662')}/result").text
+        groups = sections(page_one)
+        check("line 18: 12 → 9" in groups.get("Written to NetSuite", "")
+              and "line 19: 71 → 50" in groups.get("Written to NetSuite", ""),
+              "the result lists each written line as previous -> new", str(list(groups)))
+        written = groups.get("Written to NetSuite", "")
+        check(written.index("line 18") < written.index("line 19"),
+              "in NetSuite line order, not the slip's style/colour/size order", written[:120])
+        check("line 20" in groups.get("No change needed", ""),
+              "and the line that needed nothing, under its own heading")
+        main = " ".join(main_text(page_one).split())
+        check("edit that line's quantity in NetSuite back to the number before the arrow" in main
+              and "no undo button" in main,
+              "with the sentence on how to reverse a change")
+        check(" ".join(main_text(c.get(f"/po/{w.po_id('1662')}/result").text).split()) == main,
+              "a refresh shows the same result: it is read from the database, not the POST")
+        check("See what changed, line by line" in c.get(f"/po/{w.po_id('1662')}").text,
+              "and the PO page links to it afterwards")
+        check(not INTERNAL.findall(main), "nothing internal on the result page",
+              str(INTERNAL.findall(main)))
+
+
+def test_lines_that_cant_be_changed_are_left_out_of_the_write() -> None:
+    section("a blocked line no longer disables Approve: it is left out and listed")
+    with _World() as w:
+        with w.engine.begin() as conn:  # line 19 has closed in NetSuite
+            conn.execute(proposed_changes.update()
+                         .where(proposed_changes.c.id == w.lines("1662")["M"]["id"])
+                         .values(ns_line_is_open=False))
+        ns = w.netsuite("1662")
+        c = w.client()
+        import html as htmllib
+
+        html = c.get(f"/po/{w.po_id('1662')}").text
+        main = htmllib.unescape(main_text(html))
+        check("Approve: 1 line changes in NetSuite, 1 stays as it is — 1 can't be changed" in main
+              and '<button type="submit" disabled>' not in html,
+              "the button counts what it approves and what it leaves out, and is enabled",
+              re.search(r"Approve [^<]*", html).group(0) if re.search(r"Approve [^<]*", html)
+              else "")
+        check("(line 19)" in main and "left out" in main,
+              "the left-out line is listed by the button")
+        c.post(f"/po/{w.po_id('1662')}/approve", data=w.form(c, "1662"))
+        check([b for b, _k in ns.patches()]
+              == [{"item": {"items": [{"line": 18, "quantity": 9}]}}],
+              "only the line that can change is sent", json.dumps([b for b, _k in ns.patches()]))
+        m = w.lines("1662")["M"]
+        check(m["human_verdict"] is None and m["state"] == "NEEDS_ATTENTION",
+              "the left-out line gets no verdict and keeps its state")
+        groups = sections(c.get(f"/po/{w.po_id('1662')}/result").text)
+        check("line 19" in groups.get("Left as they are: can't be changed here", ""),
+              "the result page lists it as left as it is", str(list(groups)))
+        check("1662" in main_text(c.get("/").text),
+              "and the PO stays in the queue for it, to reject or fix in NetSuite")
+
+
+def test_the_result_page_keeps_each_outcome_apart() -> None:
+    section("result page: written, already present, refused and failed are never merged")
+    import write_path
+    from test_write_path import (Resp, client_for, insert_attempt, line_400,
+                                 po_world)
+    from review_app.app import create_app
+    from review_app.settings import Settings
+
+    td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    engine, po, changes, ns = po_world(
+        [(18, 71, 50), (19, 12, 9), (20, 30, 40), (21, 8, 10), (23, 40, 44)],
+        ns_overrides={19: {"isClosed": True, "isOpen": False}, 23: {"quantity": 44}},
+        pending_line=None, extra_ns=None, sqlite_file=Path(td.name) / "outcomes-test.db")
+    with engine.begin() as conn:  # line 23: an earlier attempt sent 44 and never heard back
+        conn.execute(proposed_changes.update().where(proposed_changes.c.id == changes[23])
+                     .values(state=sc.STATE_WRITE_FAILED, quantity_write_status="FAILED"))
+    insert_attempt(engine, changes[23], 1, "FAILED", {"quantity": 44}, "TRANSIENT", line="23")
+    # 20 is named in a 400; the resend gets a 204, but only line 18 actually lands.
+    ns.patch_failures = [(line_400(20), False), (Resp(204), {18})]
+    write_path._live = client_for(ns)
+    try:
+        app = create_app(Settings(db_url="unused", blob_root=Path(td.name), reviewer=REVIEWER),
+                         engine=engine, now=lambda: NOW)
+        c = TestClient(app)
+        c.post(f"/po/{po}/write", data={"csrf_token": app.state.csrf})
+        groups = sections(c.get(f"/po/{po}/result").text)
+    finally:
+        write_path._live = NO_LIVE_NETSUITE
+        engine.dispose()
+        td.cleanup()
+    written = groups.get("Written to NetSuite", "")
+    present = groups.get("Already showing the new quantity", "")
+    refused = groups.get("Refused, nothing written", "")
+    failed = groups.get("Not written: something went wrong", "")
+    check("line 18: 71 → 50" in written and "line 23" not in written,
+          "written: line 18 -- and the already-present line is NOT among them", written[:120])
+    check("line 23: 40 → 44" in present and "can't prove" in present,
+          "already present: its own group, before -> after, saying it is unproven", present[:160])
+    check("line 19" in refused and "closed in NetSuite" in refused
+          and "line 20" in refused and "Please enter a value for Amount" in refused,
+          "refused: each with its reason", refused[:200])
+    check("line 21" in failed and "accepted the write" in failed,
+          "failed: with what went wrong", failed[:160])
+    check("Send the unwritten lines again" in groups,
+          "and the lines not written can be sent again from here")
+
+
+def test_the_page_says_it_is_working_while_netsuite_is_updated() -> None:
+    section("Approve says what it does now, and the page never looks frozen")
+    with _World() as w:
+        html = w.client().get(f"/po/{w.po_id('1662')}").text
+        main = main_text(html)
+        check("Nothing changes in NetSuite yet" not in html
+              and "Approving updates NetSuite straight away." in main
+              and "the quantity the factory says it shipped" in main,
+              "the copy says Approve changes NetSuite, and what the numbers are")
+        check("no undo button" in main and "previous quantity" in main,
+              "and how a change is reversed")
+        check("data-writes" in html and 'class="working"' in html
+              and "This usually takes about ten seconds" in html
+              and "Still waiting for NetSuite" in html
+              and "taking much longer than usual" in html,
+              "the form shows progress, then says more when NetSuite runs long")
+        check("<noscript>" in html, "and says the same without scripts")
+
+
+def test_unwritten_lines_can_be_sent_again() -> None:
+    section("a write that didn't go through can be sent again from the result page")
+    import requests.exceptions as rex
+
+    with _World() as w:
+        ns = w.netsuite("1662")
+        ns.patch_failures = [(rex.ReadTimeout("timed out"), False)] * 3
+        c = w.client()
+        c.post(f"/po/{w.po_id('1662')}/approve", data=w.form(c, "1662"))
+        groups = sections(c.get(f"/po/{w.po_id('1662')}/result").text)
+        check("line 18" in groups.get("Not written: something went wrong", "")
+              and "Send the unwritten lines again" in groups,
+              "the timed-out lines are shown as not written, with a way to send them again")
+        r = c.post(f"/po/{w.po_id('1662')}/write", data={"csrf_token": w.app.state.csrf},
+                   follow_redirects=False)
+        groups = sections(c.get(f"/po/{w.po_id('1662')}/result").text)
+        check(r.status_code == 303 and "line 18: 12 → 9" in groups.get("Written to NetSuite", "")
+              and "Send the unwritten lines again" not in groups,
+              "sending again writes them, without approving again", str(list(groups)))
+        r = c.post(f"/po/{w.po_id('1662')}/write", data={"csrf_token": "forged"})
+        check(r.status_code == 403, "and the send-again form refuses a forged token")
+
+
+def test_a_failed_write_stays_in_the_queue_until_dealt_with() -> None:
+    section("a write that didn't go through never drops out of sight; refused lines have a way out")
+    with _World() as w:
+        # Line 19 closed in NetSuite after the slip was processed: the write refuses it.
+        ns = w.netsuite("1662", line_overrides={19: {"isOpen": False, "isClosed": True}})
+        c = w.client()
+        c.post(f"/po/{w.po_id('1662')}/approve", data=w.form(c, "1662"))
+        queue = main_text(c.get("/").text)
+        check("1662" in queue and "1 line approved but not written to NetSuite" in queue,
+              "the PO stays in the queue, saying a line isn't written", queue[:200])
+        import html as htmllib
+
+        check("1 approved line hasn't been written to NetSuite yet" in htmllib.unescape(
+                  main_text(c.get(f"/po/{w.po_id('1662')}").text)),
+              "and the PO page says so, with a link to what to do")
+        groups = sections(c.get(f"/po/{w.po_id('1662')}/result").text)
+        check("closed in NetSuite" in groups.get("Refused, nothing written", "")
+              and "Send the unwritten lines again" not in groups
+              and "Leave the unwritten lines as they are" in groups,
+              "a refused line is not offered for sending again -- it is offered a way out",
+              str(list(groups)))
+        r = c.post(f"/po/{w.po_id('1662')}/give-up", data={"csrf_token": w.app.state.csrf},
+                   follow_redirects=False)
+        m = w.lines("1662")["M"]
+        check(r.status_code == 303 and m["state"] == "DISCARDED"
+              and ns.lines[19]["quantity"] == 71,
+              "leaving it as it is discards the line and sends nothing", m["state"])
+        groups = sections(c.get(f"/po/{w.po_id('1662')}/result").text)
+        check("line 19" in groups.get("Left as they are: you stopped trying", "")
+              and "1662" not in main_text(c.get("/").text),
+              "the result says so, and the PO leaves the queue", str(list(groups)))
+        with w.engine.connect() as conn:
+            events = conn.execute(select(audit_log.c.event, audit_log.c.actor)
+                                  .where(audit_log.c.change_id == m["id"])).all()
+        check(("WRITE_GIVEN_UP", REVIEWER) in [tuple(e) for e in events],
+              "recorded as the reviewer's decision")
+        r = c.post(f"/po/{w.po_id('1662')}/give-up", data={"csrf_token": "forged"})
+        check(r.status_code == 403, "and the form refuses a forged token")
+
+
+def test_a_written_line_is_shown_by_the_attempt_that_wrote_it() -> None:
+    section("a later attempt refused as 'already shows' never turns a WRITTEN line into a refusal")
+    # A second tab, or a double submit with no script, can race the first write:
+    # the later call re-reads, finds the new value, and records REFUSED. write_path
+    # keeps the line WRITTEN (it is in the accumulation base). The result page used
+    # to show the NEWEST attempt, so the written line appeared under "Refused".
+    from test_write_path import insert_attempt
+
+    with _World() as w:
+        w.netsuite("1662")
+        c = w.client()
+        c.post(f"/po/{w.po_id('1662')}/approve", data=w.form(c, "1662"))
+        s = w.lines("1662")["S"]
+        check(s["state"] == "WRITTEN", "premise: line 18 was written", s["state"])
+        insert_attempt(w.engine, s["id"], 2, "REFUSED", {}, "OTHER", line="18")
+        groups = sections(c.get(f"/po/{w.po_id('1662')}/result").text)
+        check("line 18: 12 → 9" in groups.get("Written to NetSuite", "")
+              and "line 18" not in groups.get("Refused, nothing written", ""),
+              "line 18 stays under written, with the value it was written over",
+              str(list(groups)))
+
+
+def test_a_line_given_up_before_it_was_ever_sent_says_so() -> None:
+    section("a line refused before NetSuite was contacted, then left as it is, is not 'not sent yet'")
+    # No `w.netsuite(...)`: the stand-in has no config, so the write path refuses
+    # every line before contacting NetSuite and records NO attempt row -- the same
+    # shape as a production account with production writes switched off. The
+    # given-up grouping used to be reached only through an attempt row, so such a
+    # line read "Approved, but not sent to NetSuite yet" after she had stopped trying.
+    with _World() as w:
+        c = w.client()
+        c.post(f"/po/{w.po_id('1662')}/approve", data=w.form(c, "1662"))
+        with w.engine.connect() as conn:
+            attempts = conn.execute(select(write_attempts.c.id)).all()
+        check(attempts == [], "premise: nothing reached NetSuite, so no attempt row exists",
+              str(len(attempts)))
+        c.post(f"/po/{w.po_id('1662')}/give-up", data={"csrf_token": w.app.state.csrf})
+        check(all(w.lines("1662")[s]["state"] == "DISCARDED" for s in ("S", "M")),
+              "premise: both approved lines were left as they are")
+        groups = sections(c.get(f"/po/{w.po_id('1662')}/result").text)
+        given_up = groups.get("Left as they are: you stopped trying", "")
+        check("line 18" in given_up and "line 19" in given_up
+              and "Approved, not sent to NetSuite yet" not in groups,
+              "both are listed as left as they are, not as still waiting to be sent",
+              str(list(groups)))
+        check("Nothing was sent to NetSuite" in given_up,
+              "and the page says nothing was sent for them", given_up[:200])
+        check("1662" not in main_text(c.get("/").text), "and the PO leaves the queue")
+
+
+def test_approve_copy_never_tells_her_to_reject_the_whole_po_first() -> None:
+    section("with a line left out, the copy says to reject it AFTER approving, not before")
+    with _World() as w:
+        with w.engine.begin() as conn:
+            conn.execute(proposed_changes.update()
+                         .where(proposed_changes.c.id == w.lines("1662")["M"]["id"])
+                         .values(ns_line_is_open=False))
+        html = w.client().get(f"/po/{w.po_id('1662')}").text
+        card = " ".join(main_text(html.split("<h2>Your decision</h2>")[1].split("</form>")[0])
+                        .split())
+        check("reject this PO here to clear it" not in card
+              and "after you approve. Then reject it here" in card
+              and "Don't reject before approving" in card,
+              "the left-out line is to be rejected after approving, and the copy warns why",
+              card[:300])
+        check("(line 19): no open line in NetSuite to update" in card,
+              "each left-out line is listed with its reason in a few words")
+
+
 def test_reject_needs_a_reason() -> None:
     section("reject: a reason, every line discarded, the reason recorded")
     with _World() as w:
@@ -328,26 +794,31 @@ def test_forged_and_stale_forms_are_refused() -> None:
               "a page older than the data is refused -- reload and decide again")
 
 
-def test_resolution_and_assignment_are_refused_not_trimmed() -> None:
-    section("NEEDS_RESOLUTION / NEEDS_ASSIGNMENT: refuse the PO, name the lines")
+def test_lines_needing_a_choice_are_left_out_not_refused() -> None:
+    section("NEEDS_RESOLUTION / NEEDS_ASSIGNMENT: the page loads, the line is left out")
+    # Was (until 2026-11-02): the whole PO page refused to load.
     with _World() as w:
         c = w.client()
         states = {ln["state"] for ln in w.lines("1700").values()}
         check(states == {"NEEDS_RESOLUTION"}, "premise: PO 1700 is NEEDS_RESOLUTION", str(states))
         r = c.get(f"/po/{w.po_id('1700')}")
-        check(r.status_code == 409 and "can't be reviewed here yet" in r.text
-              and "NEEDS_RESOLUTION" in r.text and "Let Kiko know" in r.text,
-              "the page refuses, says what to do, and names the line under Details")
-        r = c.post(f"/po/{w.po_id('1700')}/approve",
-                   data={"csrf_token": w.app.state.csrf, "fingerprint": "x"})
-        check(r.status_code == 409 and w.lines("1700")["S"]["human_verdict"] is None,
-              "and an approve POST for it records nothing")
+        main = main_text(r.text)
+        check(r.status_code == 200 and "Can't be changed here" in main
+              and "could go to more than one line on this PO" in main,
+              "the page loads, the line is shown as can't be changed, and says why", main[:160])
+        check("disabled" in r.text and "nothing on this PO that can be approved" in main,
+              "with nothing else on the PO, Approve has nothing to do")
+        form = w.form(c, "1700")
+        r = c.post(f"/po/{w.po_id('1700')}/reject", data={**form, "reason": "picked by hand"},
+                   follow_redirects=False)
+        check(r.status_code == 303 and w.lines("1700")["S"]["human_verdict"] == "REJECTED",
+              "and it can be rejected from the page")
         with w.engine.begin() as conn:
             conn.execute(proposed_changes.update()
                          .where(proposed_changes.c.id == w.lines("1700")["S"]["id"])
-                         .values(state="NEEDS_ASSIGNMENT"))
-        check(c.get(f"/po/{w.po_id('1700')}").status_code == 409,
-              "NEEDS_ASSIGNMENT is refused the same way")
+                         .values(state="NEEDS_ASSIGNMENT", human_verdict=None))
+        check(c.get(f"/po/{w.po_id('1700')}").status_code == 200,
+              "NEEDS_ASSIGNMENT loads the same way")
 
 
 def test_a_blocking_line_disables_approve() -> None:
@@ -356,8 +827,8 @@ def test_a_blocking_line_disables_approve() -> None:
         c = w.client()
         html = c.get(f"/po/{w.po_id('1800')}").text
         check("disabled" in html and "match an open line on this PO in NetSuite" in html
-              and "be approved yet" in html,
-              "Approve is disabled and the page says why, in words")
+              and "be changed here" in html,
+              "with every line blocked, Approve is disabled and the page says why, in words")
         r = c.post(f"/po/{w.po_id('1800')}/approve", data=w.form(c, "1800"))
         check(r.status_code == 409 and w.lines("1800")["S"]["human_verdict"] is None,
               "and a POST anyway is refused")
@@ -398,9 +869,12 @@ def test_received_and_agreeing_lines_are_kept_from_the_reviewer() -> None:
         html = c.get(f"/po/{w.po_id('1662')}").text
         check(" / L<" not in html and " / S<" in html and " / M<" in html,
               "the agreeing line has no row on the review page; the others do")
-        check("Approve 2 lines (1 flagged)" in html,
+        check("Approve: 2 lines change in NetSuite (1 flagged)" in html,
               "and Approve covers only what the reviewer sees",
               re.search(r'<button type="submit"[^>]*>([^<]+)<', html).group(1))
+        # Approve writes now, and a PO with an approved line NOT written stays in the
+        # queue (2026-11-02). The write has to land for "the rest is decided".
+        w.netsuite("1662")
         c.post(f"/po/{w.po_id('1662')}/approve", data=w.form(c, "1662"))
         lines = w.lines("1662")
         check(lines["L"]["human_verdict"] is None and lines["S"]["human_verdict"] == "ACCEPTED",
@@ -427,8 +901,8 @@ def test_one_shared_block_reason_is_said_once() -> None:
         url = f"/po/{w.po_id('1800')}"
         html = c.get(url).text
         main = main_text(html)
-        check(main.count("be approved yet") == 1 and "All 2 lines on this PO, each for the same reason" in main,
-              "the status is stated once, for the whole PO", str(main.count("be approved yet")))
+        check(main.count("be changed here") == 1 and "All 2 lines on this PO, each for the same reason" in main,
+              "the status is stated once, for the whole PO", str(main.count("be changed here")))
         check(main.count("no longer open") == 1,
               "and the shared reason once, not under each row", str(main.count("no longer open")))
         check(html.count("State: ") == 2 and 'name="fingerprint"' in html and "disabled" in html,
@@ -442,7 +916,7 @@ def test_one_shared_block_reason_is_said_once() -> None:
             conn.execute(proposed_changes.update().where(proposed_changes.c.id == m_id)
                          .values(accumulation_basis="DISPUTED"))
         main = main_text(c.get(url).text)
-        check(main.count("be approved yet") == 2 and "changed in NetSuite since last seen" in main,
+        check(main.count("be changed here") == 2 and "changed in NetSuite since last seen" in main,
               "a tag on one line only keeps it per line, with the tag shown")
         with w.engine.begin() as conn:
             conn.execute(proposed_changes.update().where(proposed_changes.c.id == m_id)
@@ -455,8 +929,8 @@ def test_one_shared_block_reason_is_said_once() -> None:
                          .values(attention_reason=s["attention_reason"]
                                  + "; extraction confidence medium: test"))
         main = main_text(c.get(url).text)
-        check(main.count("be approved yet") == 2 and "for the same reason" not in main,
-              "reasons that differ keep the per-line status", str(main.count("be approved yet")))
+        check(main.count("be changed here") == 2 and "for the same reason" not in main,
+              "reasons that differ keep the per-line status", str(main.count("be changed here")))
         check(main.count("no longer open") == 2 and "work out part of this line" in main,
               "and each line's own explanation")
 
@@ -613,10 +1087,13 @@ def test_the_wording_map_tracks_what_the_matcher_writes() -> None:
 #: Phase 4 decision 2): this function, imported under this exact name, called
 #: with this signature, and never handed a client. NARROWED from "nothing at all"
 #: on 2026-11-02, not removed. Widening it is a decision, made here on purpose.
-PERMITTED_MODULE, PERMITTED_FUNCTION = "write_path", "write_approved_quantity"
+#: Moved DELIBERATELY the same day from the per-line `write_approved_quantity`
+#: (now an internal fallback the app may NOT import) to the per-PO batch
+#: (RUNBOOK section 11 decision 2): one PO in, a result per line out.
+PERMITTED_MODULE, PERMITTED_FUNCTION = "write_path", "write_po_batch"
 PERMITTED_SIGNATURE = (
     ("engine", "POSITIONAL_OR_KEYWORD", "<none>"),
-    ("change_id", "POSITIONAL_OR_KEYWORD", "<none>"),
+    ("shipment_po_id", "POSITIONAL_OR_KEYWORD", "<none>"),
     ("client", "KEYWORD_ONLY", None),
     ("now", "KEYWORD_ONLY", None),
 )
@@ -666,8 +1143,10 @@ def test_review_app_never_imports_netsuite_client() -> None:
 
     # The scanner must be able to fail, on every widening it exists to catch.
     permitted = (f"from {PERMITTED_MODULE} import {PERMITTED_FUNCTION}\n"
-                 f"{PERMITTED_FUNCTION}(engine, change_id, now=now)\n")
+                 f"{PERMITTED_FUNCTION}(engine, shipment_po_id, now=now)\n")
     widenings = {
+        "the per-line helper (the fallback, not an entry point)":
+            f"from {PERMITTED_MODULE} import write_approved_quantity",
         "the client module": "import netsuite_client",
         "a name from the client": "from netsuite_client import NetSuiteClient",
         "the matcher": "import matcher",
@@ -690,7 +1169,7 @@ def test_review_app_never_imports_netsuite_client() -> None:
 
     params = tuple((p.name, p.kind.name,
                     "<none>" if p.default is inspect.Parameter.empty else p.default)
-                   for p in inspect.signature(write_path.write_approved_quantity)
+                   for p in inspect.signature(getattr(write_path, PERMITTED_FUNCTION))
                    .parameters.values())
     check(params == PERMITTED_SIGNATURE,
           f"{PERMITTED_FUNCTION} has exactly the pinned signature: no way to pass fields",

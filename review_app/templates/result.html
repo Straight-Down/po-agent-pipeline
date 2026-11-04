@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% set po = view.shipment_po %}
+{% block title %}PO {{ po.po_number_printed }}: what changed in NetSuite{% endblock %}
+{% block content %}
+<h1 class="po-title">PO {{ po.po_number_printed }}: what changed in NetSuite</h1>
+<p class="muted lede"><a href="/po/{{ view.id }}">Back to the PO</a>{% if po.ns_tranid %} · {{ po.ns_tranid }} in NetSuite{% endif %}</p>
+
+{% set changed = groups|selectattr("0", "in", ["written", "already_present"])|list %}
+{% if changed %}
+<div class="card ref">
+  <p class="plain">Each changed line shows its quantity before and after: <strong>line 18: 44 → 52</strong>
+  means NetSuite had 44 and now has 52. To reverse a change, edit that line's quantity in
+  NetSuite back to the number before the arrow. There's no undo button here.</p>
+</div>
+{% endif %}
+
+{% if not groups %}
+<div class="card">Nothing on this PO has been sent to NetSuite yet.</div>
+{% endif %}
+
+{% for key, heading, lines in groups %}
+<h2>{{ heading }} ({{ lines|length }})</h2>
+<div class="card{{ ' info' if key in ('already_present', 'not_sent') }}{{ ' warn' if key in ('refused', 'failed') }}">
+  {% if key == "already_present" %}
+  <p class="muted">NetSuite already showed the new quantity when the tool came back to these
+  lines, and an earlier attempt had sent exactly that number without NetSuite confirming it.
+  They count as done, but the tool can't prove that its attempt made the change.</p>
+  {% elif key == "excluded" %}
+  <p class="muted">These were left out when you approved, and nothing was sent for them.</p>
+  {% endif %}
+  <ul class="results">
+  {% for r in lines %}
+    <li>
+      {% if key in ("written", "already_present", "refused", "failed", "not_sent") %}
+        <strong class="arrow">{{ r.arrow }}</strong> · {{ r.line.label }}
+      {% else %}
+        <strong>line {{ r.line.ns_line_id or "–" }}</strong> · {{ r.line.label }}
+      {% endif %}
+      {% if key != "written" and r.message %}<br><span class="plain">{{ r.message }}</span>{% endif %}
+    </li>
+  {% endfor %}
+  </ul>
+</div>
+{% endfor %}
+
+{% if retry %}
+<h2>Send the unwritten lines again</h2>
+<form class="card" method="post" action="/po/{{ view.id }}/write" data-writes>
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <p class="plain">{{ retry }} approved line{{ "s" if retry != 1 }} didn't go through, and can be sent again.
+  Sending again checks each line in NetSuite first, so it won't write over a change someone
+  else made.</p>
+  <button type="submit">Send {{ retry }} line{{ "s" if retry != 1 }} to NetSuite again</button>
+  <p class="working" role="status" aria-live="polite" hidden></p>
+</form>
+{% endif %}
+
+{% if unwritten %}
+<h2>Leave the unwritten lines as they are</h2>
+<form class="card" method="post" action="/po/{{ view.id }}/give-up">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <p class="plain">If {{ "these lines" if unwritten != 1 else "this line" }} shouldn't be changed after all,
+  or {{ "they've" if unwritten != 1 else "it's" }} been sorted out in NetSuite by hand, stop trying.
+  Nothing is changed in NetSuite, and the PO leaves your list once nothing else is waiting.
+  {% if unwritten != retry %}Refused lines need this: sending them again would be refused again.{% endif %}</p>
+  <button type="submit" class="secondary">Leave {{ unwritten }} line{{ "s" if unwritten != 1 }} as {{ "they are" if unwritten != 1 else "it is" }}</button>
+</form>
+{% endif %}
+{% endblock %}

@@ -2,8 +2,9 @@
 What the review screens read, and the two decisions they write.
 
 Imports `schema` and nothing that can reach NetSuite. An approval here is a row
-update and an audit row; the write path that would act on it does not exist in
-this package.
+update and an audit row. The write that follows it is `write_path.write_po_batch`,
+called by `app.py` -- the one function this package may take from the write side
+-- and its outcome is read back here from `write_attempts` (`write_results`).
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from schema import (
     proposed_changes,
     shipment_pos,
     shipments,
+    write_attempts,
 )
 
 #: States a line can be in while it still waits on a human.
@@ -38,8 +40,10 @@ REVIEW_STATES = (
     sc.STATE_PENDING_REVIEW, sc.STATE_NO_CHANGE, sc.STATE_NEEDS_ATTENTION,
     sc.STATE_NEEDS_RESOLUTION, sc.STATE_NEEDS_ASSIGNMENT, sc.STATE_MANUAL_ENTRY_REQUIRED,
 )
-#: v1 does not render these: both need a picker that has never met real data
-#: (Requirements §3). A PO holding one is REFUSED, never shown with the lines missing.
+#: Lines needing a choice between NetSuite lines. There is still no picker (it has
+#: never met real data; Requirements §3), so they cannot be approved. Since
+#: 2026-11-02 they are shown and LEFT OUT of an Approve, like a blocked line --
+#: the PO page no longer refuses to load.
 REFUSED_STATES = (sc.STATE_NEEDS_ASSIGNMENT, sc.STATE_NEEDS_RESOLUTION)
 
 WORKFLOW = "PACKING_SLIP"
@@ -112,6 +116,13 @@ class Line:
         return wording.reasons(self.row["attention_reason"], self.row)
 
     @property
+    def exclusion_short(self) -> str:
+        """Why Approve leaves this line out, in a few words; empty if it doesn't."""
+        if self.disposition not in ("block", "refused"):
+            return ""
+        return wording.EXCLUSION_SHORT[wording.block_kind(self)]
+
+    @property
     def label(self) -> str:
         parts = [self.row["src_style_text"], self.row["src_color_text"], self.row["src_size_text"]]
         return " / ".join(str(p) for p in parts if p not in (None, ""))
@@ -173,7 +184,7 @@ class PoView:
 
     @property
     def block_explanations(self) -> list[tuple[str, int]]:
-        return wording.block_explanations(self.blocking)
+        return wording.block_explanations(self.excluded)
 
     @property
     def summary_sentence(self) -> str:
@@ -206,6 +217,28 @@ class PoView:
         return [ln for ln in self.lines if ln.disposition == "block"]
 
     @property
+    def writable(self) -> list[Line]:
+        """The covered lines an Approve actually sends to NetSuite (not the
+        no-change lines, which it only accepts)."""
+        return [ln for ln in self.covered if ln.disposition == "approve"]
+
+    @property
+    def unwritten(self) -> list[Line]:
+        """Approved lines not written to NetSuite yet: failed, refused, or never
+        sent. They keep the PO in the queue until written or left as they are --
+        a failed write must not drop out of sight (partial-failure ruling)."""
+        return [ln for ln in self.lines
+                if ln.row["state"] in (sc.STATE_APPROVED, sc.STATE_WRITE_FAILED)
+                and ln.row["quantity_write_status"] in ("APPROVED", "FAILED")]
+
+    @property
+    def excluded(self) -> list[Line]:
+        """Lines an Approve leaves out: blocked, or needing a choice between NetSuite
+        lines. Shown and listed, never written, and left undecided -- so the PO stays
+        in the queue for them until they are rejected or fixed in NetSuite."""
+        return [ln for ln in self.shown_lines if ln.disposition in ("block", "refused")]
+
+    @property
     def covered(self) -> list[Line]:
         """The lines an Approve records a verdict on. Never a no-action line."""
         return [ln for ln in self.shown_lines if ln.disposition in ("approve", "accept_no_change")]
@@ -216,16 +249,36 @@ class PoView:
 
     @property
     def can_approve(self) -> bool:
-        return not self.refused_lines and not self.blocking and bool(self.covered)
+        """Anything to approve. Excluded lines no longer disable it (2026-11-02):
+        they are left out of the write and listed. Still per PO, no per-line ticks."""
+        return bool(self.covered)
 
     @property
     def can_reject(self) -> bool:
-        return not self.refused_lines and bool(self.awaiting)
+        return bool(self.awaiting)
+
+    @property
+    def changing(self) -> list[Line]:
+        """Covered lines whose NetSuite quantity Approve actually changes. A line
+        approved at the figure NetSuite already holds is confirmed, not sent, and changes
+        nothing, so it is counted with the lines that stay as they are."""
+        return [ln for ln in self.writable
+                if _decimal(ln.row["proposed_quantity"]) != _decimal(ln.row["current_quantity"])]
 
     @property
     def approve_label(self) -> str:
-        n, f = len(self.covered), self.flagged_covered
-        return f"Approve {n} line{'s' if n != 1 else ''}" + (f" ({f} flagged)" if f else "")
+        """Changes and acceptances counted SEPARATELY (2026-11-04): one total
+        implied every covered line changes in NetSuite, which it does not."""
+        c = len(self.changing)
+        k, f, x = len(self.covered) - c, self.flagged_covered, len(self.excluded)
+        parts = []
+        if c:
+            parts.append(f"{wording.lines_word(c)} change{'s' if c == 1 else ''} in NetSuite")
+        if k:
+            stays = "stays as it is" if k == 1 else "stay as they are"
+            parts.append(f"{wording.lines_word(k) if not c else k} {stays}")
+        return ("Approve: " + ", ".join(parts) + (f" ({f} flagged)" if f else "")
+                + (f" — {x} can't be changed" if x else ""))
 
     @property
     def no_action_possible(self) -> bool:
@@ -237,7 +290,12 @@ class PoView:
         Also true when nothing the reviewer would see is still waiting: a PO whose
         only awaiting lines need no action (already received, figures agree) has
         nothing to decide, and goes to the diagnostic page like a closed one.
+
+        Never true while an approved line is unwritten: that PO has something to
+        do (send again, or leave as it is), and belongs in the queue.
         """
+        if self.unwritten:
+            return False
         shown = self.shown_lines
         nothing_open = not self.candidate_open and not any(ln.row["ns_line_is_open"]
                                                            for ln in shown)
@@ -364,22 +422,31 @@ class QueueEntry:
     def status(self) -> str:
         """One plain line for the queue: what reviewing this PO involves."""
         v = self.view
-        if v.refused_lines:
-            return "Can't be reviewed here yet"
+        unwritten = (f"{wording.lines_word(len(v.unwritten))} approved but not written to "
+                     "NetSuite" if v.unwritten else "")
         if not v.can_approve:
-            return "Nothing to approve yet (open to see why)"
-        flagged = v.flagged_covered
+            return unwritten or "Nothing to approve (open to see why)"
+        flagged, excluded = v.flagged_covered, len(v.excluded)
         base = f"{wording.lines_word(len(v.covered))} to approve"
-        return base + (f", {flagged} to check first" if flagged else "")
+        return ((f"{unwritten}; " if unwritten else "") + base
+                + (f", {flagged} to check first" if flagged else "")
+                + (f", {excluded} can't be changed" if excluded else ""))
 
 
 def list_queue(conn) -> list[QueueEntry]:
-    """Every PO-in-a-shipment with at least one line still awaiting a human."""
-    ids = conn.execute(
-        select(proposed_changes.c.shipment_po_id).distinct()
-        .where(proposed_changes.c.state.in_(REVIEW_STATES))
-        .where(proposed_changes.c.human_verdict.is_(None))
-    ).scalars().all()
+    """Every PO-in-a-shipment with a line still awaiting a human -- or an approved
+    line not yet written to NetSuite, which needs one too."""
+    pc = proposed_changes
+    ids = set(conn.execute(
+        select(pc.c.shipment_po_id).distinct()
+        .where(pc.c.state.in_(REVIEW_STATES))
+        .where(pc.c.human_verdict.is_(None))
+    ).scalars().all())
+    ids |= set(conn.execute(
+        select(pc.c.shipment_po_id).distinct()
+        .where(pc.c.state.in_((sc.STATE_APPROVED, sc.STATE_WRITE_FAILED)))
+        .where(pc.c.quantity_write_status.in_(("APPROVED", "FAILED")))
+    ).scalars().all())
     views = [load_po(conn, i) for i in ids]
     entries = [QueueEntry(v) for v in views if v is not None]
     return sorted(entries, key=lambda e: (
@@ -406,10 +473,6 @@ def _load_for_decision(conn, shipment_po_id: str, fingerprint: str) -> PoView:
     if view is None:
         raise ReviewRefused("This PO isn't in your review list.", 404,
                             detail=f"no shipment_pos row {shipment_po_id!r}")
-    if view.refused_lines:
-        raise ReviewRefused(
-            "This PO can't be reviewed here yet. Let Kiko know.", 409,
-            detail="it has NEEDS_ASSIGNMENT / NEEDS_RESOLUTION lines, which v1 refuses")
     if fingerprint != view.fingerprint:
         raise ReviewRefused(
             "Something on this PO changed since you opened it, so nothing was saved. "
@@ -421,9 +484,11 @@ def _load_for_decision(conn, shipment_po_id: str, fingerprint: str) -> PoView:
 def approve(engine, shipment_po_id: str, *, reviewer: str, fingerprint: str,
             now: dt.datetime) -> dict:
     """
-    Record Paula's approval of one PO. Sets states and verdicts; writes NOTHING
-    anywhere else. Every covered line gets a verdict (Requirements §1), including
-    NO_CHANGE lines accepted as they are.
+    Record Paula's approval of one PO: states and verdicts, nothing else. The
+    caller (`app.py`) then writes the approved quantities to NetSuite. Every
+    covered line gets a verdict (Requirements §1), including NO_CHANGE lines
+    accepted as they are. Excluded lines (`PoView.excluded`) get nothing: they are
+    not approved, not written, and stay awaiting a decision.
 
     **Quantity only** (2026-11-02). A line with a quantity to approve gets the
     QUANTITY scope and goes APPROVED; a NO_CHANGE line gets its verdict and keeps
@@ -436,9 +501,9 @@ def approve(engine, shipment_po_id: str, *, reviewer: str, fingerprint: str,
         view = _load_for_decision(conn, shipment_po_id, fingerprint)
         if not view.can_approve:
             raise ReviewRefused(
-                "This PO can't be approved. Reload the page to see why.", 409,
-                detail="; ".join(f"{ln.label}: {ln.block_reason}" for ln in view.blocking)
-                or "nothing to approve")
+                "There's nothing on this PO to approve. Reload the page to see why.", 409,
+                detail="; ".join(f"{ln.label}: {ln.block_reason or ln.state}"
+                                 for ln in view.excluded) or "nothing to approve")
         for line in view.covered:
             row = line.row
             values: dict[str, Any] = {"human_verdict": "ACCEPTED", "verdict_by": reviewer,
@@ -491,6 +556,254 @@ def reject(engine, shipment_po_id: str, *, reviewer: str, reason: str, fingerpri
             _audit(conn, now=now, reviewer=reviewer, event="REVIEW_REJECTED", line=line,
                    to_state=sc.STATE_DISCARDED, detail={"reason": reason})
         return len(view.awaiting)
+
+
+# ---------------------------------------------------------------------------
+# What the write did: the result page, rebuilt from the database every time
+# ---------------------------------------------------------------------------
+
+#: `write_attempts.outcome` -> the result page's group. ALREADY_PRESENT is its own
+#: group, never "written": the tool cannot prove it made that change. CONFIRMED is
+#: its own group too: nothing was sent, so it is never a write (2026-11-04).
+OUTCOME_GROUP = {"SUCCESS": "written", "ALREADY_PRESENT": "already_present",
+                 "CONFIRMED": "confirmed", "REFUSED": "refused", "FAILED": "failed"}
+
+#: Outcomes that settle a line. A WRITTEN line is shown by one of these.
+SETTLING_OUTCOMES = ("SUCCESS", "ALREADY_PRESENT", "CONFIRMED")
+
+#: The groups in the order the result page shows them, with their headings.
+RESULT_GROUPS = (
+    ("written", "Written to NetSuite"),
+    ("already_present", "Already showing the new quantity"),
+    ("confirmed", "Confirmed: NetSuite already had the approved figure"),
+    ("refused", "Refused, nothing written"),
+    ("failed", "Not written: something went wrong"),
+    ("not_sent", "Approved, not sent to NetSuite yet"),
+    ("excluded", "Left as they are: can't be changed here"),
+    ("given_up", "Left as they are: you stopped trying"),
+    ("no_change", "No change needed"),
+    ("rejected", "Rejected"),
+)
+
+#: Shown when an attempt's own sentence is missing. Never the raw error: that is
+#: in the write history, behind the scenes.
+NO_MESSAGE = "Not written. The details are in the tool's write history."
+
+
+@dataclass
+class ResultLine:
+    line: Line
+    group: str  # a RESULT_GROUPS key
+    previous: Optional[Decimal]  # what NetSuite held just before the write
+    new: Optional[Decimal]  # the approved quantity
+    message: str  # plain English
+    attempted_at: Optional[dt.datetime] = None
+
+    @property
+    def arrow(self) -> str:
+        """"line 18: 44 → 52" -- the previous value is what a reversal goes back to."""
+        prev = "?" if self.previous is None else _fmt_qty(self.previous)
+        new = "?" if self.new is None else _fmt_qty(self.new)
+        return f"line {self.line.ns_line_id}: {prev} → {new}"
+
+
+def _fmt_qty(value) -> str:
+    return format(Decimal(value).normalize(), "f")
+
+
+def write_results(conn, shipment_po_id: str) -> list:
+    """
+    Every line the reviewer sees, with what the write did to it, from the LATEST
+    `write_attempts` row of each line -- so the page survives a refresh and stays
+    reachable from the PO. Why an approved line was not sent at all (refused before
+    NetSuite was contacted) comes from its latest `QUANTITY_WRITE_NOT_SENT` audit
+    event, so it survives a restart too (2026-11-04; it used to be held in memory).
+    """
+    view = load_po(conn, shipment_po_id)
+    if view is None:
+        return []
+    ids = [ln.row["id"] for ln in view.shown_lines]
+    written = {ln.row["id"] for ln in view.shown_lines if ln.row["state"] == sc.STATE_WRITTEN}
+    latest: dict = {}
+    if ids:
+        for row in conn.execute(
+            select(write_attempts).where(write_attempts.c.change_id.in_(ids))
+            .where(write_attempts.c.scope == "QUANTITY")
+        ).mappings():
+            # A WRITTEN line is shown by the attempt that settled it. A later
+            # attempt can exist -- a second tab or a double submit racing the
+            # first, refused as "already shows" -- and `write_path` keeps the line
+            # WRITTEN; taking that newest row showed a written line as refused.
+            if row["change_id"] in written and row["outcome"] not in SETTLING_OUTCOMES:
+                continue
+            if row["attempt_no"] > latest.get(row["change_id"], {}).get("attempt_no", 0):
+                latest[row["change_id"]] = dict(row)
+    messages_by = _attempt_messages(conn, ids)
+    not_sent = _not_sent_reasons(conn, ids)
+    out = []
+    for ln in view.shown_lines:
+        attempt = latest.get(ln.row["id"])
+        new = ln.row["approved_quantity"]
+        reason = not_sent.get(ln.row["id"])
+        unwritten = (ln.row["state"] in (sc.STATE_APPROVED, sc.STATE_WRITE_FAILED)
+                     and ln.row["quantity_write_status"] in ("APPROVED", "FAILED"))
+        if (attempt is not None and unwritten and reason is not None
+                and reason[1] > attempt["attempted_at"]):
+            # Refused before contact AFTER its last attempt (production writes
+            # switched off since, say): the newer reason is the one that applies.
+            out.append(ResultLine(ln, "not_sent", ln.row["current_quantity"], new, reason[0]))
+        elif attempt is not None:
+            # "Previous" is what a reversal goes back to. For ALREADY_PRESENT the
+            # attempt re-read the NEW value (that is the point of it), so the
+            # before is what the line held when the proposal was made.
+            previous = (ln.row["current_quantity"] if attempt["outcome"] == "ALREADY_PRESENT"
+                        else attempt["previous_quantity"])
+            group = ("given_up" if ln.row["state"] == sc.STATE_DISCARDED
+                     else OUTCOME_GROUP[attempt["outcome"]])
+            out.append(ResultLine(
+                ln, group, previous, new,
+                messages_by.get((ln.row["id"], attempt["attempt_no"])) or NO_MESSAGE,
+                attempt["attempted_at"]))
+        elif ln.disposition in ("block", "refused"):
+            out.append(ResultLine(ln, "excluded", ln.row["current_quantity"], None,
+                                  ln.exclusion_short))
+        elif (ln.row["state"] == sc.STATE_DISCARDED and ln.row["human_verdict"] == "ACCEPTED"
+              and ln.row["quantity_write_status"] in ("APPROVED", "FAILED")):
+            # Given up with NO attempt row: refused before NetSuite was contacted
+            # (no connection, production writes off), then left as it is. Checked
+            # before "not sent", which would otherwise claim it is still waiting.
+            out.append(ResultLine(ln, "given_up", ln.row["current_quantity"], new,
+                                  "Approved, then left as it is. Nothing was sent to "
+                                  "NetSuite for it."))
+        elif ln.row["quantity_write_status"] in ("APPROVED", "FAILED"):
+            out.append(ResultLine(ln, "not_sent", ln.row["current_quantity"], new,
+                                  reason[0] if reason is not None
+                                  else "Approved, but not sent to NetSuite yet."))
+        elif ln.row["human_verdict"] == "REJECTED":
+            out.append(ResultLine(ln, "rejected", ln.row["current_quantity"], None,
+                                  ln.row["human_verdict_note"] or ""))
+        elif ln.row["human_verdict"]:
+            out.append(ResultLine(ln, "no_change", ln.row["current_quantity"], None,
+                                  "Already correct in NetSuite; nothing to write."))
+    # In NetSuite line order ("line 18: 44 → 52"), which is how she finds them
+    # there; lines with no NetSuite line last.
+    out.sort(key=lambda r: (r.line.ns_line_id is None,
+                            int(r.line.ns_line_id) if str(r.line.ns_line_id or "").isdigit()
+                            else 0, str(r.line.ns_line_id or "")))
+    return out
+
+
+#: Literal, not imported: the review app may take `write_po_batch` and nothing else
+#: from the write side (`test_review_app_never_imports_netsuite_client`).
+NOT_SENT_EVENT = "QUANTITY_WRITE_NOT_SENT"
+
+
+def _not_sent_reasons(conn, change_ids: list) -> dict:
+    """change id -> (message, when) of its LATEST not-sent event: a refusal decided
+    before NetSuite was contacted, which leaves no `write_attempts` row."""
+    if not change_ids:
+        return {}
+    out: dict = {}
+    for row in conn.execute(
+        select(audit_log.c.change_id, audit_log.c.occurred_at, audit_log.c.detail_json)
+        .where(audit_log.c.change_id.in_(change_ids))
+        .where(audit_log.c.event == NOT_SENT_EVENT)
+        .order_by(audit_log.c.occurred_at)
+    ):
+        try:
+            message = json.loads(row.detail_json or "{}").get("message") or ""
+        except ValueError:
+            continue
+        if message:
+            out[row.change_id] = (message, row.occurred_at)  # ascending: last wins
+    return out
+
+
+def _attempt_messages(conn, change_ids: list) -> dict:
+    """(change id, attempt no) -> the plain message `write_path` recorded for it."""
+    if not change_ids:
+        return {}
+    out = {}
+    for row in conn.execute(
+        select(audit_log.c.change_id, audit_log.c.detail_json)
+        .where(audit_log.c.change_id.in_(change_ids))
+        .where(audit_log.c.event.like("QUANTITY_WRITE_%"))
+    ):
+        try:
+            detail = json.loads(row.detail_json or "{}")
+        except ValueError:
+            continue
+        if detail.get("attempt_no") is not None:
+            out[(row.change_id, detail["attempt_no"])] = detail.get("message") or ""
+    return out
+
+
+def has_write_results(conn, shipment_po_id: str) -> bool:
+    """Whether this PO has anything for the result page: an attempt, or an approved
+    line not yet sent."""
+    return conn.execute(
+        select(proposed_changes.c.id)
+        .where(proposed_changes.c.shipment_po_id == shipment_po_id)
+        .where(proposed_changes.c.quantity_write_status != "NONE")
+        .limit(1)
+    ).first() is not None
+
+
+def _unwritten(conn, shipment_po_id: str) -> list:
+    """(change id, latest attempt outcome or None) for each approved, unwritten line."""
+    pc, wa = proposed_changes, write_attempts
+    rows = conn.execute(
+        select(pc.c.id).where(pc.c.shipment_po_id == shipment_po_id)
+        .where(pc.c.state.in_((sc.STATE_APPROVED, sc.STATE_WRITE_FAILED)))
+        .where(pc.c.quantity_write_status.in_(("APPROVED", "FAILED")))
+    ).scalars().all()
+    out = []
+    for change_id in rows:
+        latest = conn.execute(
+            select(wa.c.outcome).where(wa.c.change_id == change_id)
+            .where(wa.c.scope == "QUANTITY").order_by(wa.c.attempt_no.desc()).limit(1)
+        ).scalar()
+        out.append((change_id, latest))
+    return out
+
+
+def retryable_count(conn, shipment_po_id: str) -> int:
+    """Lines worth sending again: unwritten, and NOT refused. A refused line --
+    closed, edited in NetSuite, or rejected by NetSuite -- is refused again on
+    every try; it needs a person, and `give_up` is the way out for it."""
+    return sum(1 for _cid, outcome in _unwritten(conn, shipment_po_id) if outcome != "REFUSED")
+
+
+def unwritten_count(conn, shipment_po_id: str) -> int:
+    return len(_unwritten(conn, shipment_po_id))
+
+
+def give_up(engine, shipment_po_id: str, *, reviewer: str, now: dt.datetime) -> int:
+    """
+    Leave every approved-but-unwritten line of one PO as it is in NetSuite: the
+    reviewer's decision to stop trying (WRITE_FAILED / APPROVED -> DISCARDED, both
+    legal HUMAN transitions). The line's attempts stay as history; nothing is sent.
+    Without this, a line that can never be written -- closed, edited elsewhere --
+    would keep its PO in the queue for good.
+    """
+    pc = proposed_changes
+    count = 0
+    with engine.begin() as conn:
+        for change_id, _outcome in _unwritten(conn, shipment_po_id):
+            row = conn.execute(select(pc).where(pc.c.id == change_id)).mappings().one()
+            sc.assert_transition(conn, row["state"], sc.STATE_DISCARDED)
+            conn.execute(pc.update().where(pc.c.id == change_id)
+                         .values(state=sc.STATE_DISCARDED, updated_at=now))
+            conn.execute(audit_log.insert(), {
+                "id": sc.new_id(), "occurred_at": now, "workflow": WORKFLOW,
+                "actor": reviewer, "actor_kind": "HUMAN", "event": "WRITE_GIVEN_UP",
+                "message_id": None, "shipment_id": row["shipment_id"], "change_id": change_id,
+                "from_state": row["state"], "to_state": sc.STATE_DISCARDED,
+                "detail_json": json.dumps({"approved_quantity": row["approved_quantity"]},
+                                          default=str),
+            })
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------

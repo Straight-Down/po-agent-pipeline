@@ -529,8 +529,8 @@ name — and because this ruling can change.
 
 ## 14. The write path re-reads every line and confirms it is still OPEN
 
-**BUILT 2026-11-02** in `write_path.write_approved_quantity` (per line; the per-PO batch of RUNBOOK
-§11 decision 2 is not built yet). Decided 2026-09-30; build plan Phase 4 item 10 carries the full
+**BUILT 2026-11-02** in `write_path` -- per PO in `write_po_batch` (RUNBOOK §11 decision 2), and per
+line in its fallback `write_approved_quantity`, sharing one set of refusals (`_reread_refusal`). Decided 2026-09-30; build plan Phase 4 item 10 carries the full
 reasoning.
 
 **The existence check is what stops the tool creating PO lines (measured 2026-11-02).** NetSuite
@@ -588,8 +588,10 @@ the last of them**, including the two this document had raised as proposals:
 | Approver (§13) | OPEN since the architecture doc | **Paula only**, no delegation |
 
 **What is left is work, not decisions.** Entries 1, 4 and 5 are built in review_app v1 (2026-09-30).
-Entry 3 (assignment groups) is still DECIDED BUT UNBUILT: v1 REFUSES to render a PO holding one,
-and NEEDS_RESOLUTION, rather than guess at a picker no real data has exercised. Entry 14 (re-read
+Entry 3 (assignment groups) is still DECIDED BUT UNBUILT. Since 2026-11-02 a PO holding one, or a
+NEEDS_RESOLUTION line, is shown with those lines LEFT OUT of Approve and listed as can't be changed
+(no longer refused outright) -- there is still no picker, rather than guess at one no real data
+has exercised. Entry 14 (re-read
 open state at write time) is built in `write_path` (2026-11-02), per line; the per-PO batch is not. Entry 12 is the only
 one of the four rulings that needed code, and it has it.
 

@@ -175,17 +175,18 @@ heavily than the code it can read. Known drift as of 2026-09-14:
   `ingest.py`, `schema.py`, `extraction_schema.py`, `claude_extractor.py`,
   `document_parsers.py`, `attachment_classifier.py`, `size_vocabulary.py`,
   `canonical.py`, `config.py`, `carton_backing.py`, alembic migrations
-  0001-0014, and ten test
+  0001-0016, and ten test
   modules as of 2026-11-02 — plus, since Phase 2 closed on 2026-09-14, the mailbox intake:
   `graph_client.py` (a four-method Graph interface with a mock and a real
   client), `poller.py` (the polling job and the content-addressed attachment
   store) and `extract_pending.py` (the ingest -> extraction driver, a separate
   command by design). Since 2026-09-30, `review_app/`: the Phase 3 review UI
-  v1 (local FastAPI, 127.0.0.1, no auth; approving sets APPROVED and stops).
-  Since 2026-11-02, `write_path.py` (`write_approved_quantity`: one approved
-  line's quantity to NetSuite, re-read first, refusals returned, every attempt
-  recorded) and `test_write_path.py` -- built and tested, not yet wired to
-  Approve.
+  v1 (local FastAPI, 127.0.0.1, no auth; since 2026-11-02 Approve writes to
+  NetSuite through `write_po_batch` and shows a result page).
+  Since 2026-11-02, `write_path.py` (`write_po_batch`: one PO's approved
+  quantities in one PATCH, re-read before and after, refusals returned, an
+  attempt row per line; `write_approved_quantity` is its per-line fallback) and
+  `test_write_path.py` -- wired to the review app's Approve on 2026-11-02.
 - "Nothing here has touched production data" should be re-confirmed rather
   than assumed, given how much has been built since.
 
@@ -324,7 +325,9 @@ not as history - a rule without its failure mode gets rationalised away.
   `quantity`.** A second slip adds to what this tool last wrote. Reading the
   base back off the line is an echo (§8 lesson 13) and compounds its own
   errors; the base comes from `proposed_changes` in `WRITTEN` state joined to
-  a SUCCESSFUL `write_attempts` row. NetSuite's value is a consistency check
+  a `write_attempts` row that settles it: SUCCESS, ALREADY_PRESENT (below), or
+  CONFIRMED (the line already held the approved figure; nothing sent).
+  NetSuite's value is a consistency check
   only — where it disagrees, propose nothing and flag with both numbers.
 - **Never backfill `write_attempts` to quiet the PRE_EXISTING_RECEIPT wave.**
   Writing "we wrote N" for a quantity this tool did not write fabricates the
@@ -487,22 +490,40 @@ not as history - a rule without its failure mode gets rationalised away.
   as false positives against the stale copy.
 - **The review app reaches NetSuite through ONE function and nothing else**
   (narrowed 2026-11-02, RUNBOOK §11 Phase 4 decision 2): `from write_path import
-  write_approved_quantity`, under that name, called without `client=`. Never
+  write_po_batch`, under that name, called without `client=`. Never
   `netsuite_client`, `matcher` or `ingest`, never `import write_path`, never a
-  second name. `test_review_app_never_imports_netsuite_client` pins the import,
-  the call's keywords AND the function's signature, checks a fresh
-  interpreter's `sys.modules`, and self-tests its scanner against ten widenings.
+  second name -- the per-line `write_approved_quantity` included, which is the
+  batch's internal fallback. `test_review_app_never_imports_netsuite_client` pins
+  the import, the call's keywords AND the function's signature, checks a fresh
+  interpreter's `sys.modules`, and self-tests its scanner against eleven widenings.
   Widening any of that is a decision: change `PERMITTED_*` in the test on purpose,
-  never delete the test to make room. Not wired yet: Approve still sets APPROVED
-  and stops.
+  never delete the test to make room. Wired 2026-11-02: Approve records the
+  verdicts, then calls `write_po_batch(engine, shipment_po_id)` while she waits.
+- **No test may reach live NetSuite through the review app.** Approve calls
+  `write_po_batch` without a client (it may not pass one), and the default client
+  is built from `.env` -- the sandbox. `conftest.py` and `test_review_app.py`
+  install a stand-in with no config, which the write path refuses before sending
+  anything; a test that wants writes installs a fake with `World.netsuite` and
+  `_World` restores the stand-in. Never remove that stand-in to "simplify".
 - **The write path sends `quantity` and nothing else** (2026-11-02). No date
   field, `expectedReceiptDate` included; `custcol_sd_fg_excluderepspark` never.
   `write_path._assert_quantity_only` raises before sending otherwise. It
   re-reads the line first and REFUSES (records `outcome='REFUSED'`, sends
   nothing) a line that is closed, not open, gone, or whose quantity no longer
-  equals the proposal's `current_quantity`. Do not "fix" a refusal of a line
-  already at the new value by recording it as SUCCESS: that claims a write the
-  tool cannot prove it made, and it becomes the accumulation base.
+  equals the proposal's `current_quantity`. A line already at the new value is
+  never recorded SUCCESS -- that claims a write the tool cannot prove it made.
+  It is **ALREADY_PRESENT** (Kiko, 2026-11-02; migration 0015) ONLY when an
+  earlier attempt of the SAME proposal **failed after the request was sent**,
+  with exactly that value (a timeout, a dropped link, a 204 the closing re-read
+  disagreed with; never a 400, a permission refusal or a REFUSED row), and the
+  line is still open (`write_path._proven_earlier_attempt`). "Sent" is decided by
+  the CLIENT (`netsuite_client.request_was_sent`, 2026-11-04): a local error or a
+  connection never made records `{}` as the payload and never qualifies -- it
+  cannot be evidence our write landed. Do not record the intended payload on such
+  a failure, and do not re-read and credit the line after one. That settles
+  it: WRITTEN, and counted by the accumulation base. A matching value alone never
+  does: no qualifying attempt on record means refused as "already shows". Do not
+  widen the guard, and do not insert a `write_attempts` row to satisfy it.
 - **"Is any line open?" must read `change_candidates` as well as the row.** A
   line with no chosen target (NEEDS_RESOLUTION) has `ns_line_is_open` NULL and
   its open candidates in `change_candidates` (Requirements §2). Reading the row
@@ -581,4 +602,61 @@ not as history - a rule without its failure mode gets rationalised away.
   there let a re-run of the same email propose the slip's figure outright onto a
   received line (`test_the_receipt_rule_survives_a_second_sighting`). `ACCUMULATED`
   (lines this tool wrote) is untouched - Paula's 2026-09-16 ruling stands.
+- **A write's recording failure is caught -- and SURFACED, never silent** (Kiko,
+  2026-11-02). `write_path` catches a failure to write `write_attempts` so its
+  caller still gets a per-line result. Being caught, it also has to be:
+  - logged (CRITICAL when the write reached NetSuite, ERROR otherwise);
+  - appended to the unrecorded-writes file (`config.unrecorded_writes_path`,
+    outside the database, because the database is what just failed);
+  - kept in `write_path.unrecorded_failures`.
+
+  Every review app page shows a banner while the file lists a write that
+  reached, or may have reached, NetSuite (`reached_netsuite` true or "unknown":
+  a timeout after sending counts), because a write with no row is the worst
+  outcome in this system. The catch once hid a dropped SQL Server link: a test failed as an
+  "assertion" the harness would not re-run. So tests call the write functions
+  through `test_write_path.guarded`, which re-raises a swallowed recording
+  failure in the test's own call phase. Never call them directly from a test,
+  and never narrow the catch back to a bare log line. Tests never touch the
+  real file: conftest and test_write_path point it at a temp file.
+- **The result page shows a WRITTEN line by the attempt that SETTLED it, not the
+  newest attempt** (2026-11-04, `review_app/data.write_results`). A second tab or
+  a script-less double submit races the first write; the loser re-reads, finds
+  the new value and records REFUSED, and `write_path` rightly keeps the line
+  WRITTEN. Taking the highest `attempt_no` showed that written line under
+  "Refused", contradicting its state. Likewise a line given up with NO attempt
+  row (refused before NetSuite was contacted) is "given up", not "not sent yet".
+  `test_a_written_line_is_shown_by_the_attempt_that_wrote_it`,
+  `test_a_line_given_up_before_it_was_ever_sent_says_so`.
+- **A line already at its approved figure is CONFIRMED, never sent and never a
+  write** (Kiko, 2026-11-04; migration 0016). If the re-read finds the line
+  unchanged since the proposal AND equal to the approved figure (Decimal, so
+  `5.0 == 5.000`), `write_path` records outcome CONFIRMED with `{}` and leaves it
+  out of the PATCH. It used to send a same-value PATCH, record SUCCESS and show
+  "5 → 5" under Written -- claiming a write that changed nothing. CONFIRMED
+  settles the line (WRITTEN state) and `ingest._line_history` counts it as the
+  base, like ALREADY_PRESENT; the result page shows it in its own group. The base
+  it supplies is the APPROVED figure, confirmed on the line at write time -- not
+  a claim that this tool wrote it. That is why it differs from the forbidden
+  `write_attempts` backfill above: Paula approved that figure as this
+  shipment's total, and the line was read holding it.
+- **A refusal decided before NetSuite is contacted goes to `audit_log`
+  (`QUANTITY_WRITE_NOT_SENT`), never to `write_attempts`, and never only to
+  memory** (Kiko, 2026-11-04). No live connection, production writes off, a
+  database precondition. A REFUSED attempt row would read "refused every time"
+  and drop "send again" for a cause that is fixable; holding the reason in the
+  app's memory lost it on restart, after which the line read "approved, but not
+  sent yet". `review_app/data.write_results` reads it from the audit.
+- **`NetSuiteAuthError` is classified PERMISSION -- unless an earlier try of the
+  same request may have landed** (Kiko, 2026-11-04). A 401 whose token refresh
+  then FAILS raises it; NetSuite applied nothing on that try, and as "OTHER" it
+  read as "may have landed": eligible for ALREADY_PRESENT, and the batch re-read
+  and could credit a value someone else typed. A 401 the refresh cured and that
+  came back anyway was already a `NetSuitePermissionError`. **But a final error
+  speaks for the LAST try only.** If an earlier try timed out or dropped after
+  sending (`netsuite_client.request_may_have_applied`), it may have landed: the
+  batch treats the request as unconfirmed (closing re-read decides) and
+  `_error_kind` records TRANSIENT, never PERMISSION or VALIDATION. Classifying by
+  the final error alone recorded "nothing was changed" for a write that had
+  landed and stranded the line for good (caught in review, 2026-11-04).
 - <add the next one here>

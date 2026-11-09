@@ -18,6 +18,15 @@ from typing import Optional
 #: (category, phrase the matcher writes, what Paula reads). Matched in order on
 #: the matcher's `attention_reason`; one sentence per category found.
 REASON_CATEGORIES: tuple[tuple[str, str, str], ...] = (
+    # Never below what is ordered (2026-11-09). The matcher writes this reason FOR
+    # the reviewer -- the line's figures, how much of the whole PO the slip covers,
+    # what to do -- so `reasons` shows the matcher's own sentence (`_own_sentence`)
+    # and this text is only the fallback.
+    ("below_ordered", "The tool never proposes a quantity below what is ordered",
+     "This packing slip ships less than is ordered on this line, and the tool never "
+     "proposes a quantity below what is ordered, so it hasn't proposed one. If more is "
+     "coming, nothing needs changing. If this is the last shipment, the PO needs "
+     "reducing — do that in NetSuite."),
     # The figures are added from the row by `reasons(..., row=)`; this is the
     # fallback when they are not to hand. Never a combined total (2026-10-21).
     ("pre_existing", "from before this tool tracked it",
@@ -60,6 +69,9 @@ REASON_CATEGORIES: tuple[tuple[str, str, str], ...] = (
 
 UNRECOGNISED = "This line needs a look. What the tool noted is under Details."
 
+#: The never-below-ordered phrase on its own, for `is_below_ordered`.
+BELOW_ORDERED_PHRASE = next(p for k, p, _ in REASON_CATEGORIES if k == "below_ordered")
+
 
 def reasons(attention_reason: Optional[str], row: Optional[dict] = None) -> list[str]:
     """Plain sentences for a line's reasons; empty when there are none. Given the
@@ -67,9 +79,32 @@ def reasons(attention_reason: Optional[str], row: Optional[dict] = None) -> list
     text = attention_reason or ""
     if not text.strip():
         return []
-    found = [(_received_figures(row) if key == "pre_existing" and row else None) or plain
-             for key, phrase, plain in REASON_CATEGORIES if phrase.lower() in text.lower()]
+    found = []
+    for key, phrase, plain in REASON_CATEGORIES:
+        if phrase.lower() not in text.lower():
+            continue
+        if key == "pre_existing" and row:
+            found.append(_received_figures(row) or plain)
+        elif key == "below_ordered":
+            found.append(_own_sentence(text, phrase) or plain)
+        else:
+            found.append(plain)
     return found or [UNRECOGNISED]
+
+
+def _own_sentence(text: str, phrase: str) -> Optional[str]:
+    """The one reason (the matcher joins them with '; ') that carries `phrase`,
+    verbatim. Used only for a reason the matcher writes in the reviewer's words."""
+    for part in text.split("; "):
+        if phrase.lower() in part.lower():
+            return part.strip()
+    return None
+
+
+def is_below_ordered(row: dict) -> bool:
+    """The matcher refused a figure below the line's ordered quantity (2026-11-09).
+    Read from the reason text: the stored basis stays FIRST_SHIPMENT for it."""
+    return BELOW_ORDERED_PHRASE.lower() in str(row.get("attention_reason") or "").lower()
 
 
 def _received_figures(row: dict) -> Optional[str]:
@@ -101,6 +136,12 @@ def _dec(value) -> Optional[Decimal]:
 
 #: Grouped explanations for a disabled Approve, by what blocks it.
 BLOCK_MESSAGES = {
+    "below_ordered": (
+        "This packing slip ships less than is ordered on these lines, and the tool never "
+        "lowers an ordered quantity, so it hasn't proposed a number. If more is coming, "
+        "nothing needs changing: reject this PO here to clear it from your list. If this is "
+        "the last shipment, the PO needs reducing — do that in NetSuite, using the figure "
+        "given for each line."),
     "pre_existing": (
         "NetSuite already shows goods received on these lines, and those figures don't "
         "agree with the ordered quantity or with this packing slip. The tool doesn't add a "
@@ -128,6 +169,7 @@ BLOCK_MESSAGES = {
 #: The same reasons in a few words, for one line in a list (the result page, the
 #: lines Approve leaves out).
 EXCLUSION_SHORT = {
+    "below_ordered": "this slip ships less than is ordered, and the tool never lowers an order",
     "pre_existing": "already received in NetSuite, and the figures disagree",
     "disputed": "changed in NetSuite since the tool last saw it",
     "not_updatable": "no open line in NetSuite to update",
@@ -151,6 +193,8 @@ def block_kind(line) -> str:
         return "pre_existing"
     if basis == "DISPUTED":
         return "disputed"
+    if is_below_ordered(row):
+        return "below_ordered"
     return "no_quantity"
 
 

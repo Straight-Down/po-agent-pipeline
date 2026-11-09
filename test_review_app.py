@@ -72,7 +72,7 @@ def _build_db(path: Path):
 
 
 class World:
-    """One ingested shipment covering four POs, each shaped for one behaviour."""
+    """One ingested shipment covering five POs, each shaped for one behaviour."""
 
     def __init__(self, tmp: Path):
         import ingest as ing
@@ -105,11 +105,18 @@ class World:
             # PO 1900: flagged (medium), but its figure ALREADY matches NetSuite.
             line(po="1900", size="S", qty=5, conf="medium",
                  note="style inherited from the row above"),
+            # PO 2000: the slip ships less than is ordered -> flagged, nothing proposed
+            # (never below ordered, 2026-11-09; the PO 1657 rehearsal).
+            line(po="2000", size="S", qty=37),
         ], parser="claude-assisted", vendor_name="Inprotex",
             ship_info={"etd": "2026/6/27 19:40", "eta": "2026/6/27 16:45"})
+        # PO 1662 orders BELOW the slip (8 < 9, 45 < 50), so both changes are
+        # proposable. It was 12 and 71, the demo's reductions, until 2026-11-09, when a
+        # figure below ordered stopped being proposed (RUNBOOK section 4).
         client = NetSuiteClient(mock_data={
-            "1662": [ns_line("18", size="S", qty=12), ns_line("19", size="M", qty=71),
+            "1662": [ns_line("18", size="S", qty=8), ns_line("19", size="M", qty=45),
                      ns_line("20", size="L", qty=30)],
+            "2000": [ns_line("14", size="S", qty=216)],
             "1700": [ns_line("1", size="S", qty=5), ns_line("2", size="S", qty=5)],
             "1800": [ns_line("1", size="S", qty=5, is_open=False)],
             "1900": [ns_line("1", size="S", qty=5)],
@@ -248,10 +255,10 @@ def test_the_po_page() -> None:
         check("receipt_date" not in html and 'type="date"' not in html
               and "receipt date" not in html.lower() and 'value="2026' not in html,
               "and there is no receipt date to enter at all (2026-11-02)")
-        # PO 1662: S 9 vs 12, M 50 vs 71, L 30 vs 30 -- under on both that differ.
-        check("This packing slip ships 89 units against 113 ordered on these lines: less than "
+        # PO 1662: S 9 vs 8, M 50 vs 45, L 30 vs 30 -- over on both that differ.
+        check("This packing slip ships 89 units against 83 ordered on these lines: more than "
               "ordered on every line that differs." in html
-              and "2 under, 1 equal" in html,
+              and "2 over, 0 under, 1 equal" in html,
               "the ordered-versus-shipped summary in words, the counts under Details (§4)")
 
 
@@ -512,8 +519,8 @@ def test_approve_writes_to_netsuite_and_shows_what_changed() -> None:
 
         page_one = c.get(f"/po/{w.po_id('1662')}/result").text
         groups = sections(page_one)
-        check("line 18: 12 → 9" in groups.get("Written to NetSuite", "")
-              and "line 19: 71 → 50" in groups.get("Written to NetSuite", ""),
+        check("line 18: 8 → 9" in groups.get("Written to NetSuite", "")
+              and "line 19: 45 → 50" in groups.get("Written to NetSuite", ""),
               "the result lists each written line as previous -> new", str(list(groups)))
         written = groups.get("Written to NetSuite", "")
         check(written.index("line 18") < written.index("line 19"),
@@ -648,7 +655,7 @@ def test_unwritten_lines_can_be_sent_again() -> None:
         r = c.post(f"/po/{w.po_id('1662')}/write", data={"csrf_token": w.app.state.csrf},
                    follow_redirects=False)
         groups = sections(c.get(f"/po/{w.po_id('1662')}/result").text)
-        check(r.status_code == 303 and "line 18: 12 → 9" in groups.get("Written to NetSuite", "")
+        check(r.status_code == 303 and "line 18: 8 → 9" in groups.get("Written to NetSuite", "")
               and "Send the unwritten lines again" not in groups,
               "sending again writes them, without approving again", str(list(groups)))
         r = c.post(f"/po/{w.po_id('1662')}/write", data={"csrf_token": "forged"})
@@ -680,7 +687,7 @@ def test_a_failed_write_stays_in_the_queue_until_dealt_with() -> None:
                    follow_redirects=False)
         m = w.lines("1662")["M"]
         check(r.status_code == 303 and m["state"] == "DISCARDED"
-              and ns.lines[19]["quantity"] == 71,
+              and ns.lines[19]["quantity"] == 45,
               "leaving it as it is discards the line and sends nothing", m["state"])
         groups = sections(c.get(f"/po/{w.po_id('1662')}/result").text)
         check("line 19" in groups.get("Left as they are: you stopped trying", "")
@@ -711,7 +718,7 @@ def test_a_written_line_is_shown_by_the_attempt_that_wrote_it() -> None:
         check(s["state"] == "WRITTEN", "premise: line 18 was written", s["state"])
         insert_attempt(w.engine, s["id"], 2, "REFUSED", {}, "OTHER", line="18")
         groups = sections(c.get(f"/po/{w.po_id('1662')}/result").text)
-        check("line 18: 12 → 9" in groups.get("Written to NetSuite", "")
+        check("line 18: 8 → 9" in groups.get("Written to NetSuite", "")
               and "line 18" not in groups.get("Refused, nothing written", ""),
               "line 18 stays under written, with the value it was written over",
               str(list(groups)))
@@ -1006,6 +1013,7 @@ def test_no_internal_detail_outside_the_details_toggle() -> None:
             "PO 1700 (refused)": c.get(f"/po/{w.po_id('1700')}").text,
             "PO 1800 (blocked)": c.get(f"/po/{w.po_id('1800')}").text,
             "PO 1900": c.get(f"/po/{w.po_id('1900')}").text,
+            "PO 2000 (below ordered)": c.get(f"/po/{w.po_id('2000')}").text,
             "stale form": c.post(f"/po/{w.po_id('1662')}/approve",
                                  data={"csrf_token": w.app.state.csrf, "fingerprint": "0"}).text,
             "expired form": c.post(f"/po/{w.po_id('1662')}/approve", data={}).text,
@@ -1018,6 +1026,49 @@ def test_no_internal_detail_outside_the_details_toggle() -> None:
               "Details on any page", str(leaks or "none"))
         check("<details" in pages["PO 1662"] and "State: NEEDS_ATTENTION" in pages["PO 1662"],
               "and the internal detail is still there, behind the toggle")
+
+
+def test_a_slip_below_ordered_is_shown_with_its_figures_and_left_out() -> None:
+    section("below ordered (2026-11-09): the figures shown, nothing approvable, reject clears it")
+    import html as htmllib
+
+    with _World() as w:
+        row = w.lines("2000")["S"]
+        check(row["state"] == "NEEDS_ATTENTION" and row["proposed_quantity"] is None
+              and float(row["current_quantity"]) == 216.0,
+              "premise: 216 ordered, slip 37, nothing proposed",
+              f"{row['state']}/{row['proposed_quantity']}/{row['current_quantity']}")
+        c = w.client()
+        page = htmllib.unescape(main_text(c.get(f"/po/{w.po_id('2000')}").text))
+        check("216 ordered, 37 on this slip" in page
+              and "This slip lists 37 of the 216 units still to receive on PO 2000 (216 "
+                  "ordered, none received yet)." in page
+              and "If more is coming, nothing needs changing." in page
+              and "in NetSuite, change line 14 from 216 to 37." in page,
+              "the reviewer reads both figures, the PO's coverage and the figure to enter, "
+              "in the main text")
+        check("The packing slip gives no quantity" not in page,
+              "and is never told the slip gave no quantity")
+        # The under-only summary branch, which PO 1662 exercised until 2026-11-09.
+        check("This packing slip ships 37 units against 216 ordered on these lines: less "
+              "than ordered on every line that differs." in page,
+              "the summary says less than ordered, in words", page[:0])
+        from review_app import data as rdata
+
+        with w.engine.connect() as conn:
+            view = rdata.load_po(conn, w.po_id("2000"))
+        check(not view.can_approve and [ln.disposition for ln in view.lines] == ["block"]
+              and view.lines[0].exclusion_short.startswith("this slip ships less than is ordered"),
+              "there is nothing to approve: the line is left out, as below ordered",
+              f"{view.can_approve}/{[ln.disposition for ln in view.lines]}")
+        r = c.post(f"/po/{w.po_id('2000')}/reject",
+                   data={**w.form(c, "2000"), "reason": "more is coming", "confirmed": "yes"},
+                   follow_redirects=False)
+        after = w.lines("2000")["S"]
+        check(r.status_code == 303 and after["human_verdict"] == "REJECTED",
+              "Reject records the decision on the line", f"{r.status_code}/{after['human_verdict']}")
+        check("2000" not in main_text(c.get("/").text),
+              "and the PO leaves the queue, with nothing sent anywhere")
 
 
 def test_the_wording_map_tracks_what_the_matcher_writes() -> None:
@@ -1071,6 +1122,36 @@ def test_the_wording_map_tracks_what_the_matcher_writes() -> None:
     check(wording.block_explanations([blocked(ns_line_is_open=False)])[0][0]
           == wording.BLOCK_MESSAGES["not_updatable"],
           "a line with no open NetSuite line gets the not-updatable message")
+
+    # Never below ordered (2026-11-09): the matcher's own sentence is shown whole --
+    # it is written for the reviewer -- and only that reason, not its neighbours.
+    below = ("This packing slip ships less than is ordered on NetSuite line 14: 216 ordered, "
+             "37 on this slip. The tool never proposes a quantity below what is ordered, so it "
+             "hasn't proposed one. This slip lists 1,049 of the 4,400 units ordered on PO 1657."
+             " If more is coming, nothing needs changing. If this is the last shipment, the PO "
+             "needs reducing — do that in NetSuite.")
+    got = wording.reasons(below + "; extraction confidence medium: PO carried forward")
+    check(len(got) == 2 and got[0] == below and "work out part of this line" in got[1],
+          "the below-ordered reason is shown verbatim, and the next reason separately",
+          str(got)[:160])
+    # Every summary_sentence branch, by its counts (PO 1662 stopped covering "less
+    # than" and nothing covered "mixed" once the world's figures moved, 2026-11-09).
+    def summ(over, under, equal, matched=3):
+        return SimpleNamespace(shipped_total=89, matched_lines=matched, ordered_on_matched=83,
+                               shipped_on_matched=89, over=over, under=under, equal=equal)
+    for counts, expected in (((2, 0, 1), "more than ordered on every line that differs"),
+                             ((0, 2, 1), "less than ordered on every line that differs"),
+                             ((0, 0, 3), "exactly the ordered quantity on every line"),
+                             ((1, 1, 1), "more than ordered on some lines and less on others")):
+        check(expected in wording.summary_sentence(summ(*counts)),
+              f"summary sentence: {expected}")
+    check("None of its lines matched" in wording.summary_sentence(summ(0, 0, 0, matched=0)),
+          "summary sentence: nothing matched")
+
+    kind = wording.block_kind(blocked(accumulation_basis="FIRST_SHIPMENT", attention_reason=below))
+    check(kind == "below_ordered" and "never lowers an ordered quantity"
+          in wording.BLOCK_MESSAGES[kind],
+          "and the disabled Approve explains it as below ordered, not as 'no quantity'", kind)
 
     many = wording.rows_lost_message({"lines_extracted": 44, "removed": [
         {"reason": "NOT SHIPMENT DATA (no carton backing)"}] * 16})

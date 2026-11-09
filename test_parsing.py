@@ -2689,8 +2689,9 @@ def test_duplicate_key_resolution(tmp: Path) -> None:
         "and to_netsuite_fields still raises LineClosed",
     )
 
-    # -- The ordinary case is untouched: one matching line, no duplicates.
-    c = one([ns("5", 12)], vendor(9))
+    # -- The ordinary case is untouched: one matching line, no duplicates. Ordered 8,
+    #    slip 9: below-ordered figures are never proposed since 2026-11-09.
+    c = one([ns("5", 8)], vendor(9))
     check(c.status == mt.STATUS_PENDING_REVIEW and c.line_id == "5",
           "a single open match still proposes normally", f"{c.status}/{c.line_id}")
     check(c.candidate_lines == [], "and carries no candidate payload")
@@ -2746,17 +2747,24 @@ def test_line_balance_context(tmp: Path) -> None:
     def one(lines, vl):
         return mt.build_proposed_changes([vl], NetSuiteClient(mock_data={"1721": lines}))[0]
 
-    # 1. A normal proposal carries it. 300 ordered, 0 received, this slip 128 --
-    #    a partial delivery is legible from the numbers without the tool saying so.
+    # 1. 300 ordered, 0 received, this slip 128. SUPERSEDED 2026-11-09 (Kiko): this
+    #    asserted "a short slip still PROPOSES". Now the matcher never proposes below
+    #    what is ordered -- it flags (test_never_below_ordered has the detail). The
+    #    five figures still travel on the change, and line_balance itself decides
+    #    nothing: the rule lives in `_accumulated_quantity`.
     c = one([ns(qty=300, recv=0.0)], vendor(128))
-    check(c.status == mt.STATUS_PENDING_REVIEW,
-          "a short slip still PROPOSES -- line_balance gates nothing", c.status)
+    check(c.status == mt.STATUS_NEEDS_ATTENTION and c.proposed_quantity is None,
+          "a short first slip is flagged and proposes nothing (2026-11-09)", c.status)
     check(c.line_balance == {"ns_line_id": "10", "line_quantity": 300,
                              "quantity_received": 0.0, "slip_quantity": 128.0,
                              "outstanding": 300.0},
-          "and carries all five figures", str(c.line_balance))
-    check(c.to_netsuite_fields() == {"quantity": 128},
-          "the write is unaffected", str(c.to_netsuite_fields()))
+          "and still carries all five figures", str(c.line_balance))
+    check(c.to_netsuite_fields() == {},
+          "so there is nothing to write", str(c.to_netsuite_fields()))
+    c = one([ns(qty=100, recv=0.0)], vendor(128))
+    check(c.status == mt.STATUS_PENDING_REVIEW and c.to_netsuite_fields() == {"quantity": 128},
+          "a slip above ordered still proposes, with the figures attached",
+          f"{c.status} {c.to_netsuite_fields()}")
 
     # 2. NO_CHANGE carries it too -- Paula still wants to see the arithmetic on a
     #    line whose quantity happens to already be right.
@@ -2818,9 +2826,10 @@ def test_line_balance_context(tmp: Path) -> None:
         [vendor(128, size="M"), vendor(50, size="L")],
         NetSuiteClient(mock_data={"1721": [ns(size="M", qty=300), ns(size="L", qty=50, line_id="11")]}),
     )}
-    check(changes["M"].status == mt.STATUS_PENDING_REVIEW
+    # The short line is flagged since 2026-11-09; the exact one beside it is not.
+    check(changes["M"].status == mt.STATUS_NEEDS_ATTENTION
           and changes["L"].status == mt.STATUS_NO_CHANGE,
-          "a short line and an exact line coexist, both unflagged",
+          "a short line and an exact line coexist, each judged on its own figures",
           f"{changes['M'].status}/{changes['L'].status}")
     check(changes["M"].line_balance["outstanding"] == 300.0
           and changes["L"].line_balance["outstanding"] == 50.0,
@@ -2833,6 +2842,257 @@ def test_line_balance_context(tmp: Path) -> None:
     for name in ("QuantityMismatch", "ATTENTION_PARTIAL_LINE", "ATTENTION_OVER_SHIPMENT",
                  "_classify_line_balance"):
         check(not hasattr(mt, name), f"no {name} -- the gating version stays cancelled")
+
+
+def test_never_below_ordered(tmp: Path) -> None:
+    section("never below what is ordered (Kiko, 2026-11-09): flagged, never proposed")
+    import datetime as dt
+
+    import matcher as mt
+    from netsuite_client import NetSuiteClient, POLine
+
+    def ns(line_id, style, colour, size, qty, recv=0.0):
+        line = POLine(
+            line_id=str(line_id), item=f"{style} : {style}-{colour}-{size}",
+            style_number=style, vendor_name=None, color=colour, size=size, quantity=qty,
+            units="Ea", expected_receipt_date=dt.date(2026, 8, 1),
+            override_expected_receipt=False, updated_receipt_date=None, is_open=True,
+        )
+        line.quantity_received = recv
+        return line
+
+    def vendor(style, colour, size, qty, po="1657"):
+        return {"po_number": po, "style_number": style, "color": colour, "size": size,
+                "quantity": qty, "confidence": "high", "note": ""}
+
+    # -- The incident. PO 1657 as Sandbox 2 held it on 2026-11-09 (34 lines, 4,400
+    #    units), and the Legendz slip's eight lines exactly as extracted -- `DFK`
+    #    included, the vendor's transposition of DKF (RUNBOOK section 6 item 13).
+    order = {
+        ("M340016", "CAT"): {"S": 10, "M": 72, "L": 110, "XL": 78, "2X": 30},
+        ("M630018", "DKF"): {"S": 27, "M": 225, "L": 306, "XL": 252, "2X": 81, "3X": 9},
+        ("M630018", "MLT"): {"S": 27, "M": 216, "L": 315, "XL": 243, "2X": 90, "3X": 9},
+        ("M680006", "BLK"): {"M": 59, "L": 104, "XL": 86, "2X": 47, "3X": 4},
+        ("M680009", "DKF"): {"S": 30, "M": 250, "L": 360, "XL": 270, "2X": 80, "3X": 10},
+        ("M680009", "MLT"): {"S": 30, "M": 250, "L": 360, "XL": 270, "2X": 80, "3X": 10},
+    }
+    po_lines, n = [], 0
+    for (style, colour), sizes in order.items():
+        for size, qty in sizes.items():
+            n += 1
+            po_lines.append(ns(n, style, colour, size, qty))
+    check(len(po_lines) == 34 and sum(l.quantity for l in po_lines) == 4400,
+          "premise: the replica is 34 lines ordering 4,400")
+    slip = [vendor("M630018", "DFK", "M", 148), vendor("M630018", "DFK", "L", 205),
+            vendor("M630018", "DFK", "XL", 188), vendor("M630018", "DFK", "2XL", 32),
+            vendor("M630018", "MLT", "M", 37), vendor("M630018", "MLT", "L", 111),
+            vendor("M680009", "DKF", "M", 128), vendor("M680009", "DKF", "L", 200)]
+    changes = mt.build_proposed_changes(slip, NetSuiteClient(mock_data={"1657": po_lines}))
+    matched = [c for c in changes if c.line_id]
+    check(len(matched) == 4 and all(c.proposed_quantity is None
+                                    and c.status == mt.STATUS_NEEDS_ATTENTION for c in matched),
+          "all four matched reductions (216->37, 315->111, 250->128, 360->200) are flagged, "
+          "none proposed", str([(c.current_quantity, c.proposed_quantity, c.status)
+                                for c in matched]))
+    check(all(c.to_netsuite_fields() == {} for c in changes),
+          "and no change on the PO can build a write")
+    m = next(c for c in matched if c.style_number == "M630018" and c.size == "M")
+    check("This packing slip ships less than is ordered on NetSuite line "
+          f"{m.line_id}: 216 ordered, 37 on this slip." in m.attention_reason,
+          "the line's two figures, plainly", m.attention_reason[:120])
+    coverage = ("This slip lists 1,049 of the 4,400 units still to receive on PO 1657 (4,400 "
+                "ordered, none received yet), and nothing on it matches 4 of the PO's 6 "
+                "style/colour groups (M340016 CAT, M630018 DKF, M680006 BLK, M680009 MLT).")
+    check(all(coverage in c.attention_reason for c in matched),
+          "and the WHOLE PO's coverage on every one -- the stronger evidence", coverage)
+    check(all("4 of its lines for this PO match no line on it." in c.attention_reason
+              for c in matched),
+          "saying how many slip lines matched nothing, so a misprinted group can be "
+          "discounted (DFK for DKF)", m.attention_reason[:400])
+    check(m.attention_reason.endswith("If more is coming, nothing needs changing. If this is "
+                                      "the last shipment, the PO needs reducing — in NetSuite, "
+                                      f"change line {m.line_id} from 216 to 37."),
+          "ending with what to do in either case -- including the exact figure to enter",
+          m.attention_reason[-140:])
+    figures = {c.current_quantity: c.attention_reason for c in matched}
+    check(all(f"from {o} to {s}." in figures[o] for o, s in
+              ((216, 37), (315, 111), (250, 128), (360, 200))),
+          "each line carries its own figure: 37, 111, 128, 200")
+    check(all(";" not in c.attention_reason for c in matched),
+          "one reason, no ';' -- the review app shows it whole", "")
+    check(all(c.accumulation.get("basis") == mt.BASIS_FIRST_SHIPMENT
+              and c.accumulation.get("below_ordered") is True for c in matched),
+          "basis stays FIRST_SHIPMENT, marked below_ordered")
+    dfk = [c for c in changes if c.color == "DFK"]
+    check(len(dfk) == 4 and all("no NetSuite line on PO 1657" in c.attention_reason
+                                and "less than is ordered" not in c.attention_reason
+                                for c in dfk),
+          "the misprinted DFK lines keep their own 'not on the PO' reason")
+
+    # -- The rule blocks reductions only.
+    po = {"1721": [ns(10, "W600001", "BLACK", "M", 100)]}
+
+    def one(qty, history=None):
+        return mt.build_proposed_changes(
+            [vendor("W600001", "BLACK", "M", qty, po="1721")], NetSuiteClient(mock_data=po),
+            line_history=history)[0]
+
+    check(one(100).status == mt.STATUS_NO_CHANGE, "slip == ordered: NO_CHANGE, unflagged")
+    over = one(500)
+    check(over.status == mt.STATUS_PENDING_REVIEW and over.proposed_quantity == 500
+          and over.attention_reason == "",
+          "over-shipment is untouched: a plain proposal, no flag (ruling 6)", over.status)
+    short = one(60)
+    check("This slip lists 60 of the 100 units still to receive on PO 1721 (100 ordered, "
+          "none received yet)." in short.attention_reason,
+          "coverage on a one-group PO: units only, no group sentence",
+          short.attention_reason[:220])
+
+    # -- PO-level coverage, when the slip lists at least the whole order.
+    po_two = {"1721": [ns(10, "W600001", "BLACK", "M", 100), ns(11, "W600001", "BLACK", "L", 10)]}
+    covered = mt.build_proposed_changes(
+        [vendor("W600001", "BLACK", "M", 90, po="1721"),
+         vendor("W600001", "BLACK", "L", 40, po="1721")], NetSuiteClient(mock_data=po_two))
+    check(covered[0].proposed_quantity is None
+          and "This slip lists 130 units for PO 1721, against 110 still to receive (110 "
+              "ordered, none received yet)." in covered[0].attention_reason,
+          "a slip listing more than the whole order says so, without calling it partial",
+          covered[0].attention_reason[:200])
+    check(covered[1].proposed_quantity == 40, "and the line above ordered still proposes")
+
+    # -- Coverage is measured against what is STILL TO RECEIVE (Kiko, 2026-11-09):
+    #    against the full ordered total, a PO with earlier receipts reads as far more
+    #    partial than it is. L ordered 100 with 90 received leaves 10 to come; XL was
+    #    received OVER its order and must not cancel out anyone else's shortfall.
+    received = mt.build_proposed_changes(
+        [vendor("W600001", "BLACK", "M", 20, po="1721")],
+        NetSuiteClient(mock_data={"1721": [ns(10, "W600001", "BLACK", "M", 100),
+                                            ns(11, "W600001", "BLACK", "L", 100, recv=90.0),
+                                            ns(12, "W600001", "BLACK", "XL", 10, recv=15.0)]}))
+    check("This slip lists 20 of the 110 units still to receive on PO 1721 (210 ordered "
+          "less 105 already received, counting any line received over its order as zero)."
+          in received[0].attention_reason,
+          "measured against ordered less received, with both figures named -- 110, not 210, "
+          "and the over-received XL counts as zero, not -5, which the sentence says so it "
+          "still adds up", received[0].attention_reason[:360])
+    plain = mt.build_proposed_changes(
+        [vendor("W600001", "BLACK", "M", 20, po="1721")],
+        NetSuiteClient(mock_data={"1721": [ns(10, "W600001", "BLACK", "M", 100),
+                                            ns(11, "W600001", "BLACK", "L", 100, recv=90.0)]}))
+    check("This slip lists 20 of the 110 units still to receive on PO 1721 (200 ordered "
+          "less 90 already received)." in plain[0].attention_reason,
+          "with no over-received line, the measure needs no qualifier",
+          plain[0].attention_reason[:320])
+    # -- Only OPEN lines count toward "still to receive" (Kiko, 2026-11-09). L was
+    #    closed short (100 ordered, 60 received): its 40 will never arrive. XL is
+    #    no longer open (is_open False, not ticked closed). Neither group is
+    #    "missing" either. The figures printed are the counted lines' own, so they
+    #    reconcile: 100 + 50 ordered, 0 + 10 received, 140 still to receive.
+    closed_short = ns(11, "W600001", "BLACK", "L", 100, recv=60.0)
+    closed_short.closed, closed_short.is_open = True, False
+    not_open = ns(12, "W600002", "NAVY", "XL", 80, recv=30.0)
+    not_open.is_open = False
+    still = mt.build_proposed_changes(
+        [vendor("W600001", "BLACK", "M", 20, po="1721")],
+        NetSuiteClient(mock_data={"1721": [ns(10, "W600001", "BLACK", "M", 100),
+                                            closed_short, not_open,
+                                            ns(13, "W600003", "RED", "S", 50, recv=10.0)]}))[0]
+    check("This slip lists 20 of the 140 units still to receive on PO 1721 (150 ordered "
+          "less 10 already received, on its open lines only: 2 lines closed or no longer "
+          "open, expecting nothing further, are left out), and nothing on it matches 1 of the "
+          "PO's 2 open style/colour groups (W600003 RED)." in still.attention_reason,
+          "closed and no-longer-open lines are left out, the sentence says so, and its "
+          "figures reconcile (150 - 10 = 140)", still.attention_reason[:420])
+    check("W600002" not in still.attention_reason,
+          "a group whose only line is no longer open is not called missing")
+    # A slip line matching ONLY a left-out line: its units are not set against what
+    # is still to receive, and the sentence says so (same footing on both sides).
+    vs_closed = mt.build_proposed_changes(
+        [vendor("W600001", "BLACK", "M", 20, po="1721"),
+         vendor("W600001", "BLACK", "L", 40, po="1721")],
+        NetSuiteClient(mock_data={"1721": [ns(10, "W600001", "BLACK", "M", 100),
+                                            closed_short]}))[0]
+    check("This slip lists 20 of the 100 units still to receive" in vs_closed.attention_reason
+          and "1 of its lines for this PO matches only lines that are closed or no longer "
+              "open, so its units are not counted." in vs_closed.attention_reason,
+          "units against a closed line are set aside, and named", vs_closed.attention_reason[:420])
+    # Nothing open on the PO at all: no coverage sentence, rather than "0 of 0".
+    check(mt._po_coverage("1721", [closed_short, not_open],
+                          [vendor("W600001", "BLACK", "L", 5, po="1721")]) == "",
+          "a PO with no open line gets no coverage sentence")
+
+    negative = mt.build_proposed_changes(
+        [vendor("W600001", "BLACK", "M", -5, po="1721")],
+        NetSuiteClient(mock_data={"1721": [ns(10, "W600001", "BLACK", "M", 100)]}))[0]
+    check(negative.proposed_quantity is None and "change line" not in negative.attention_reason,
+          "a negative slip is refused and offers no figure to enter",
+          negative.attention_reason[-160:])
+
+    # -- Many untouched groups are named up to six.
+    wide = [ns(i, f"S{i:03d}", "BLK", "M", 10) for i in range(1, 10)]
+    many = mt.build_proposed_changes([vendor("S001", "BLK", "M", 5, po="1721")],
+                                     NetSuiteClient(mock_data={"1721": wide}))[0]
+    check("nothing on it matches 8 of the PO's 9 style/colour groups (S002 BLK, S003 BLK, "
+          "S004 BLK, S005 BLK, S006 BLK, S007 BLK and 2 more)" in many.attention_reason,
+          "the untouched-group list stops at six", many.attention_reason[:300])
+
+    # -- Seen on an earlier slip, never written: say so, and don't tell her the PO
+    #    needs reducing on the strength of this slip alone.
+    seen = mt.LineHistory(po_number="1721", line_id="10", observed_quantity=100.0,
+                          observed_at="2026-09-01T10:00:00")
+    again = one(60, {("1721", "10"): seen})
+    check(again.proposed_quantity is None
+          and "seen this line on an earlier packing slip (2026-09-01)" in again.attention_reason
+          and "the PO needs reducing" not in again.attention_reason
+          and "change line" not in again.attention_reason
+          and "(this one lists 60), and if that is less than 100, reduce it in NetSuite."
+          in again.attention_reason,
+          "an earlier sighting is stated, changes the advice, and offers NO figure -- the "
+          "tool does not add up slips it never wrote", again.attention_reason[-300:])
+
+    # -- ACCUMULATED onto a written base still adds, and the floor holds there too.
+    wrote = mt.LineHistory(po_number="1721", line_id="10", written_quantity=100.0,
+                           written_at="2026-09-01T10:00:00", written_change_id="c1",
+                           write_count=1, observed_quantity=100.0)
+    acc = one(28, {("1721", "10"): wrote})
+    check(acc.proposed_quantity == 128 and acc.accumulation["basis"] == mt.BASIS_ACCUMULATED,
+          "a second slip still accumulates: 100 written + 28 = 128", str(acc.proposed_quantity))
+    neg = one(-5, {("1721", "10"): wrote})
+    check(neg.proposed_quantity is None and neg.status == mt.STATUS_NEEDS_ATTENTION
+          and "would take NetSuite line 10 below what is ordered: 100 ordered, 95 after this "
+              "slip" in neg.attention_reason,
+          "a total below ordered is refused on the ACCUMULATED path as well",
+          neg.attention_reason[:160])
+    check("change line" not in neg.attention_reason,
+          "and offers no figure derived from a negative slip", neg.attention_reason[-160:])
+
+    # -- The review app's phrase is the one the matcher writes.
+    check(mt.NEVER_BELOW_ORDERED in m.attention_reason, "the shared phrase is in the reason")
+
+    # -- A ';' in a NetSuite value never splits the reason (the review app splits
+    #    reasons on '; ' and would show only the first half).
+    odd = [ns(1, "S1", "BLK; WHT", "M", 10), ns(2, "S2", "RED", "M", 10)]
+    semi = mt.build_proposed_changes([vendor("S2", "RED", "M", 4, po="1721")],
+                                     NetSuiteClient(mock_data={"1721": odd}))[0]
+    check(";" not in semi.attention_reason and "BLK, WHT" in semi.attention_reason,
+          "a NetSuite value carrying ';' is rendered with ','", semi.attention_reason[:220])
+
+    # -- Measured only when needed: a PO with nothing below ordered is never measured.
+    calls = []
+    real = mt._po_coverage
+    try:
+        mt._po_coverage = lambda *a, **k: calls.append(a[0]) or real(*a, **k)
+        mt.build_proposed_changes([vendor("W600001", "BLACK", "M", 500, po="1721")],
+                                  NetSuiteClient(mock_data=po))
+        check(calls == [], "an over-shipment never measures the PO", str(calls))
+        twice = mt.build_proposed_changes(
+            [vendor("W600001", "BLACK", "M", 10, po="1721"),
+             vendor("W600001", "BLACK", "L", 5, po="1721")],
+            NetSuiteClient(mock_data=po_two))
+        check(all(c.proposed_quantity is None for c in twice), "premise: both lines refused")
+        check(calls == ["1721"], "and a PO with refused lines is measured once", str(calls))
+    finally:
+        mt._po_coverage = real
 
 
 def test_colour_resolution(tmp: Path) -> None:
@@ -3336,9 +3596,10 @@ def test_size_value_space_failsafe(tmp: Path) -> None:
               f"size {odd_size!r} produced no silent quantity overwrite")
 
     # And a known alias still matches, so the fail-safe isn't just rejecting everything.
+    # 15 against 10 ordered: a figure below ordered is never proposed (2026-11-09).
     ok = mt.build_proposed_changes(
         [{"po_number": "1721", "style_number": "W520005", "color": "BLACK",
-          "size": "M", "quantity": 5, "confidence": "high", "note": ""}],
+          "size": "M", "quantity": 15, "confidence": "high", "note": ""}],
         client,
     )[0]
     check(ok.status == mt.STATUS_PENDING_REVIEW, "a recognized size still matches normally", ok.status)
@@ -4138,7 +4399,7 @@ def main() -> int:
             test_line_aggregation, test_aggregation_wired_into_parsers,
             test_matcher_paula_rulings, test_sheet_selection, test_closed_po_line,
             test_duplicate_key_resolution, test_scope_boundaries,
-            test_line_balance_context, test_colour_resolution,
+            test_line_balance_context, test_never_below_ordered, test_colour_resolution,
             test_line_fields_surfaced, test_colour_provenance, test_prompt_version,
             test_unopenable_files, test_size_value_space_failsafe,
             test_no_packing_sheet_becomes_manual_entry,

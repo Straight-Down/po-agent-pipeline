@@ -8,6 +8,12 @@ This proves the diff engine surfaces exactly the kind of mismatch this project
 exists to catch: NetSuite currently says S=12/M=71, but the real shipment (per
 the packing slip) is S=9/M=50.
 
+**Since 2026-11-09 those two lines are FLAGGED, not proposed** (Kiko; RUNBOOK
+section 4): the engine never proposes a quantity below what is ordered, because
+a short slip may be a partial shipment and writing it would strand the rest. The
+demo prints them with the reason a reviewer would read. If 9/50 really was the
+final shipment, the PO is reduced by hand in NetSuite.
+
 It also demonstrates Paula's rulings of 2026-08-11 in action:
   - The engine proposes a new QUANTITY and nothing else. It does not propose a
     receipt date; the vendor's ETA travels through as labelled reference only.
@@ -98,14 +104,22 @@ changes = build_proposed_changes(
 
 pending = [c for c in changes if c.status == STATUS_PENDING_REVIEW]
 needs_attention = [c for c in changes if c.status == STATUS_NEEDS_ATTENTION]
+flagged_matched = [c for c in needs_attention if c.line_id]
 no_change = [c for c in changes if c.status == STATUS_NO_CHANGE]
 
 print(f"Total vendor lines parsed: {len(changes)}")
-print(f"  PENDING_REVIEW (real, matched change):  {len(pending)}")
-print(f"  NEEDS_ATTENTION (no NetSuite match yet): {len(needs_attention)}")
-print(f"  NO_CHANGE:                               {len(no_change)}")
+print(f"  PENDING_REVIEW (real, matched change):        {len(pending)}")
+print(f"  NEEDS_ATTENTION, matched but flagged:          {len(flagged_matched)}")
+print(f"  NEEDS_ATTENTION, no NetSuite match (mock PO): {len(needs_attention) - len(flagged_matched)}")
+print(f"  NO_CHANGE:                                     {len(no_change)}")
 print()
-print("--- Matched changes (this is the real signal) ---")
+print("--- Matched but flagged: what the reviewer reads ---")
+for c in flagged_matched:
+    print(f"PO {c.po_number} {c.style_number} {c.color}-{c.size} (line {c.line_id}): "
+          f"ordered {c.current_quantity}, nothing proposed")
+    print(f"    {c.attention_reason}")
+print()
+print("--- Matched changes ---")
 for c in pending:
     print(
         f"PO {c.po_number} {c.style_number} {c.color}-{c.size}: "
@@ -118,13 +132,12 @@ for c in pending:
 print()
 print("--- The write is quantity only; no date is ever written (2026-11-02) ---")
 if pending:
-    sample = pending[0]
-    print(f"  the write           : {sample.to_netsuite_fields()}")
-    try:
-        normalize_line_fields({"quantity": 1, "expected_receipt_date": "2026-07-20"})
-    except NetSuiteError as exc:
-        print("  a date field        : refused by the client")
-        print(f"                        {str(exc).splitlines()[0][:96]}")
+    print(f"  the write           : {pending[0].to_netsuite_fields()}")
+try:
+    normalize_line_fields({"quantity": 1, "expected_receipt_date": "2026-07-20"})
+except NetSuiteError as exc:
+    print("  a date field        : refused by the client")
+    print(f"                        {str(exc).splitlines()[0][:96]}")
 
 print()
 print("--- PO lines not in this shipment (normal: POs ship in batches) ---")

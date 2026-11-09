@@ -292,6 +292,15 @@ transition. The proposal is not to.
 
 ## 8. The five figures — and that NOTHING gates on them
 
+> **SUPERSEDED IN PART 2026-11-09 (Kiko).** The matcher now never proposes a quantity below the
+> line's current ordered quantity. A first shipment whose slip figure is lower proposes nothing
+> and is flagged, with both figures and the whole PO's coverage stated (RUNBOOK §4). So
+> "nothing gates on them" is no longer true of `current_quantity`: the matcher gates on it.
+> The reasoning below that a short shipment and a partial delivery are indistinguishable now
+> argues for refusing to decide, not for proposing the lower figure. **What still holds:** the
+> screen does not gate. The rule lives in `matcher._accumulated_quantity`, and the
+> instruction not to put a gate in the UI layer stands. Over-shipment is still never flagged.
+
 **BUILT AND TESTED** on the producing side. The screen must display them and must *not* gate on
 them.
 
@@ -306,7 +315,8 @@ second source of truth for simple arithmetic.
 **The warning that matters for whoever builds the screen:** a version that refused to propose
 anything unless the slip equalled outstanding **was built and cancelled**. A final short-ship and a
 partial delivery are indistinguishable from quantities alone. `matcher._line_balance` is documented
-as *"Display context, never a gate."* Do not reintroduce the gate in the UI layer.
+as *"Display context, never a gate."* Do not reintroduce the gate in the UI layer. (The narrower
+never-below-ordered rule of 2026-11-09 is a matcher rule, not this gate; see the note above.)
 
 Related, and the reason a short row count is normal rather than alarming: a PO line absent from a
 slip is *"routine batch shipping, not cancellation"* (`Architecture.md` §6.1). No record is created

@@ -167,6 +167,8 @@ The lines that succeeded keep `WRITTEN` **and their original approval timestamps
 
 **Nothing gates on any of them, and that was tested rather than assumed.** A version that refused to propose anything unless the slip equalled outstanding was built and cancelled: a final short-ship and a partial delivery are the same document, so no arithmetic on these numbers separates them; and with `quantity_received = 0`, "slip equals outstanding" means "nothing to update but the date", which would have left the tool unable to propose a quantity change on any unreceived line. RUNBOOK §8 item 7 has the full account. **There is no `PARTIAL_LINE` state and no `OVER_SHIPMENT` state.** Ruling 6 stands: over-shipment is a plain `PENDING_REVIEW` with no flag.
 
+**SUPERSEDED IN PART 2026-11-09 (Kiko): the matcher now gates on `current_quantity`, one direction only.** It never proposes a quantity below the line's ordered figure. A first shipment whose slip is lower is `NEEDS_ATTENTION` with `proposed_quantity` NULL, and the reason states both figures and the whole PO's coverage (RUNBOOK §4). **No schema change:** `accumulation_basis` stays `FIRST_SHIPMENT` on such a row, because a refusal is not a different kind of history, and a new value would have meant a CHECK-constraint migration. The review app recognises the row by its reason text (`review_app.wording.is_below_ordered`). There is still no partial-line state, and the screen still gates on nothing.
+
 ---
 
 ## 11. Scope boundaries the schema enforces

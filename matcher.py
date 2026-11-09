@@ -36,7 +36,17 @@ slip only shows the new shipment's quantities."* So a second slip against a line
 this tool has already written adds to what was written, rather than overwriting
 it — replacing a first shipment of 128 with a second of 100 would silently lose
 28 units. The first slip against an untouched line still proposes the slip's own
-figure, because the base is zero.
+figure, because the base is zero -- unless that figure is below what the line
+orders (next ruling).
+
+**Never below what is ordered (Kiko, 2026-11-09).** This engine never proposes a
+quantity below the line's current ordered quantity. A first shipment whose slip
+figure is lower proposes nothing and is flagged with both figures and, measured
+across the whole PO, how much of the order the slip covers. Writing it would set
+the line to one partial shipment's quantity; NetSuite would mark the line fully
+received once those units arrived, and no later slip could add the remainder.
+A short slip is a final short shipment or a partial delivery, and the numbers
+cannot say which, so the engine refuses to decide. See `_accumulated_quantity`.
 
 **The arithmetic base is this tool's own record, never NetSuite's current
 quantity.** That is not an optimisation and it is not an oversight; see
@@ -52,7 +62,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import asdict, dataclass, field
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence, Union
 
 from canonical import canonical
 from netsuite_client import (
@@ -287,7 +297,8 @@ class ProposedChange:
     confidence_discharge: str = ""
 
     #: The five quantity figures for this line, on EVERY change -- see
-    #: `_line_balance`. Display context, never a gate.
+    #: `_line_balance`. Display context; nothing branches on THIS payload. The
+    #: never-below-ordered rule (2026-11-09) is enforced in `_accumulated_quantity`.
     line_balance: dict = field(default_factory=dict)
 
     #: How `proposed_quantity` was arrived at -- see `_accumulated_quantity`.
@@ -691,9 +702,17 @@ def _line_balance(line: Optional[POLine], slip_quantity: Optional[float]) -> dic
     carrying its slip quantity with the line-side figures None. "Nothing matched,
     and the slip said 128" is itself worth showing.
 
-    **This is deliberately not a gate, and the reasoning is worth keeping** --
-    a version that refused to propose anything when the slip fell short of
-    outstanding was built and cancelled:
+    **This payload is not a gate.** But a gate on the same figures now exists:
+    **SUPERSEDED IN PART 2026-11-09 (Kiko)** -- `_accumulated_quantity` refuses to
+    propose anything below the line's ordered quantity (RUNBOOK section 4). It is a
+    narrower rule than the one cancelled below: that one demanded slip == outstanding
+    and so also blocked over-shipment; this one only blocks reductions. And the
+    cancellation's main argument -- short-ship and partial delivery are the same
+    document -- is now read as a reason to REFUSE to decide, as the engine already
+    does between two matching PO lines, rather than a reason to propose the lower
+    figure. The original reasoning, kept for the record -- a version that refused
+    to propose anything when the slip fell short of outstanding was built and
+    cancelled:
 
     - **A final short-ship and a partial delivery are the same document.**
       Production came in light, or the balance is following by sea: slip quantity
@@ -726,6 +745,8 @@ def _accumulated_quantity(
     line: Optional[POLine],
     slip_quantity: Optional[float],
     history: Optional[LineHistory],
+    *,
+    po_coverage: Union[str, Callable[[], str]] = "",
 ) -> tuple[Optional[float], dict, Optional[str]]:
     """
     What the line's quantity should become, given that slips accumulate.
@@ -733,6 +754,37 @@ def _accumulated_quantity(
     Returns `(proposed_quantity, accumulation, problem)`. A `problem` means the
     tool refused to compute anything: `proposed_quantity` comes back None and the
     caller flags the line for Paula.
+
+    ## Never below what is ordered (Kiko, 2026-11-09)
+
+    Whatever the arithmetic below produces, a figure under the line's current
+    ordered quantity is never proposed: `proposed_quantity` comes back None, the
+    payload carries `below_ordered`, and the problem states both figures plus
+    `po_coverage` -- the caller's sentence on how much of the WHOLE PO this slip
+    covers, which is better evidence of a partial shipment than one line. It may be
+    a callable, so the caller only measures a PO when a line on it is refused. The
+    `basis` stays what it was (normally FIRST_SHIPMENT): this is a refusal, not a
+    different kind of history, and adding a basis value would mean a migration.
+
+    Why: writing a short slip's figure sets the line to one partial shipment.
+    NetSuite marks it fully received and not open once those units arrive, and no
+    later slip can add the remainder -- the units still to come are lost from the
+    PO for good (PO 1657, Sandbox 2 rehearsal, 2026-11-04: 216 -> 37). A final
+    short shipment and a partial delivery look the same in the numbers, so the
+    tool refuses to decide, exactly as it refuses to choose between two matching
+    PO lines. A final short shipment is reduced by hand in NetSuite.
+
+    Over-shipment and an exact match are untouched (ruling 6). On the receipt
+    path the figure returned is NetSuite's own, so it cannot fall below; on the
+    ACCUMULATED path it could only with a negative slip, and the floor covers that
+    too rather than trusting it cannot happen.
+
+    **Scope: a MATCHED target only.** NEEDS_RESOLUTION and NEEDS_ASSIGNMENT rows
+    have no target line, never reach this function's arithmetic, and keep the
+    slip's raw figure in `proposed_quantity`. That is not a write today -- the
+    review app cannot choose a line and `to_netsuite_fields` raises LineAmbiguous
+    -- but **whatever chooses the line later must apply this floor against the
+    chosen line's ordered quantity**, or it reopens the 216 -> 37 write.
 
     ## Why the base is not NetSuite's current quantity
 
@@ -847,7 +899,7 @@ def _accumulated_quantity(
                 "this line should total"
             )
         payload["basis"] = BASIS_ACCUMULATED
-        return expected + slip, payload, None
+        return _never_below_ordered(expected + slip, payload, line, slip, history, po_coverage)
 
     payload.update({"base_quantity": 0.0, "prior_writes": 0})
     if history is not None and history.observed_quantity is not None:
@@ -894,7 +946,202 @@ def _accumulated_quantity(
             "combined total"
         )
     payload["basis"] = BASIS_FIRST_SHIPMENT
-    return slip, payload, None
+    return _never_below_ordered(slip, payload, line, slip, history, po_coverage)
+
+
+#: The phrase the review app keys on (`review_app/wording.py`). Kept whole in ONE
+#: literal: `test_the_wording_map_tracks_what_the_matcher_writes` reads this file.
+NEVER_BELOW_ORDERED = "The tool never proposes a quantity below what is ordered"
+
+
+def _units(value: float) -> str:
+    """A count as a reviewer reads it: 1049.0 -> '1,049', 37.5 -> '37.5'."""
+    value = float(value)
+    return f"{int(value):,}" if value.is_integer() else f"{value:,}"
+
+
+def _never_below_ordered(
+    proposed: float,
+    payload: dict,
+    line: POLine,
+    slip: float,
+    history: Optional[LineHistory],
+    po_coverage: Union[str, Callable[[], str]],
+) -> tuple[Optional[float], dict, Optional[str]]:
+    """
+    The floor (Kiko, 2026-11-09): `proposed` passes through unless it is below
+    the line's ordered quantity, in which case nothing is proposed and the line is
+    flagged with what the tool knows. See `_accumulated_quantity`.
+
+    The text is written for the reviewer and contains no ';' -- the caller joins
+    reasons with '; ', and the review app shows this one whole.
+    """
+    ordered = float(line.quantity)
+    if proposed >= ordered - QUANTITY_TOLERANCE:
+        return proposed, payload, None
+
+    payload["below_ordered"] = True
+    if payload.get("basis") == BASIS_FIRST_SHIPMENT:
+        first = (f"This packing slip ships less than is ordered on NetSuite line {line.line_id}: "
+                 f"{_units(ordered)} ordered, {_units(slip)} on this slip.")
+    else:
+        first = (f"This packing slip would take NetSuite line {line.line_id} below what is "
+                 f"ordered: {_units(ordered)} ordered, {_units(proposed)} after this slip.")
+    parts = [first, f"{NEVER_BELOW_ORDERED}, so it hasn't proposed one."]
+    coverage = po_coverage() if callable(po_coverage) else po_coverage
+    if coverage:
+        parts.append(coverage)
+    seen_before = (history is not None and not history.has_written
+                   and history.observed_quantity is not None)
+    if seen_before:
+        when = str(history.observed_at or "")[:10]
+        parts.append(
+            "This tool has seen this line on an earlier packing slip"
+            + (f" ({when})" if when else "")
+            + " and wrote nothing to it, so this slip may be only part of what has shipped for it."
+        )
+        # No figure to enter: what the line should hold is this slip PLUS the
+        # earlier ones, and the tool does not add up slips it never wrote.
+        parts.append("If more is coming, nothing needs changing. If this is the last shipment, "
+                     "the line should hold what all its packing slips list together (this one "
+                     f"lists {_units(slip)}), and if that is less than {_units(ordered)}, "
+                     "reduce it in NetSuite.")
+    elif (payload.get("basis") == BASIS_FIRST_SHIPMENT
+          and float(line.quantity_received or 0.0) + slip >= 0):
+        # The exact figure to type, so she is not working it out (Kiko, 2026-11-09).
+        # Received + this slip. On this path nothing has been received (a line with
+        # receipts takes the receipt rule instead), so it is the slip's own figure;
+        # the addition is written out so the figure stays right if that ever changes.
+        final = float(line.quantity_received or 0.0) + slip
+        parts.append("If more is coming, nothing needs changing. If this is the last shipment, "
+                     f"the PO needs reducing — in NetSuite, change line {line.line_id} from "
+                     f"{_units(ordered)} to {_units(final)}.")
+    else:
+        # The ACCUMULATED floor, or a negative slip on a first shipment: either way
+        # the arithmetic rests on a negative figure, so none is offered.
+        parts.append("If more is coming, nothing needs changing. If this is the last shipment, "
+                     "the PO needs reducing — do that in NetSuite.")
+    # NetSuite values (line id, style, colour) are interpolated above: keep the
+    # reason one '; '-free part, or the review app shows only the first half of it.
+    return None, payload, " ".join(parts).replace(";", ",")
+
+
+def _po_coverage(
+    po_number: str,
+    ns_lines: list[POLine],
+    vendor_lines: Sequence[dict],
+    colour_lookup: Optional[ColourLookup] = None,
+) -> str:
+    """
+    One sentence on how much of the WHOLE PO this slip covers, for the
+    never-below-ordered flag. Empty when the PO has no lines to measure against.
+
+    Whole-PO coverage is stronger evidence of a partial shipment than one line's
+    comparison: "1,049 of 4,400 units, and nothing on it matches four of the PO's
+    style/colour groups" says "more is coming" in a way "37 against 216" cannot.
+
+    - Units: every quantity this slip lists for the PO, matched or not (it is what
+      the document says), against what is STILL TO RECEIVE on the PO -- ordered
+      less received, per line, floored at zero (Kiko, 2026-11-09). Measured against
+      the full ordered total instead, a PO with earlier receipts read as far more
+      partial than it was. The sentence names the measure and both its figures.
+    - Groups: the PO's (style, colour) pairs, and which of them no slip line
+      matched, through the same matching (colour names included) the change
+      records use. A pair the vendor misprinted therefore counts as unmatched --
+      true of what the tool matched -- so the sentence also says how many slip
+      lines matched no PO line at all, letting the reviewer discount it.
+    - **Only lines still open count** (Kiko, 2026-11-09): a line that is closed, or
+      no longer open (`is_open` False -- NOT the complement of `closed`, see
+      POLine), expects nothing further. A line closed short (ordered 100,
+      received 60, closed) would otherwise add 40 that will never arrive, and the
+      slip would look more partial than it is. The same filter applies to the
+      groups (a group with no open line is not "missing" from the slip) and to the
+      slip side: a slip line matching only left-out lines is not counted in the
+      slip's units, and the sentence says how many were set aside. When
+      lines are left out, the sentence says how many and why, and its ordered and
+      received figures are those of the counted lines, so they still reconcile.
+
+    Facts only; it never says "partial" -- that is the reviewer's call.
+    """
+    counted = [line for line in ns_lines if line.is_open and not line.closed]
+    if not counted:
+        # Nothing still to receive to measure against. Unreachable for a refused
+        # line, whose target is always open; a guard, not a sentence.
+        return ""
+    left_out = len(ns_lines) - len(counted)
+    counted_ids = {id(line) for line in counted}
+    on_po = [vl for vl in vendor_lines if po_number_key(vl.get("po_number")) == po_number]
+    ordered_total = sum(float(line.quantity or 0) for line in counted)
+    received_total = sum(float(line.quantity_received or 0) for line in counted)
+    # Outstanding per line, floored at zero: a line received over its order has
+    # nothing still to come, and must not cancel out another line's shortfall.
+    outstanding_total = sum(max(float(line.quantity or 0) - float(line.quantity_received or 0), 0.0)
+                            for line in counted)
+
+    groups: dict[tuple, str] = {}
+    for line in counted:
+        groups.setdefault((canonical(line.style_number), canonical(line.color)),
+                          f"{line.style_number} {line.color}".strip())
+    # Slip units are counted on the same footing as the PO side: a slip line that
+    # matches only lines left out (closed / not open) is not set against what is
+    # still to receive, or the slip reads as more complete than it is. A line that
+    # matches nothing is kept -- it is on the slip, and cannot be placed.
+    matched: set = set()
+    orphans = closed_only = 0
+    slip_total = 0.0
+    for vl in on_po:
+        lines, _resolution, _problem, _provenance = _find_matching_lines(vl, ns_lines, colour_lookup)
+        open_lines = [m for m in lines if id(m) in counted_ids]
+        quantity = _as_quantity(vl.get("quantity"))
+        if lines and not open_lines:
+            closed_only += 1
+            continue
+        matched.update((canonical(m.style_number), canonical(m.color)) for m in open_lines)
+        orphans += not lines
+        slip_total += quantity or 0.0
+    unmatched = [name for key, name in groups.items() if key not in matched]
+
+    # Say which measure it is: still to receive = ordered less already received.
+    if received_total > QUANTITY_TOLERANCE:
+        measure = (f"{_units(ordered_total)} ordered less {_units(received_total)} "
+                   "already received")
+        if abs((ordered_total - received_total) - outstanding_total) > QUANTITY_TOLERANCE:
+            # The clamp moved the figure: say so, or the sentence does not add up for
+            # anyone who subtracts the two numbers it prints.
+            measure += ", counting any line received over its order as zero"
+    else:
+        measure = f"{_units(ordered_total)} ordered, none received yet"
+    if left_out:
+        # The figures above are the counted lines' own, so name what was left out
+        # and why, or they will not match the PO's totals in NetSuite.
+        measure += (f", on its open lines only: {left_out} line{'s' if left_out != 1 else ''} "
+                    f"closed or no longer open, expecting nothing further, "
+                    f"{'are' if left_out != 1 else 'is'} left out")
+    if slip_total < outstanding_total - QUANTITY_TOLERANCE:
+        sentence = (f"This slip lists {_units(slip_total)} of the {_units(outstanding_total)} "
+                    f"units still to receive on PO {po_number} ({measure})")
+    else:
+        sentence = (f"This slip lists {_units(slip_total)} units for PO {po_number}, against "
+                    f"{_units(outstanding_total)} still to receive ({measure})")
+    if unmatched:
+        shown = ", ".join(unmatched[:6])
+        if len(unmatched) > 6:
+            shown += f" and {len(unmatched) - 6} more"
+        sentence += (f", and nothing on it matches {len(unmatched)} of the PO's "
+                     f"{len(groups)} {'open ' if left_out else ''}style/colour groups ({shown})")
+    sentence += "."
+    if orphans:
+        # A misprinted colour makes its group look absent (PO 1657's DFK for DKF).
+        # Say how many slip lines matched nothing, so the group count can be
+        # discounted by someone who can see why.
+        sentence += (f" {orphans} of its lines for this PO "
+                     f"match{'es' if orphans == 1 else ''} no line on it.")
+    if closed_only:
+        sentence += (f" {closed_only} of its lines for this PO "
+                     f"match{'es' if closed_only == 1 else ''} only lines that are closed or no "
+                     "longer open, so "
+                     f"{'its units are' if closed_only == 1 else 'their units are'} not counted.")
+    return sentence
 
 
 def _resolve_target_line(
@@ -1045,6 +1292,19 @@ def build_proposed_changes(
     po_numbers = sorted({po_number_key(vl.get("po_number")) for vl in vendor_lines
                          if str(vl.get("po_number") or "").strip()})
     ns_lines_by_po = {po: client.get_purchase_order(po) for po in po_numbers if po}
+    # How much of each WHOLE PO this slip covers, for the never-below-ordered flag
+    # (2026-11-09). Measured lazily, once per PO, and only for a PO with a refused
+    # line, so a PO with nothing below ordered never pays for it.
+    coverage_by_po: dict[str, str] = {}
+
+    def coverage_for(po: str) -> Callable[[], str]:
+        def measure() -> str:
+            if po not in coverage_by_po:
+                coverage_by_po[po] = _po_coverage(
+                    po, ns_lines_by_po.get(po, []), vendor_lines,
+                    (colour_lookups or {}).get(po))
+            return coverage_by_po[po]
+        return measure
 
     # Shipment rows that share a key with each other -- i.e. one size split across
     # several transport-mode recap rows. Built once, keyed WITHOUT the recap label
@@ -1108,7 +1368,7 @@ def build_proposed_changes(
         slip_quantity = _as_quantity(vl.get("quantity"))
         history = (line_history or {}).get((po_number, match.line_id)) if match else None
         proposed_quantity, accumulation, accumulation_problem = _accumulated_quantity(
-            match, slip_quantity, history
+            match, slip_quantity, history, po_coverage=coverage_for(po_number)
         )
         if not accumulation:
             # No accumulation applied: unmatched line, or a quantity that is not a
@@ -1166,7 +1426,8 @@ def build_proposed_changes(
             reasons.append(assignment_problem)
         if accumulation_problem:
             # NetSuite's line disagrees with what this tool believes it wrote, or
-            # goods reached a line it has no record of. Both numbers go to Paula
+            # goods reached a line it has no record of, or the slip would take the
+            # line below what is ordered (2026-11-09). The figures go to Paula
             # verbatim: the tool does not pick one and does not reconcile them.
             reasons.append(accumulation_problem)
         if match is None and candidates and all(line.closed for line in candidates):

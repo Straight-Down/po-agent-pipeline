@@ -46,7 +46,7 @@ anything else depends on it.
 | `parse_packing_slip.py` | **Validated reference implementation** — parses the Inprotex-format packing slip Excel + shipping advice PDF. Every line it extracts was hand-checked against the vendor's own summary email (100% match). Reuse this logic; don't re-derive it from scratch. |
 | `netsuite_client.py` | Stub NetSuite client — defines the interface (`get_purchase_order`, `update_po_line`) the rest of the pipeline codes against. Method bodies are mocked/`NotImplementedError` pending M2M NetSuite access — swap in real REST calls here. Docstring has the confirmed field names/types and the CFO-vs-least-privilege-role caveat — read it before implementing. |
 | `matcher.py` | Diff/staging logic — matches parsed vendor lines to NetSuite PO lines and computes proposed changes. Matching uses exact-match fields confirmed live against sandbox (`custcol_sd_tmpl_style`, `custcol_product_color.refName`, `custcol_product_size.refName` with size normalization) — no longer a display-name substring heuristic. The three business-logic questions are all resolved (see above); quantities ACCUMULATE as of 2026-09-16, and `_accumulated_quantity` is the function to read before touching quantity behaviour. |
-| `demo_matcher.py` | Proves `matcher.py` works: mocks NetSuite's current state using a real example from Paula (PO 1662/M120246/TID showing S=12,M=71 in NetSuite vs. the real shipment's S=9,M=50) and confirms the diff engine catches it. Lines with no mock NetSuite data correctly come back `NEEDS_ATTENTION` instead of being silently dropped — preserve that behavior in the real implementation; a matching miss on live PO data should never fail silently. |
+| `demo_matcher.py` | Proves `matcher.py` works: mocks NetSuite's current state using a real example from Paula (PO 1662/M120246/TID showing S=12,M=71 in NetSuite vs. the real shipment's S=9,M=50) and confirms the diff engine catches it. **Since 2026-11-09 that example is a reduction the engine flags rather than proposes** (never below ordered, RUNBOOK §4), so the demo shows two flagged lines and no proposals. Lines with no mock NetSuite data correctly come back `NEEDS_ATTENTION` instead of being silently dropped — preserve that behavior in the real implementation; a matching miss on live PO data should never fail silently. |
 | `0626建躍空運成衣 (SD-219國外)Invoice_Packing.xlsx` | Real sample vendor packing slip |
 | `Shipping Advice 6128990769 建躍.pdf` | Real sample shipping advice |
 | `Proposed_PO_Updates_SD-219.xlsx` | Example of what the human review step should show — a flat, readable diff table. Not a required format, just a reference for what "good" looks like. |
@@ -225,7 +225,7 @@ commands work normally from the project root.
 
 ## Definition of done
 
-A change is not finished until all four hold. Do not report success before
+A change is not finished until all five hold. Do not report success before
 then.
 
 1. The file compiles and `ruff check` is clean on what you touched.
@@ -235,10 +235,15 @@ then.
    findings are resolved.
 4. Any statement in `CLAUDE.md`, `RUNBOOK.md` or the architecture doc that
    this change made untrue has been corrected.
-5. **If the change touches an INDEX, a CONSTRAINT or a VIEW, it has been run
-   against BOTH dialects, IN BOTH DIRECTIONS** - SQLite and SQL Server,
-   upgrade AND downgrade - not just the one the suite defaults to and not just
-   the direction that runs on the way in. See "Dual-dialect runs" below.
+5. **SQL Server, per the testing policy (RUNBOOK §7, "Testing policy", Kiko
+   2026-11-09).** A change in one of its categories - schema, migration, raw
+   SQL, a statement-building line in a database module, or the connection
+   harness - has had its AFFECTED test modules run with `--mssql`. Other
+   changes need SQLite only. The full `--mssql` suite runs once before a
+   branch merges, never during development. **A change touching an INDEX, a
+   CONSTRAINT or a VIEW is run IN BOTH DIRECTIONS** on SQL Server - upgrade
+   AND downgrade, via `test_schema.py` - not only the direction that runs on
+   the way in. See "Dual-dialect runs" below.
 
    The "both directions" half is not belt-and-braces: three of the eight
    failures on the first real SQL Server run were downgrade-only, and they had
@@ -265,10 +270,19 @@ admin. Both are enforced: the harness refuses a database not named `*-test`,
 and refuses to run connected as `dbo` (the server admin is `dbo` in every
 database on the server, production's included). RUNBOOK section 8 lesson 25.
 
+**When to run it is decided by the testing policy (RUNBOOK §7), not case by
+case:** only the affected test modules for a change in one of its categories,
+and the full suite once before a branch merges. It takes ~30 minutes in full.
+
 ```
 set PO_AGENT_TEST_DB_URL=mssql+pyodbc://po_agent_test_runner:<URL-encoded pw>@sql-po-agent-prod.database.windows.net/sqldb-po-agent-test?driver=ODBC+Driver+18+for+SQL+Server
+rem affected modules only (policy categories A-E)
+.venv\Scripts\python -m pytest -q --mssql test_schema.py test_ingest.py
+rem full suite: once, before merging a branch
 .venv\Scripts\python -m pytest -q --mssql
 ```
+
+`--mssql` also reads `PO_AGENT_TEST_DB_URL` from `.env` when it is set there.
 
 **SUPERSEDED 2026-10-01: the local Docker route** (`docker-compose.test.yml`).
 It named its database `po_agent_test` and logged in as `sa`, and both guards
@@ -659,4 +673,19 @@ not as history - a rule without its failure mode gets rationalised away.
   `_error_kind` records TRANSIENT, never PERMISSION or VALIDATION. Classifying by
   the final error alone recorded "nothing was changed" for a write that had
   landed and stranded the line for good (caught in review, 2026-11-04).
+- **Never propose a quantity below the line's ordered quantity** (Kiko, 2026-11-09;
+  `matcher._never_below_ordered`, RUNBOOK §4). A first shipment's slip figure used
+  to be proposed as-is. In the PO 1657 rehearsal that proposed 216→37, 315→111,
+  250→128 and 360→200 from a slip covering 1,049 of 4,400 units. Written, the line
+  is fully received and closed once the 37 arrive, and the rest of the order can
+  never be added. Now it is NEEDS_ATTENTION with nothing proposed, and the reason
+  gives both figures, the whole PO's coverage against what is STILL TO RECEIVE
+  (ordered less received, on OPEN lines only - a line closed short expects
+  nothing more - never the ordered total), and the exact figure to enter if
+  she reduces it. Do not "fix" the flag back into
+  a proposal, and do not move the rule into the review app (Phase 3 Requirements
+  §8). The basis stays FIRST_SHIPMENT on purpose: a new value means a
+  CHECK-constraint migration. A future line-picker for NEEDS_RESOLUTION /
+  NEEDS_ASSIGNMENT must apply the same floor to the chosen line. Those rows still
+  carry the raw slip figure.
 - <add the next one here>

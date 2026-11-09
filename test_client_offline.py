@@ -1054,8 +1054,19 @@ def test_mock_mode_unchanged() -> None:
         client,
         eta="2026/6/27 16:45",
     )
-    check(len(changes) == 1 and changes[0].status == "PENDING_REVIEW", "matcher.py still produces a diff", changes[0].status)
-    check(changes[0].current_quantity == 12 and changes[0].proposed_quantity == 9, "diff values correct", "12 -> 9")
+    # Ordered 12, slip 9: since 2026-11-09 a figure below ordered is flagged, never
+    # proposed (RUNBOOK section 4) -- demo_matcher.py's own PO 1662 example included.
+    check(len(changes) == 1 and changes[0].status == "NEEDS_ATTENTION"
+          and changes[0].proposed_quantity is None
+          and "never proposes a quantity below what is ordered" in changes[0].attention_reason,
+          "matcher.py still runs, and flags the demo's 12 -> 9 rather than proposing it",
+          changes[0].status)
+    over = build_proposed_changes(
+        [{"po_number": "1662", "style_number": "M120246", "color": "TID", "size": "S", "quantity": 15}],
+        client,
+    )
+    check(over[0].status == "PENDING_REVIEW" and over[0].current_quantity == 12
+          and over[0].proposed_quantity == 15, "and still produces a diff upward", "12 -> 15")
 
     unmatched = build_proposed_changes(
         [{"po_number": "1662", "style_number": "M120246", "color": "TID", "size": "XXXL", "quantity": 4}],

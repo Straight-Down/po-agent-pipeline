@@ -46,7 +46,14 @@ In short: the hard, uncertain part (can this reliably read messy vendor document
 
 `matcher.py`'s `ProposedChange` represents one line's proposed update. The rules baked into it come directly from Paula, not from assumptions:
 
-- **Quantity**: the packing list's shipped quantity **ACCUMULATES** onto what this tool has already written to the line (Paula, 2026-09-16: *"The vendor's packing slip only shows the new shipment's quantities"*). A first shipment against an untouched line proposes the slip's own figure, because the base is zero; a second proposes the written total plus this slip. **The base is this tool's own audit trail, never NetSuite's current quantity** — that is a field this tool writes, so reading it back would be an echo (§8 lesson 13). Where the two disagree, nothing is proposed and both numbers go to Paula. Full detail in §6 item 30. Shipping more than was ordered is normal and accepted — it does not get flagged as unusual.
+- **Quantity**: the packing list's shipped quantity **ACCUMULATES** onto what this tool has already written to the line (Paula, 2026-09-16: *"The vendor's packing slip only shows the new shipment's quantities"*). A first shipment against an untouched line proposes the slip's own figure, because the base is zero -- **unless that figure is below what the line orders, in which case nothing is proposed** (next bullet, 2026-11-09); a second proposes the written total plus this slip. **The base is this tool's own audit trail, never NetSuite's current quantity** — that is a field this tool writes, so reading it back would be an echo (§8 lesson 13). Where the two disagree, nothing is proposed and both numbers go to Paula. Full detail in §6 item 30. Shipping more than was ordered is normal and accepted — it does not get flagged as unusual.
+- **The tool never proposes a quantity below the line's current ordered quantity** (Kiko, 2026-11-09). On a first shipment where the slip's figure is lower than what is ordered, it proposes nothing and flags the line for review, stating both figures plainly. Where it can measure coverage across the whole PO it says so too: how many units this slip lists against what is **still to receive** on the PO (ordered less received, per line, never below zero, and saying so when a line received over its order made the difference), naming the measure and both its figures. **Only open lines count** (Kiko, 2026-11-09). A line that is closed or no longer open expects nothing further; counting a line closed short would overstate how partial the slip looks. The sentence says how many lines were left out and why, and prints the counted lines' own ordered and received figures, so they still reconcile. The slip side is filtered the same way: a slip line matching only left-out lines does not count toward the slip's units, and the sentence says how many were set aside. The same filter applies to the next item: which of the PO's OPEN style/colour groups nothing on the slip matches, since a group with no open line is not missing; and how many slip lines matched no PO line. That is stronger evidence of a partial shipment than one line's comparison. **Measured against what is still to receive, not the full ordered total** (Kiko, 2026-11-09): against the ordered total, a PO with earlier receipts read as far more partial than it was. The reviewer is told: if more is coming, nothing needs changing; if this is the last shipment, the PO needs reducing in NetSuite, **with the exact figure to enter** ("change line 14 from 216 to 37"), which is what was received plus this slip. **No figure is given when the tool has seen the line on an earlier slip**, because the right figure is this slip plus the earlier ones and the tool does not add up slips it never wrote. It says so instead.
+  - **Why.** Writing the slip figure would set the line to a partial shipment's quantity. NetSuite would then mark the line fully received and no longer open once those units arrived, and no later slip could add the remainder: the outstanding units would be permanently lost from the PO. Found in the 2026-11-04 Sandbox 2 rehearsal: PO 1657 (Legendz) orders 4,400 units on 34 lines, its 26-carton slip lists 1,049, and the tool proposed line 14 216→37, line 15 315→111, line 25 250→128 and line 26 360→200. None was approved.
+  - **Why the cancelled gate's reasoning does not stand against it.** §8 lesson 7 records a gate that was built and cancelled because a final short shipment and a partial delivery are indistinguishable in the numbers. That is an argument for refusing to decide, the same rule that makes the tool refuse to choose between two matching PO lines (§6 item 10). The cancelled gate's test, "slip equals outstanding", was also stricter than this rule, which only blocks reductions: over-shipment (ruling 6) and a slip equal to the ordered figure are untouched.
+  - **Where it lives.** In `matcher._accumulated_quantity`, not the review app. The instruction not to put a gate in the UI layer (Phase 3 Requirements §8) still stands; this is a matcher rule. It covers every path: a first shipment, and (defensively) an accumulated total. A line with receipts already follows the receipt rule (§6 item 30), which never proposes below the ordered figure either. **It covers a matched target line only.** A NEEDS_RESOLUTION or NEEDS_ASSIGNMENT row has no target and keeps the slip's raw figure. That is not a write today: there is no picker, and `to_netsuite_fields` raises. **Whatever chooses the line later must apply this floor against the chosen line**, or the 216→37 write comes back.
+  - **Supersedes** Phase 3 Requirements §8 ("nothing gates on them") and the note above that a first shipment always proposes the slip's own figure.
+  - **Consequence, accepted with the decision: a genuine final short shipment is no longer written by the tool.** That includes the founding example in `demo_matcher.py` (PO 1662 TID, S 12→9 and M 71→50), which now flags both lines instead of proposing them. Reducing a PO is done by hand in NetSuite.
+  - **Residual gap, named rather than solved.** The tool does not add unwritten slips together. On a line it has never written, each later batch of a split order is still a first shipment in its terms, and is compared on its own with the full ordered figure. So the final batch of a split order flags too, even when the batches together match the order. When the tool has seen the line on an earlier slip, the flag says so, so that "the PO needs reducing" is not read as true of that one slip alone.
 - **A slip is sent when the goods SHIP, not when they arrive** (Kiko, 2026-11-02). The factory sends the packing slip at dispatch, and with sea-freight transit the tool processes it weeks before anything is received against the PO. So the normal case is an open line with no receipts (`FIRST_SHIPMENT`, or `ACCUMULATED` for a later batch), and the proposal path is the main path. Pre-existing receipts (`PRE_EXISTING_RECEIPT`, §6 item 30) are the exception, not the routine case.
   - **Consequence: approving confirms the vendor's claim, not a verified receipt.** An approved change raises the PO line's quantity to what the factory says it shipped, before the goods have been counted. The approver is confirming what the vendor states was sent; nobody has yet verified that it arrived.
 - **Receipt dates are never computed or proposed by this system.** Paula determines the actual receipt date herself, using her own knowledge of customs/trucking buffers — she explicitly does not use the vendor's stated arrival date. Enforced structurally: `ProposedChange` has no `proposed_expected_receipt_date` field at all. The vendor's ETD/ETA are still shown as labeled reference information. **And since 2026-11-02 this system writes no date at all** (Kiko): see "Dates are never written" below.
@@ -846,6 +853,55 @@ whoever builds that screen needs to know it up front.
 
 **Not yet exercised against a real document:** the merge-note path (`color printed as 'X' and 'Y' in the source`) is covered by unit tests, but in every live run so far each individual run rendered a value consistently — the variation was *between* runs. So that code path has never fired on real input.
 
+### Testing policy: which engine a change is tested on (Kiko, 2026-11-09)
+
+Decided, not proposed. Apply it by category, as written, rather than deciding case by case.
+
+**1. Every change: the full suite on SQLite.** `.venv\Scripts\python -m pytest -q`. This is the default, and for pure Python logic it is the whole requirement.
+
+**2. SQL Server only for the categories below, and then only the affected test modules, not the full suite.** For example, `.venv\Scripts\python -m pytest -q --mssql test_schema.py test_ingest.py`. Connection setup is in CLAUDE.md, "Dual-dialect runs".
+
+A change **requires** a SQL Server run if its diff does any of the following:
+
+| # | Category | What counts | Run on SQL Server |
+|---|---|---|---|
+| A | **Schema** | Any table, column, type, length, nullability, default, constraint, index or view definition in `schema.py` | `test_schema.py`, plus the test module of every database module that reads or writes the changed table (see map below) |
+| B | **Migration** | Any file under `migrations/` (`versions/` or `env.py`) | `test_schema.py` (its round trip covers upgrade AND downgrade), plus as in A |
+| C | **Raw SQL** | `text()`, `exec_driver_sql`, a SQL string, DDL, or a view body | The test module for that source module |
+| D | **Dialect-sensitive SQLAlchemy** | In a database module (map below), any line that builds or executes a statement: a `select` / `insert` / `update` / `delete` or its `where`, `join`, `order_by`, `group_by`, `values` or `returning`. This specifically includes Boolean comparisons, `func.*`, `cast`, `limit` / `offset` / `first()`, `distinct`, string comparison or `like`, NULL ordering, Numeric/Decimal and date/time values, and transactions or locking | The test module for that source module |
+| E | **Connection or harness** | `dialect_target.py`, the database parts of `conftest.py`, engine or connection creation (`schema.connect`) | All six database-backed modules: `test_config.py`, `test_schema.py`, `test_ingest.py`, `test_poller.py`, `test_write_path.py`, `test_review_app.py` |
+
+**Database modules and their test modules:**
+
+| Source module | Test module |
+|---|---|
+| `schema.py`, `migrations/` | `test_schema.py` |
+| `ingest.py` | `test_ingest.py` |
+| `poller.py`, `extract_pending.py` | `test_poller.py` |
+| `write_path.py` | `test_write_path.py` |
+| `review_app/data.py` | `test_review_app.py` |
+| `dialect_target.py` | `test_config.py` |
+
+**Does NOT require SQL Server:**
+- Pure Python logic in any module, including the database modules when the edited lines only work on rows already fetched (wording, arithmetic, branching).
+- Everything outside the database modules: `matcher.py`, the parsers and extractor, the classifier, `carton_backing.py`, `canonical.py`, `size_vocabulary.py`, `netsuite_client.py`, `graph_client.py`, `review_app` templates, `wording.py` and routes.
+- Test-fixture data.
+- Documentation.
+
+**The tie-break, so it never needs a judgement call:** does the diff touch a line in a database module that builds, renders or executes SQL? If yes, it requires SQL Server; if no, it does not.
+
+**3. The full SQL Server suite once, before a branch is merged, and not during development.** `.venv\Scripts\python -m pytest -q --mssql`. It takes about 30 minutes on the Basic-tier test database (§8 lesson 33).
+
+**A run with re-runs is not a clean run** (CLAUDE.md gotchas). Re-run each test the harness lists on its own under `--mssql`. A clean pass there is accepted as a dropped link. A failure there is a real failure.
+
+**Why.** The full suite on SQL Server costs about 30 minutes and drops connections on this tier, while SQLite takes about 40 seconds. Most changes are Python logic, where the engine cannot matter. The categories above are where it has mattered:
+- four filtered unique indexes compiled to FULL indexes (§8 lesson 22);
+- downgrade-only DDL failures (CLAUDE.md, definition of done item 5);
+- `.is_(True)` rendering `IS 1`;
+- tests that never reached the server (§8 lesson 33).
+
+**Applies from 2026-11-09.** The never-below-ordered change (§4) was the first change under it. It is pure Python: `matcher.py`, `wording.py`, a branch on fetched rows in `review_app/data.py`, and test fixtures. So it needed SQLite only; its in-progress full SQL Server run was stopped, and the full run is owed before this branch merges.
+
 ## 8. Lessons learned — debugging and validating against NetSuite
 
 Written up because the permission investigation cost far more cycles than it should have. Items 5 and 6 are about *analysis* rather than permissions, and were added after two conclusions turned out to be artifacts of how the data was chosen.
@@ -937,6 +993,8 @@ would have destroyed it — the tests would have gone green around a rule that h
 quietly disabled the feature. What shipped instead was the same numbers with no
 gate: `line_balance` on every change, so the review screen shows "ordered 300,
 received 0, this slip 128" and the human who can judge it does.
+
+**Revisited 2026-11-09 (Kiko), and narrowed rather than reversed.** The PO 1657 rehearsal showed what "propose the slip's figure" costs on a split order. The line is written down to the first batch, NetSuite closes it once those units arrive, and the remainder can never be added (§4). The rule now in `matcher._accumulated_quantity` is **never below what is ordered**. It is not the gate above. It blocks reductions only, so over-shipment (ruling 6) and an exact match are untouched. And it reads "a short-ship and a partial delivery look the same" as a reason to refuse to decide, as the tool already does between two matching PO lines. The lesson still applied to that change: 24 tests failed, and each was read before any was changed. Three asserted the old rule by name and were rewritten to assert the new one (`test_line_balance_context`, `test_first_shipment_proposes_the_slip`, `test_mock_mode_unchanged`). The other 21 used PO 1662's 12→9 / 71→50, or a similar reduction, as "a change" whose direction was incidental. Their ordered figures were moved below the slip, so each still tests its own concern. Fifteen of those were the review app's, and one shared fixture fixed all fifteen. What showed the feature was not quietly disabled this time was the real corpus. All 51 changed proposals across `rerun10*.db` are increases, and none is a reduction. The cost is named, not hidden: `demo_matcher.py`'s own example, a genuine final short-ship, now flags instead of proposing.
 
 ### 8. Validate a configured rule against the whole population, not the setting
 

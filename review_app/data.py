@@ -363,6 +363,9 @@ def _disposition(row: dict) -> tuple[str, str]:
                              "disagrees with received -- nothing proposed, by design")
         if basis == "DISPUTED":
             return "block", "DISPUTED: nothing proposed -- NetSuite and this tool's record disagree"
+        if wording.is_below_ordered(row):
+            return "block", ("below ordered: nothing proposed -- the slip would lower the "
+                             "line's ordered quantity, which the tool never does (2026-11-09)")
         return "block", "no quantity proposed"
     return "approve", ""
 

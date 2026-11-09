@@ -70,6 +70,11 @@ proposed_updates.csv
 *.tmp.xlsx
 vendor_results/
 
+# Working notes, status write-ups and mock-ups produced in Claude sessions. Kept
+# locally for reference, not part of the project's record (RUNBOOK and the
+# architecture docs are).
+/Claude outputs/
+
 # ---------------------------------------------------------------------------
 # Editor / OS noise
 # ---------------------------------------------------------------------------

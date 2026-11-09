@@ -492,7 +492,10 @@ def test_the_matcher_discharges_only_on_a_complete_proof() -> None:
     from netsuite_client import NetSuiteClient
     from test_ingest import ns_line
 
-    client = NetSuiteClient(mock_data={"1662": [ns_line("18", size="S", qty=12)]})
+    # Ordered 8, slip 9: a change the matcher may propose. It was 12 until
+    # 2026-11-09, when a figure below ordered stopped being proposable at all
+    # (RUNBOOK section 4); this test is about the confidence flag, not direction.
+    client = NetSuiteClient(mock_data={"1662": [ns_line("18", size="S", qty=8)]})
 
     def change(proof):
         vl = {"po_number": "1662", "style_number": "M120246", "color": "TID", "size": "S",

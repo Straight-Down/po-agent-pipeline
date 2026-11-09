@@ -196,8 +196,10 @@ def test_ingest_writes_every_table() -> None:
             ship_info={"etd": "2026/6/27 19:40", "eta": "2026/6/27 16:45"},
             parser="inprotex-deterministic", vendor_name="Inprotex",
             notes=["attachment triage: 1 selected"], warnings=[])
+        # Ordered below the slip (8 < 9, 45 < 50): a figure below ordered is never
+        # proposed since 2026-11-09, and this test is about persistence, not direction.
         client = NetSuiteClient(mock_data={"1662": [
-            ns_line("18", size="S", qty=12), ns_line("19", size="M", qty=71),
+            ns_line("18", size="S", qty=8), ns_line("19", size="M", qty=45),
             ns_line("20", size="2X", qty=2)]})
 
         monkey = {}
@@ -232,7 +234,7 @@ def test_ingest_writes_every_table() -> None:
     check(rows["s"].source_hint == "PACKING!R42", "source_hint persisted", rows["s"].source_hint)
 
     # the five review figures
-    check(float(rows["s"].current_quantity) == 12.0
+    check(float(rows["s"].current_quantity) == 8.0
           and float(rows["s"].current_quantity_received) == 0.0
           and float(rows["s"].proposed_quantity) == 9.0
           and rows["s"].ns_line_id == "18",
@@ -242,7 +244,7 @@ def test_ingest_writes_every_table() -> None:
     with engine.connect() as conn:
         outstanding = conn.execute(text(
             "SELECT outstanding FROM v_review_lines WHERE size_printed = 'S'")).scalar()
-    check(float(outstanding) == 12.0, "and outstanding derives in the view", str(outstanding))
+    check(float(outstanding) == 8.0, "and outstanding derives in the view", str(outstanding))
 
     # calibration halves: the claim is stored, the verdict is not yet
     check(xxl.extraction_confidence == "low" and xxl.needs_review == 1,
@@ -717,7 +719,9 @@ def test_multi_po_document() -> None:
         # take the shipment down with them.
         client = NetSuiteClient(mock_data={
             "1662": [ns_line("18", size="S", qty=10)],
-            "1667": [ns_line("4", size="S", qty=12)]})
+            # 8 ordered against 10 shipped: a change the matcher may propose
+            # (below-ordered is flagged, never proposed, since 2026-11-09).
+            "1667": [ns_line("4", size="S", qty=8)]})
         monkey = {}
         install_stub_parse(monkey, parsed, classification)
         try:
@@ -925,7 +929,9 @@ def test_colour_resolution_end_to_end() -> None:
     # A name-printing vendor: the lookup is built, the name resolves, and the
     # printed text is preserved verbatim beside the canonical key.
     engine, report, client = ingest_one(
-        "NEW INDIGO", [po_line("2", "NIN", "M", 155), po_line("3", "MLT", "M", 20)],
+        # NIN ordered 100 against 110 shipped: proposable. It was 155 until
+        # 2026-11-09, when below-ordered figures stopped being proposed.
+        "NEW INDIGO", [po_line("2", "NIN", "M", 100), po_line("3", "MLT", "M", 20)],
         {"item-NIN": "New Indigo", "item-MLT": "Moonlight"})
     with engine.connect() as conn:
         row = conn.execute(select(proposed_changes)).one()
@@ -1232,9 +1238,11 @@ def _record_write(engine, change, quantity, when, *,
 def test_first_shipment_proposes_the_slip() -> None:
     section("first shipment against an untouched line: the base is zero")
     engine = fresh_db()
+    # 100 ordered, 128 shipped. Until 2026-11-09 this ordered 300 -- a reduction,
+    # which is no longer proposed (test_first_shipment_below_ordered_is_flagged).
     report = _ship(engine, po="1662", graph_id="AAMk-batch-1",
                    slip_lines=[line(qty=128)],
-                   ns_lines=[ns_line("18", qty=300, recv=0.0)])
+                   ns_lines=[ns_line("18", qty=100, recv=0.0)])
     change = _only_change(engine, report.shipment_id)
 
     check(float(change.proposed_quantity) == 128.0,
@@ -1246,9 +1254,64 @@ def test_first_shipment_proposes_the_slip() -> None:
           str(change.accumulation_base_quantity))
     check(change.state == sc.STATE_PENDING_REVIEW,
           "and it is an ordinary PENDING_REVIEW", change.state)
-    check(float(change.current_quantity) == 300.0,
-          "the ORDERED 300 is still recorded as NetSuite's current value, untouched "
+    check(float(change.current_quantity) == 100.0,
+          "the ORDERED 100 is still recorded as NetSuite's current value, untouched "
           "by the accumulation", str(change.current_quantity))
+
+
+def test_first_shipment_below_ordered_is_flagged() -> None:
+    section("first shipment BELOW ordered: nothing proposed, flagged, persisted (2026-11-09)")
+    engine = fresh_db()
+    report = _ship(engine, po="1662", graph_id="AAMk-short-1",
+                   slip_lines=[line(qty=37)],
+                   ns_lines=[ns_line("18", qty=216, recv=0.0),
+                             ns_line("19", size="M", qty=100, recv=0.0)])
+    change = _only_change(engine, report.shipment_id)
+
+    check(change.state == sc.STATE_NEEDS_ATTENTION and change.proposed_quantity is None,
+          "NEEDS_ATTENTION with NO proposed quantity -- 216 is never written down to 37",
+          f"{change.state}/{change.proposed_quantity}")
+    check(change.ns_line_id == "18" and float(change.current_quantity) == 216.0,
+          "still matched to its line, with the ordered figure recorded",
+          f"{change.ns_line_id}/{change.current_quantity}")
+    check(change.accumulation_basis == "FIRST_SHIPMENT"
+          and float(change.accumulation_base_quantity) == 0.0,
+          "the basis stays FIRST_SHIPMENT: a refusal, not a new kind of history",
+          f"{change.accumulation_basis}/{change.accumulation_base_quantity}")
+    check(change.quantity_write_status == "NONE" and change.src_quantity_text == "37",
+          "nothing approvable, and the slip's 37 kept verbatim",
+          f"{change.quantity_write_status}/{change.src_quantity_text}")
+    reason = change.attention_reason or ""
+    check("216 ordered, 37 on this slip" in reason
+          and "never proposes a quantity below what is ordered" in reason
+          and "This slip lists 37 of the 316 units still to receive on PO 1662 (316 ordered, "
+              "none received yet)" in reason
+          and "If more is coming, nothing needs changing" in reason
+          and "in NetSuite, change line 18 from 216 to 37." in reason,
+          "the reason states both figures, the whole PO's coverage, and the exact figure "
+          "to enter",
+          reason[:200])
+    check("vendor line has no quantity" not in reason,
+          "and does not blame the slip for the tool's own refusal", reason[:120])
+
+    # The next slip on the same, never-written line is still compared on its own,
+    # and says the line has been seen before (RUNBOOK section 4, residual gap).
+    second = _ship(engine, po="1662", graph_id="AAMk-short-2",
+                   slip_lines=[line(qty=179)],
+                   ns_lines=[ns_line("18", qty=216, recv=0.0),
+                             ns_line("19", size="M", qty=100, recv=0.0)],
+                   now=dt.datetime(2026, 9, 16, 9, 0, 0))
+    change_2 = _only_change(engine, second.shipment_id)
+    reason_2 = change_2.attention_reason or ""
+    check(change_2.state == sc.STATE_NEEDS_ATTENTION and change_2.proposed_quantity is None
+          and "216 ordered, 179 on this slip" in reason_2,
+          "a second short slip on an unwritten line is flagged on its own figures",
+          reason_2[:120])
+    check("seen this line on an earlier packing slip" in reason_2
+          and "what all its packing slips list together (this one lists 179)" in reason_2
+          and "the PO needs reducing" not in reason_2 and "change line" not in reason_2,
+          "and says so, with no figure to enter -- it never adds up unwritten slips",
+          reason_2[-260:])
 
 
 def test_second_shipment_accumulates() -> None:
@@ -1576,11 +1639,14 @@ def test_unwritten_proposals_do_not_move_the_base() -> None:
         ("rejected outright", sc.STATE_DISCARDED, None, None),
         ("approved but the write FAILED", sc.STATE_WRITE_FAILED, "FAILED", "FAILED"),
     )
+    # Ordered 50, below both slips, so each is proposable. It was 300 until
+    # 2026-11-09, when a figure below ordered stopped being proposed at all; the
+    # subject here is the base, not the direction.
     for label, state, write_status, outcome in cases:
         engine = fresh_db()
         first = _ship(engine, po="1662", graph_id="AAMk-batch-1",
                       slip_lines=[line(qty=128)],
-                      ns_lines=[ns_line("18", qty=300, recv=0.0)])
+                      ns_lines=[ns_line("18", qty=50, recv=0.0)])
         change_1 = _only_change(engine, first.shipment_id)
         if write_status:
             _record_write(engine, change_1, 128, dt.datetime(2026, 9, 1, 10, 0, 0),
@@ -1592,10 +1658,10 @@ def test_unwritten_proposals_do_not_move_the_base() -> None:
                              .values(state=state, human_verdict="REJECTED",
                                      verdict_by="paula@straightdown.com", verdict_at=NOW))
 
-        # The line still holds 300: nothing was ever written to it.
+        # The line still holds 50: nothing was ever written to it.
         second = _ship(engine, po="1662", graph_id="AAMk-batch-2",
                        slip_lines=[line(qty=100)],
-                       ns_lines=[ns_line("18", qty=300, recv=0.0)],
+                       ns_lines=[ns_line("18", qty=50, recv=0.0)],
                        now=dt.datetime(2026, 9, 16, 9, 0, 0))
         change_2 = _only_change(engine, second.shipment_id)
 
@@ -1607,15 +1673,15 @@ def test_unwritten_proposals_do_not_move_the_base() -> None:
               f"{label}: proposes the slip alone, 100", str(change_2.proposed_quantity))
         check(float(change_2.proposed_quantity) != 228.0,
               f"{label}: NOT 228 -- an unwritten proposal changed nothing")
-        check(float(change_2.proposed_quantity) != 400.0,
-              f"{label}: and NOT 300 + 100, which is NetSuite's ordered quantity used "
+        check(float(change_2.proposed_quantity) != 150.0,
+              f"{label}: and NOT 50 + 100, which is NetSuite's ordered quantity used "
               "as a base")
 
         hist = ing._line_history(engine, ["1662"])[("1662", "18")]
         check(hist.written_quantity is None,
               f"{label}: the history records no write", str(hist.written_quantity))
-        check(hist.observed_quantity == 300.0,
-              f"{label}: but DOES remember seeing the line at 300, which is how an "
+        check(hist.observed_quantity == 50.0,
+              f"{label}: but DOES remember seeing the line at 50, which is how an "
               "edit made later would still be caught", str(hist.observed_quantity))
 
 
@@ -2288,6 +2354,7 @@ def main() -> int:
         test_scope_boundaries,
         test_gaps_are_reported_not_defaulted,
         test_first_shipment_proposes_the_slip,
+        test_first_shipment_below_ordered_is_flagged,
         test_second_shipment_accumulates,
         test_po_1624_later_shipment_accumulates_onto_the_first,
         test_netsuite_disagreeing_with_our_record_is_flagged,

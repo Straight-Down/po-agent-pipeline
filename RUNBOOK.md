@@ -1733,6 +1733,55 @@ Decided, not proposed. **Built 2026-11-02: decision 2 (writes while she waits, o
 - **Where:** `review_app/app.py` (the `confirmed` field), `review_app/data.reject_preview`, `review_app/wording.reject_confirmation`, and `templates/reject_confirm.html`. Server-side, so it works without JavaScript and is tested end to end (`test_reject_confirms_what_it_covers_first`).
 - **Does not change decision 4.** Reject still requires a free-text reason. The three-reason picker is not built.
 
+### End-to-end rehearsal against Sandbox 2 (Kiko, 2026-11-09) -- evidence for the cutover decision
+
+**The first time the whole path ran with a human click and real NetSuite writes:** email → ingest → review app → Approve → batch PATCH → closing re-read → confirmed independently in NetSuite. All against **Sandbox 2 (`1321665-sb2`)**, never production.
+
+**Set-up.**
+- **Run database:** `~/po-agent-runs/e2e-sb2-20261104-rerun0017-test.db`, the Inprotex SD-219 email (`msg-inprotex-001`, six POs, 77 lines) re-ingested after migration 0017 (§8 lesson 34).
+- **Checked before starting:**
+  - `NetSuiteConfig.from_env()` resolved to `1321665-sb2` (`is_sandbox` true, record API on the sb2 host);
+  - `PO_AGENT_ALLOW_PRODUCTION_WRITES` was unset;
+  - `write_path._account_refusal` allowed the sandbox;
+  - the database was at 0017 with no verdicts and no write attempts.
+- **Review app:** `python -m review_app --db sqlite:///...rerun0017-test.db`, reviewer `Kiko`, on 127.0.0.1:8000.
+
+**What was approved -- by Kiko, in the review app, one click per PO:**
+
+| PO (internal id) | Approved at (UTC) | NetSuite lines written |
+|---|---|---|
+| 1640 (8408234) | 2026-11-09 21:48:24 | 91-102, 12 lines, one PATCH |
+| 1667 (8507780) | 2026-11-09 21:51:50 | 7-11, 5 lines, one PATCH |
+
+Each PO's PATCH carried one idempotency key, shared by all its lines' `write_attempts` rows; they are in the run database, not here. The credential scan (`test_no_credentials_in_tracked_files`) rightly treats any GUID in a tracked file as a possible tenant or client id.
+
+**Before → after.** "Before" is the value the write path re-read immediately before its PATCH (`write_attempts.previous_quantity`). It equalled the figure recorded at ingest on every line.
+
+| PO 1640 line | 91 | 92 | 93 | 94 | 95 | 96 | 97 | 98 | 99 | 100 | 101 | 102 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Item | W60118 BLK XS | BLK S | BLK M | BLK L | BLK XL | BLK 2X | W60118 IND XS | IND S | IND M | IND L | IND XL | IND 2X |
+| Before | 60 | 261 | 344 | 282 | 216 | 37 | 102 | 258 | 331 | 269 | 168 | 72 |
+| After | 61 | 265 | 347 | 286 | 219 | 39 | 103 | 260 | 335 | 274 | 171 | 73 |
+
+| PO 1667 line | 7 | 8 | 9 | 10 | 11 |
+|---|---|---|---|---|---|
+| Item | W160036 TID XS | TID S | TID M | TID L | TID XL |
+| Before | 9 | 19 | 35 | 29 | 8 |
+| After | 11 | 21 | 38 | 30 | 9 |
+
+All 17 are increases, all `FIRST_SHIPMENT`. Each was recorded `SUCCESS` with HTTP 204, the line moved to `WRITTEN`, and the audit log has 17 `REVIEW_APPROVED` (HUMAN, Kiko) and 17 `QUANTITY_WRITE_SUCCESS` rows. No refusal, failure or retry occurred, and the unrecorded-writes file was not touched.
+
+**Confirmed directly in Sandbox 2 afterwards.** A separate GET-only read of both POs, not through the write path, with update methods disabled and any non-GET request refused, found every one of the 17 lines holding exactly its "after" figure, open, with nothing received. **What that read does NOT prove:** that no OTHER line on those POs moved. No full snapshot of either PO was taken before the write, so this rests on the PATCH payload carrying only the 17 lines. The 2026-11-02 measurement above (all 41 lines of PO 1662 compared after a three-line PATCH) is the evidence that NetSuite leaves unsent lines alone. Take a full before-snapshot in the production rehearsal.
+
+**Not exercised here.** These paths are tested offline but were not seen live in this rehearsal:
+- PO 1704 was opened but **not** approved. Its left-out below-ordered line, 15 (51 vs slip 50), was not written either.
+- No line was left out of a PATCH that actually went out.
+- No refusal, timeout or send-again occurred.
+
+POs 1645, 1650, 1662 and 1704 remain undecided in that database.
+
+**Bearing on cutover (§12).** This shows the mechanics of the approved path work end to end against a real NetSuite account. It does **not** discharge §12 item 4: every figure here is Sandbox 2, which disagrees with production (§8 lesson 31).
+
 ## 12. Production cutover checklist
 
 Added 2026-10-21. Do these in order and tick each one only once it is verified. Steps 1-4 can be done any time before cutover. Steps 5-6 happen at the moment of cutover and not before.

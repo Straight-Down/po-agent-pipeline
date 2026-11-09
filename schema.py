@@ -890,13 +890,21 @@ Index("ix_proposed_changes_shipment_id", proposed_changes.c.shipment_id)
 # careless human one) points both at the same line and the second write silently
 # overwrites the first.
 #
-# Scoped per SHIPMENT, not globally: a later shipment updating the same line again
-# is normal and correct. `IS NOT NULL` is required rather than tidy -- Azure SQL
-# treats NULLs as equal in a unique index, so without it the many rows that have
-# no target yet would collide with each other there while passing on SQLite.
+# Scoped per PO WITHIN a shipment -- `shipment_po_id` is one PO in one shipment
+# (`uq_shipment_pos_key`) -- not globally: a later shipment updating the same line
+# again is normal and correct. `IS NOT NULL` is required rather than tidy -- Azure
+# SQL treats NULLs as equal in a unique index, so without it the many rows that
+# have no target yet would collide with each other there while passing on SQLite.
+#
+# FIXED by migration 0017 (2026-11-09). 0004 keyed this on (shipment_id,
+# ns_line_id). `ns_line_id` is a line NUMBER, and NetSuite numbers lines from 1 on
+# every PO, so two POs in one email that both had a matched line 18 collided and
+# the WHOLE email failed to ingest -- the Inprotex SD-219 email, six POs on one
+# sheet, in the 2026-11-04 Sandbox 2 rehearsal. A line number identifies a line
+# only together with its PO. RUNBOOK section 8 lesson 34.
 Index(
-    "ux_proposed_changes_one_line_per_shipment",
-    proposed_changes.c.shipment_id,
+    "ux_proposed_changes_one_line_per_po",
+    proposed_changes.c.shipment_po_id,
     proposed_changes.c.ns_line_id,
     unique=True,
     **_partial("ns_line_id IS NOT NULL"),

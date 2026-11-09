@@ -1348,7 +1348,7 @@ def build_proposed_changes(
         elif len(siblings) > 1 and len(candidates) == 1:
             # Two shipment rows, one PO line. Nothing to assign, and writing both
             # to that line would double-write it -- which the database now
-            # refuses outright (ux_proposed_changes_one_line_per_shipment).
+            # refuses outright (ux_proposed_changes_one_line_per_po).
             match, resolution_problem, ambiguous_lines = None, None, []
             assignment = _assignment_payload(candidates, siblings)
             assignment_problem = (

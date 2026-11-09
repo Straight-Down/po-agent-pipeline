@@ -650,15 +650,16 @@ def test_transport_mode_recap_rows() -> None:
         # part is that it was refused -- so check for either idiom rather than
         # asserting on one engine's wording:
         #   SQLite     reports the offending COLUMNS: "proposed_changes.ns_line_id"
-        #   SQL Server reports the INDEX: "ux_proposed_changes_one_line_per_shipment"
+        #   SQL Server reports the INDEX: "ux_proposed_changes_one_line_per_po"
+        #   (renamed from ..._one_line_per_shipment by migration 0017, 2026-11-09)
         # This was the one failure of eight on the first SQL Server run that
         # concerned BEHAVIOUR rather than syntax, and the behaviour turned out to
         # be right on both: the constraint fired. Only the assertion was
         # dialect-specific.
         detail = str(exc)   # NOT `msg` -- that is this module's envelope helper
-        by_columns = ("proposed_changes.shipment_id" in detail
+        by_columns = ("proposed_changes.shipment_po_id" in detail
                       and "proposed_changes.ns_line_id" in detail)
-        by_index = "ux_proposed_changes_one_line_per_shipment" in detail
+        by_index = "ux_proposed_changes_one_line_per_po" in detail
         check(by_columns or by_index,
               "the DB refuses two changes selecting ONE line, naming that constraint",
               ("columns" if by_columns else "index" if by_index else "NEITHER")
@@ -700,6 +701,44 @@ def test_transport_mode_recap_rows() -> None:
                              .where(proposed_changes.c.ns_line_id == "18")).scalar()
     check(again == 2,
           "two SHIPMENTS may both target line 18 -- the guard is per shipment", str(again))
+
+
+def test_two_pos_in_one_email_may_share_a_line_number() -> None:
+    section("two POs in one email, both with a matched line 18: both ingest (0017)")
+    # NetSuite numbers lines from 1 on EVERY PO, so line 18 on PO 1662 and line 18
+    # on PO 1667 are different lines. Keyed on (shipment, line number), 0004's index
+    # refused the second and the WHOLE email failed to ingest -- msg-inprotex-001,
+    # Sandbox 2 rehearsal, 2026-11-04. Keyed on (shipment PO, line number), the
+    # guard still refuses two changes on ONE PO's line (the transport-mode test)
+    # but lets each PO keep its own numbering.
+    engine = fresh_db()
+    with tempfile.TemporaryDirectory() as td:
+        docs = make_docs(Path(td), ("Invoice_Packing.xlsx",))
+        classification = FakeClassification(
+            selected=[FakeClassification.Item(docs[0], "packing_list")])
+        parsed = ParseResult(
+            lines=[line(po="1662", size="S", qty=10), line(po="1667", size="S", qty=10),
+                   line(po="1667", size="M", qty=10)],
+            parser="inprotex-deterministic", vendor_name="Inprotex")
+        client = NetSuiteClient(mock_data={
+            "1662": [ns_line("18", size="S", qty=8)],
+            "1667": [ns_line("18", size="S", qty=8), ns_line("19", size="M", qty=8)]})
+        monkey = {}
+        install_stub_parse(monkey, parsed, classification)
+        try:
+            report = ing.ingest_shipment(engine, docs, message=msg(), client=client, now=NOW)
+        finally:
+            restore(monkey)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(shipment_pos.c.po_number_key, proposed_changes.c.ns_line_id)
+            .select_from(proposed_changes.join(
+                shipment_pos, proposed_changes.c.shipment_po_id == shipment_pos.c.id))
+            .order_by(shipment_pos.c.po_number_key, proposed_changes.c.ns_line_id)).all()
+    check(report.created and [tuple(r) for r in rows]
+          == [("1662", "18"), ("1667", "18"), ("1667", "19")],
+          "the email ingests, and both POs keep their own line 18",
+          str([tuple(r) for r in rows]))
 
 
 def test_multi_po_document() -> None:
@@ -2346,6 +2385,7 @@ def main() -> int:
         test_po_key_is_canonical,
         test_size_composition_persisted,
         test_transport_mode_recap_rows,
+        test_two_pos_in_one_email_may_share_a_line_number,
         test_multi_po_document,
         test_multi_candidate_line,
         test_audit_and_state_guard,

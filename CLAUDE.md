@@ -175,7 +175,7 @@ heavily than the code it can read. Known drift as of 2026-09-14:
   `ingest.py`, `schema.py`, `extraction_schema.py`, `claude_extractor.py`,
   `document_parsers.py`, `attachment_classifier.py`, `size_vocabulary.py`,
   `canonical.py`, `config.py`, `carton_backing.py`, alembic migrations
-  0001-0016, and ten test
+  0001-0017, and ten test
   modules as of 2026-11-02 — plus, since Phase 2 closed on 2026-09-14, the mailbox intake:
   `graph_client.py` (a four-method Graph interface with a mock and a real
   client), `poller.py` (the polling job and the content-addressed attachment
@@ -688,4 +688,14 @@ not as history - a rule without its failure mode gets rationalised away.
   CHECK-constraint migration. A future line-picker for NEEDS_RESOLUTION /
   NEEDS_ASSIGNMENT must apply the same floor to the chosen line. Those rows still
   carry the raw slip figure.
+- **A NetSuite line NUMBER identifies a line only together with its PO.**
+  Line numbers restart at 1 on every PO. Migration 0004's
+  `ux_proposed_changes_one_line_per_shipment` keyed on (shipment, line number),
+  so any email with two resolved POs sharing a matched line number failed to
+  ingest entirely (Inprotex SD-219, six POs, 2026-11-04). It is now
+  `ux_proposed_changes_one_line_per_po` on (shipment_po_id, ns_line_id), from
+  migration 0017. Never key, group or dedupe on `ns_line_id` without the PO
+  beside it. A test of a multi-PO case must give two POs the SAME matched line
+  number, or it cannot fail (`test_two_pos_in_one_email_may_share_a_line_number`).
+  RUNBOOK §8 lesson 34.
 - <add the next one here>

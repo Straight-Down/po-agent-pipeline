@@ -115,7 +115,8 @@ made. **Grouping key:** `(shipment_po_id, key_style, key_color, key_size)` — t
 *without* `key_recap_label`, which is exactly `matcher._sibling_key`.
 
 `matcher._assignment_payload` already sets `auto_assignable: False` *"so nobody later mistakes an
-even count for permission to pair by position"*. `ux_proposed_changes_one_line_per_shipment` will
+even count for permission to pair by position"*. `ux_proposed_changes_one_line_per_po` (named
+`..._one_line_per_shipment` until migration 0017, 2026-11-09, which scoped it to the PO) will
 reject a double-assignment, so a per-row dropdown UI offers choices the database cannot save.
 
 ---

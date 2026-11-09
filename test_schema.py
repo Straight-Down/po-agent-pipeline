@@ -146,7 +146,7 @@ def mk_po(conn, shipment_id, printed="PO#1662", key="1662", **kw):
 
 #: Distinct NetSuite line per fixture row. A real PO line carries exactly one
 #: style/colour/size, so two different canonical keys can never target the same
-#: line -- and `ux_proposed_changes_one_line_per_shipment` now enforces that.
+#: line -- and `ux_proposed_changes_one_line_per_po` now enforces that.
 #: The old fixture hardcoded line "18" on every row, which modelled something
 #: NetSuite cannot represent; tests that specifically want a collision pass
 #: `ns_line_id=` explicitly.

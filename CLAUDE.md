@@ -698,4 +698,14 @@ not as history - a rule without its failure mode gets rationalised away.
   beside it. A test of a multi-PO case must give two POs the SAME matched line
   number, or it cannot fail (`test_two_pos_in_one_email_may_share_a_line_number`).
   RUNBOOK §8 lesson 34.
+- **Never put an idempotency key or any other generated UUID in the docs.**
+  `test_no_credentials_in_tracked_files` matches every GUID-shaped string in a
+  tracked file as a possible tenant or client id. A random write key is
+  indistinguishable from one by shape, so the scan is right to refuse it. The
+  2026-11-09 Sandbox 2 rehearsal record put both PATCH keys in a RUNBOOK table
+  and failed the scan (caught before push, amended out). To audit a specific
+  request, look it up in `write_attempts` (`idempotency_key`, shared by every
+  line of one PATCH); that table is the record. In the docs, identify a
+  request by PO, NetSuite internal id, lines and time. Leave the scan's
+  pattern as it is, and add no file exception to quiet it.
 - <add the next one here>

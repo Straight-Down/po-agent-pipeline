@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Reject PO {{ view.shipment_po.po_number_printed }}?{% endblock %}
+{% block content %}
+<h1>Reject PO {{ view.shipment_po.po_number_printed }}?</h1>
+<div class="card">
+  <p class="plain">{{ sentence }}</p>
+  <p class="plain">Nothing is sent to NetSuite. Your reason is saved with each line:</p>
+  <blockquote class="plain">{{ reason }}</blockquote>
+  <form method="post" action="/po/{{ view.id }}/reject">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <input type="hidden" name="fingerprint" value="{{ fingerprint }}">
+    <input type="hidden" name="reason" value="{{ reason }}">
+    <input type="hidden" name="confirmed" value="yes">
+    <button type="submit" class="secondary">Yes, reject this PO</button>
+    <a href="/po/{{ view.id }}">No, go back to the PO</a>
+  </form>
+</div>
+{% endblock %}

@@ -781,11 +781,86 @@ def test_reject_needs_a_reason() -> None:
                                            for ln in w.lines("1662").values()),
               "a blank reason is refused and nothing is recorded", str(r.status_code))
         c.post(f"/po/{w.po_id('1662')}/reject",
-               data={**form, "reason": "vendor re-sending corrected slip"})
+               data={**form, "reason": "vendor re-sending corrected slip", "confirmed": "yes"})
         lines = w.lines("1662")
         check(all(ln["state"] == "DISCARDED" and ln["human_verdict"] == "REJECTED"
                   and ln["human_verdict_note"] == "vendor re-sending corrected slip"
                   for ln in lines.values()), "every line DISCARDED + REJECTED with the reason")
+
+
+def test_reject_confirms_what_it_covers_first() -> None:
+    section("reject (2026-11-09): per PO, but it names what it covers before it goes through")
+    import html as htmllib
+
+    from review_app import wording
+
+    with _World() as w:
+        c = w.client()
+        form = {**w.form(c, "1662"), "reason": "vendor re-sending corrected slip"}
+        r = c.post(f"/po/{w.po_id('1662')}/reject", data=form, follow_redirects=False)
+        page = htmllib.unescape(main_text(r.text))
+        check(r.status_code == 200 and "This rejects all 3 lines on this PO, including 2 that "
+              "would have been updated in NetSuite." in page,
+              "the first step names what it covers: 3 lines, 2 of them changes", page[:300])
+        check("vendor re-sending corrected slip" in page and "Yes, reject this PO" in page
+              and "No, go back to the PO" in page,
+              "it repeats the reason and offers both ways out")
+        check(all(ln["human_verdict"] is None and ln["state"] != "DISCARDED"
+                  for ln in w.lines("1662").values()),
+              "and records NOTHING until confirmed")
+        with w.engine.connect() as conn:
+            events = conn.execute(select(audit_log).where(audit_log.c.event == "REVIEW_REJECTED")
+                                  ).mappings().all()
+        check(events == [], "not even an audit row")
+
+        stale = c.post(f"/po/{w.po_id('1662')}/reject",
+                       data={**form, "confirmed": "yes", "fingerprint": "0" * 64},
+                       follow_redirects=False)
+        check(stale.status_code == 409 and w.lines("1662")["S"]["human_verdict"] is None,
+              "a confirmation from a page the data has moved past is refused", str(stale.status_code))
+
+        done = c.post(f"/po/{w.po_id('1662')}/reject", data={**form, "confirmed": "yes"},
+                      follow_redirects=False)
+        check(done.status_code == 303 and all(ln["human_verdict"] == "REJECTED"
+                                              for ln in w.lines("1662").values()),
+              "confirming rejects every line, still per PO")
+
+        one = c.post(f"/po/{w.po_id('2000')}/reject",
+                     data={**w.form(c, "2000"), "reason": "more is coming"})
+        check("This rejects the only line on this PO. It wouldn't have changed anything in "
+              "NetSuite." in htmllib.unescape(main_text(one.text)),
+              "a one-line PO with nothing to change says so", main_text(one.text)[:200])
+        check(not INTERNAL.findall(main_text(r.text)) and not INTERNAL.findall(main_text(one.text)),
+              "no internal detail on the confirmation page")
+
+    # The reason is echoed twice (shown, and in a hidden input): escaped both times.
+    with _World() as w:
+        c = w.client()
+        hostile = '"><script>alert(1)</script> & more'
+        r = c.post(f"/po/{w.po_id('1662')}/reject", data={**w.form(c, "1662"), "reason": hostile})
+        check(r.status_code == 200 and "<script>alert(1)</script>" not in r.text
+              and "&lt;script&gt;" in r.text and "&amp; more" in r.text,
+              "a reason carrying markup is escaped on the confirmation page", str(r.status_code))
+        c.post(f"/po/{w.po_id('1662')}/reject",
+               data={**w.form(c, "1662"), "reason": hostile, "confirmed": "yes"})
+        check(w.lines("1662")["S"]["human_verdict_note"] == hostile,
+              "and stored exactly as typed once confirmed")
+
+    cases = (((8, 4, True), "This rejects all 8 lines on this PO, including 4 that would have "
+                            "been updated in NetSuite."),
+             ((3, 3, True), "This rejects all 3 lines on this PO, all 3 of which would have "
+                            "been updated in NetSuite."),
+             ((2, 0, True), "This rejects both lines on this PO. None of them would have "
+                            "changed anything in NetSuite."),
+             ((1, 1, True), "This rejects the only line on this PO, which would have been "
+                            "updated in NetSuite."),
+             ((5, 2, False), "This rejects the 5 lines on this PO still waiting for a decision, "
+                             "including 2 that would have been updated in NetSuite."),
+             ((1, 0, False), "This rejects 1 line on this PO still waiting for a decision. It "
+                             "wouldn't have changed anything in NetSuite."))
+    for args, expected in cases:
+        got = wording.reject_confirmation(*args)
+        check(got == expected, f"wording {args}", got)
 
 
 def test_forged_and_stale_forms_are_refused() -> None:
@@ -816,7 +891,8 @@ def test_lines_needing_a_choice_are_left_out_not_refused() -> None:
         check("disabled" in r.text and "nothing on this PO that can be approved" in main,
               "with nothing else on the PO, Approve has nothing to do")
         form = w.form(c, "1700")
-        r = c.post(f"/po/{w.po_id('1700')}/reject", data={**form, "reason": "picked by hand"},
+        r = c.post(f"/po/{w.po_id('1700')}/reject",
+                   data={**form, "reason": "picked by hand", "confirmed": "yes"},
                    follow_redirects=False)
         check(r.status_code == 303 and w.lines("1700")["S"]["human_verdict"] == "REJECTED",
               "and it can be rejected from the page")

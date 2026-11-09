@@ -1586,7 +1586,7 @@ See `PO-Update-Automation-Build-Plan.md` for full phase detail. **Corrected 2026
 
 ### Phase 4 decisions (Kiko, 2026-10-21)
 
-Decided, not proposed. **Built 2026-11-02: decision 2 (writes while she waits, one batch PATCH per PO, wired to Approve) and decision 3 (no undo; a result page with previous -> new that stays reachable from the PO). Decision 5 is superseded: approval stays per PO (below). Decisions 1 and 4 are not built.** Where a decision reverses an earlier recorded ruling or collides with an existing guard, that is named under it, so whoever builds it changes the old rule on purpose rather than tripping over it.
+Decided, not proposed. **Built 2026-11-02: decision 2 (writes while she waits, one batch PATCH per PO, wired to Approve) and decision 3 (no undo; a result page with previous -> new that stays reachable from the PO). Built 2026-11-09: decision 6 (Reject confirms what it covers). Decision 5 is superseded: approval stays per PO (below). Decisions 1 and 4 are not built.** Where a decision reverses an earlier recorded ruling or collides with an existing guard, that is named under it, so whoever builds it changes the old rule on purpose rather than tripping over it.
 
 **1. Notification is a once-daily email digest to the approver, sent when changes are waiting.**
 - **Blocked** on the Graph `Mail.Send` application permission, requested on **2026-10-21**, to be scoped to the shared `shipments@` mailbox by application access policy. When it lands, prove the scoping by observation, as was done for `Mail.Read` (`scripts/probe_graph_auth.py` is refused on a second mailbox), not from the policy's configuration. Note that the existing `Mail.Read` scoping uses **RBAC for Applications** (§6 item 11), not an application access policy; confirm which mechanism the `Mail.Send` grant actually uses.
@@ -1692,6 +1692,13 @@ Decided, not proposed. **Built 2026-11-02: decision 2 (writes while she waits, o
   - **Reject is per PO** and records `REJECTED` on every undecided line shown.
   - Lines already received with every figure agreeing are left out of both. That is a change of 2026-10-21, not yet committed when this was recorded; it is unaffected by this decision.
 - **So the case this decision exists for is real today:** one blocked line holds up every approvable line on its PO.
+
+**6. Reject confirms what it covers before it goes through** (Kiko, 2026-11-09; built the same day). **Rejection stays per PO**: this adds a confirmation step to the existing flow, not a new flow. Before it, nothing recorded this, and a Reject discarded every undecided line on the PO with no statement of how many, or that some of them were changes Approve would have made.
+- **What she sees.** The first POST of the Reject form records nothing and shows a confirmation that names the reach, repeats her reason, and offers "Yes, reject this PO" or "No, go back to the PO". For example: "This rejects all 8 lines on this PO, including 4 that would have been updated in NetSuite." The wording covers one line, two lines ("both lines"), none changing ("None of them would have changed anything in NetSuite"), and only some lines still undecided ("the 5 lines on this PO still waiting for a decision").
+- **The counts come from the code that acts on them.** "Lines" is `PoView.awaiting`, the exact set `data.reject` discards. "Would have been updated" is `PoView.changing`, the count the Approve button uses, so the confirmation, the button and the write cannot disagree.
+- **Guards hold at both steps.** The page token, a reason (blank is refused before the confirmation is shown) and the page fingerprint are checked at the first step and again on confirming. A PO that changed between the two is refused: reload and decide again.
+- **Where:** `review_app/app.py` (the `confirmed` field), `review_app/data.reject_preview`, `review_app/wording.reject_confirmation`, and `templates/reject_confirm.html`. Server-side, so it works without JavaScript and is tested end to end (`test_reject_confirms_what_it_covers_first`).
+- **Does not change decision 4.** Reject still requires a free-text reason. The three-reason picker is not built.
 
 ## 12. Production cutover checklist
 

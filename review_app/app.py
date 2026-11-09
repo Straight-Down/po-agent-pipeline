@@ -186,9 +186,18 @@ def create_app(settings: Settings, engine=None, now=None) -> FastAPI:
 
     @app.post("/po/{shipment_po_id}/reject")
     def reject(request: Request, shipment_po_id: str, csrf_token: str = Form(""),
-               fingerprint: str = Form(""), reason: str = Form("")):
+               fingerprint: str = Form(""), reason: str = Form(""),
+               confirmed: str = Form("")):
+        """Per PO, in two steps (Kiko, 2026-11-09): the first POST records nothing
+        and shows what the Reject covers; only `confirmed=yes` goes through."""
         try:
             check_csrf(csrf_token)
+            if confirmed != "yes":
+                with engine.connect() as conn:
+                    view, sentence, cleaned = data.reject_preview(
+                        conn, shipment_po_id, reason=reason, fingerprint=fingerprint)
+                return page(request, "reject_confirm.html", view=view, sentence=sentence,
+                            reason=cleaned, fingerprint=fingerprint)
             data.reject(engine, shipment_po_id, reviewer=settings.reviewer, reason=reason,
                         fingerprint=fingerprint, now=clock())
         except data.ReviewRefused as exc:

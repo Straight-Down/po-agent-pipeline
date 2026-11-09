@@ -538,14 +538,44 @@ def approve(engine, shipment_po_id: str, *, reviewer: str, fingerprint: str,
     return counts
 
 
-def reject(engine, shipment_po_id: str, *, reviewer: str, reason: str, fingerprint: str,
-           now: dt.datetime) -> int:
-    """Discard every awaiting line of one PO, with the reason on each line and in the audit."""
+def clean_reject_reason(reason: str) -> str:
+    """The reason as it will be stored, or a refusal. Checked at BOTH steps of a
+    Reject, so a blank reason is refused before the confirmation is shown."""
     reason = (reason or "").strip()
     if not reason:
         raise ReviewRefused("Please say why you're rejecting this PO, then try again.", 400)
     if len(reason) > 1000:
         raise ReviewRefused("Please keep the reason under 1,000 characters.", 400)
+    return reason
+
+
+def reject_preview(conn, shipment_po_id: str, *, reason: str,
+                   fingerprint: str) -> tuple[PoView, str, str]:
+    """
+    What a Reject WOULD cover, for the confirmation step (Kiko, 2026-11-09).
+    Records nothing. Returns `(view, sentence, cleaned_reason)`.
+
+    The same lines `reject` discards (`view.awaiting`), and the same "would have
+    changed NetSuite" count the Approve button uses (`view.changing`), so the
+    confirmation cannot disagree with either. The fingerprint is checked here AND
+    again by `reject`, so a PO that moves between the two steps is refused.
+    """
+    reason = clean_reject_reason(reason)
+    view = _load_for_decision(conn, shipment_po_id, fingerprint)
+    if not view.can_reject:
+        raise ReviewRefused("This PO has already been decided. Nothing to do.", 409)
+    awaiting_ids = {ln.row["id"] for ln in view.awaiting}
+    changing = sum(1 for ln in view.changing if ln.row["id"] in awaiting_ids)
+    sentence = wording.reject_confirmation(
+        len(view.awaiting), changing, every_line=len(view.awaiting) == len(view.shown_lines))
+    return view, sentence, reason
+
+
+def reject(engine, shipment_po_id: str, *, reviewer: str, reason: str, fingerprint: str,
+           now: dt.datetime) -> int:
+    """Discard every awaiting line of one PO, with the reason on each line and in the audit.
+    Reached only through the confirmation step (`reject_preview`) in the app."""
+    reason = clean_reject_reason(reason)
     with engine.begin() as conn:
         view = _load_for_decision(conn, shipment_po_id, fingerprint)
         if not view.can_reject:

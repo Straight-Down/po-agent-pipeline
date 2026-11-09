@@ -207,6 +207,35 @@ def block_explanations(blocking: list) -> list[tuple[str, int]]:
     return [(BLOCK_MESSAGES[k], counts[k]) for k in BLOCK_MESSAGES if k in counts]
 
 
+# -- confirming a Reject (Kiko, 2026-11-09) ---------------------------------------
+
+
+def reject_confirmation(rejected: int, changing: int, every_line: bool) -> str:
+    """What a Reject covers, said before it goes through. Rejection stays per PO;
+    this only names its reach, so a whole PO is never rejected by surprise.
+
+    `rejected` is every line the Reject records a verdict on, `changing` how many
+    of them Approve would have changed in NetSuite, and `every_line` whether that
+    is every line on the PO (some may already be decided or set aside)."""
+    if every_line:
+        what = ("the only line on this PO" if rejected == 1
+                else "both lines on this PO" if rejected == 2
+                else f"all {rejected} lines on this PO")
+    else:
+        what = (f"{rejected} line on this PO still waiting for a decision" if rejected == 1
+                else f"the {rejected} lines on this PO still waiting for a decision")
+    if changing == 0:
+        tail = (". It wouldn't have changed anything in NetSuite" if rejected == 1
+                else ". None of them would have changed anything in NetSuite")
+    elif rejected == 1:
+        tail = ", which would have been updated in NetSuite"
+    elif changing == rejected:
+        tail = f", all {changing} of which would have been updated in NetSuite"
+    else:
+        tail = f", including {changing} that would have been updated in NetSuite"
+    return f"This rejects {what}{tail}."
+
+
 # -- the escalation bubble ------------------------------------------------------
 
 

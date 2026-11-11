@@ -297,6 +297,10 @@ transition. The proposal is not to.
 > line's current ordered quantity. A first shipment whose slip figure is lower proposes nothing
 > and is flagged, with both figures and the whole PO's coverage stated (RUNBOOK §4). So
 > "nothing gates on them" is no longer true of `current_quantity`: the matcher gates on it.
+> **Narrowed 2026-11-11:** a first-shipment reduction IS proposed, still flagged, when the slip
+> covers the line's whole style/colour group, the line is short by at most 3 units and 5%, and
+> no other line of the group is short by more (the factory's final count, RUNBOOK §4). It is still a matcher rule, and the screen still
+> does not gate.
 > The reasoning below that a short shipment and a partial delivery are indistinguishable now
 > argues for refusing to decide, not for proposing the lower figure. **What still holds:** the
 > screen does not gate. The rule lives in `matcher._accumulated_quantity`, and the

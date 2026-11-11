@@ -27,6 +27,13 @@ REASON_CATEGORIES: tuple[tuple[str, str, str], ...] = (
      "proposes a quantity below what is ordered, so it hasn't proposed one. If more is "
      "coming, nothing needs changing. If this is the last shipment, the PO needs "
      "reducing — do that in NetSuite."),
+    # The one exception, the factory's final count (2026-11-11): the reduction IS
+    # proposed. The matcher's sentence says why and that approving writes it, so it
+    # is shown verbatim too; this is the fallback.
+    ("final_count", "reads as the factory's final count",
+     "This packing slip ships slightly less than is ordered on this line, and lists all "
+     "of this style and colour on the PO, so the tool has proposed the lower figure as "
+     "the factory's final count. If more is still coming for this line, don't approve it."),
     # The figures are added from the row by `reasons(..., row=)`; this is the
     # fallback when they are not to hand. Never a combined total (2026-10-21).
     ("pre_existing", "from before this tool tracked it",
@@ -85,7 +92,7 @@ def reasons(attention_reason: Optional[str], row: Optional[dict] = None) -> list
             continue
         if key == "pre_existing" and row:
             found.append(_received_figures(row) or plain)
-        elif key == "below_ordered":
+        elif key in ("below_ordered", "final_count"):
             found.append(_own_sentence(text, phrase) or plain)
         else:
             found.append(plain)
@@ -137,8 +144,9 @@ def _dec(value) -> Optional[Decimal]:
 #: Grouped explanations for a disabled Approve, by what blocks it.
 BLOCK_MESSAGES = {
     "below_ordered": (
-        "This packing slip ships less than is ordered on these lines, and the tool never "
-        "lowers an ordered quantity, so it hasn't proposed a number. If more is coming, "
+        "This packing slip ships less than is ordered on these lines, and the tool doesn't "
+        "lower an ordered quantity unless a slip reads as the factory's final count, so it "
+        "hasn't proposed a number. If more is coming, "
         "nothing needs changing: reject this PO here to clear it from your list. If this is "
         "the last shipment, the PO needs reducing — do that in NetSuite, using the figure "
         "given for each line."),
@@ -169,7 +177,7 @@ BLOCK_MESSAGES = {
 #: The same reasons in a few words, for one line in a list (the result page, the
 #: lines Approve leaves out).
 EXCLUSION_SHORT = {
-    "below_ordered": "this slip ships less than is ordered, and the tool never lowers an order",
+    "below_ordered": "this slip ships less than is ordered, and the tool hasn't lowered the order",
     "pre_existing": "already received in NetSuite, and the figures disagree",
     "disputed": "changed in NetSuite since the tool last saw it",
     "not_updatable": "no open line in NetSuite to update",

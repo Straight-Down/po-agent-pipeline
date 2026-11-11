@@ -3076,6 +3076,8 @@ def test_never_below_ordered(tmp: Path) -> None:
                                      NetSuiteClient(mock_data={"1721": odd}))[0]
     check(";" not in semi.attention_reason and "BLK, WHT" in semi.attention_reason,
           "a NetSuite value carrying ';' is rendered with ','", semi.attention_reason[:220])
+    check(all("final_count" not in c.accumulation for c in matched),
+          "PO 1657 is never a final count: groups at 16 and 33 percent, 4 of 6 lines missing")
 
     # -- Measured only when needed: a PO with nothing below ordered is never measured.
     calls = []
@@ -3093,6 +3095,225 @@ def test_never_below_ordered(tmp: Path) -> None:
         check(calls == ["1721"], "and a PO with refused lines is measured once", str(calls))
     finally:
         mt._po_coverage = real
+
+
+def test_final_count_reduction(tmp: Path) -> None:
+    section("the factory's final count (2026-11-11): a small short on a fully covered group")
+    import datetime as dt
+
+    import matcher as mt
+    from netsuite_client import NetSuiteClient, POLine
+
+    def ns(line_id, style, colour, size, qty, recv=0.0, is_open=True, closed=False):
+        line = POLine(
+            line_id=str(line_id), item=f"{style} : {style}-{colour}-{size}",
+            style_number=style, vendor_name=None, color=colour, size=size, quantity=qty,
+            units="Ea", expected_receipt_date=dt.date(2026, 8, 1),
+            override_expected_receipt=False, updated_receipt_date=None, is_open=is_open,
+        )
+        line.quantity_received = recv
+        line.closed = closed
+        return line
+
+    def vendor(style, colour, size, qty, po="1650"):
+        return {"po_number": po, "style_number": style, "color": colour, "size": size,
+                "quantity": qty, "confidence": "high", "note": ""}
+
+    def run(po_lines, slip, po="1650", history=None):
+        return mt.build_proposed_changes(slip, NetSuiteClient(mock_data={po: po_lines}),
+                                         line_history=history)
+
+    # -- PO 1650 as Sandbox 2 held it on 2026-11-11: W340039 NIN, all six lines on
+    #    the slip, 1,063 against 1,050. Plus other groups the slip does not touch --
+    #    the WHOLE PO is barely covered, and that must not matter.
+    nin = {"XS": (49, 80, 82), "S": (50, 271, 274), "M": (51, 343, 342),
+           "L": (52, 261, 267), "XL": (53, 86, 87), "2X": (54, 9, 11)}
+    po_lines = [ns(n, "W340039", "NIN", size, qty) for size, (n, qty, _s) in nin.items()]
+    po_lines += [ns(100 + i, f"W1000{i:02d}", "PLP", "M", 600) for i in range(14)]
+    slip = [vendor("W340039", "NIN", size, s) for size, (_n, _q, s) in nin.items()]
+    changes = {c.size: c for c in run(po_lines, slip)}
+    m = changes["M"]
+    check(m.proposed_quantity == 342 and m.status == mt.STATUS_NEEDS_ATTENTION
+          and m.to_netsuite_fields() == {"quantity": 342},
+          "PO 1650 line 51 (343, slip 342) PROPOSES 342, flagged so it is read",
+          f"{m.proposed_quantity}/{m.status}")
+    check("This slip lists" not in m.attention_reason,
+          "and the whole PO's coverage plays no part in it", m.attention_reason[:200])
+    expected = ("This packing slip ships less than is ordered on NetSuite line 51: 343 ordered, "
+                "342 on this slip. It lists all of W340039 NIN on this PO (1,063 units against "
+                "1,050 still to receive, every one of its 6 open lines listed, and no other line "
+                "more than a few units short), and this line is short by only 1 unit, so it reads as the factory's final count. Approving this "
+                "PO lowers line 51 from 343 to 342. If more is still coming for this line, "
+                "don't approve it.")
+    check(m.attention_reason == expected, "the reason says why, and that approving writes it",
+          m.attention_reason)
+    check(mt.FINAL_COUNT_PROPOSED in m.attention_reason
+          and mt.NEVER_BELOW_ORDERED not in m.attention_reason
+          and "%" not in m.attention_reason and ";" not in m.attention_reason,
+          "its own phrase, not the refusal's; no percentage, no ';'")
+    check(m.accumulation.get("basis") == mt.BASIS_FIRST_SHIPMENT
+          and m.accumulation.get("below_ordered") is True
+          and m.accumulation.get("final_count", {}).get("short_by") == 1.0,
+          "basis stays FIRST_SHIPMENT, marked below ordered AND final count",
+          str(m.accumulation))
+    check(all(c.status == mt.STATUS_PENDING_REVIEW for s, c in changes.items() if s != "M"),
+          "the over-shipped lines beside it are untouched plain proposals")
+
+    # -- PO 1704 line 15: 51 ordered, 50 shipped -- 1.96 percent, inside 5.
+    tid = [ns(12, "M120278", "TID", "M", 57), ns(13, "M120278", "TID", "L", 105),
+           ns(14, "M120278", "TID", "XL", 87), ns(15, "M120278", "TID", "2X", 51)]
+    c1704 = run(tid, [vendor("M120278", "TID", s, q, po="1704") for s, q in
+                      (("M", 59), ("L", 110), ("XL", 89), ("2XL", 50))], po="1704")[3]
+    check(c1704.proposed_quantity == 50 and "lowers line 15 from 51 to 50" in c1704.attention_reason,
+          "PO 1704 line 15 (51, slip 50) proposes 50", c1704.attention_reason[:120])
+
+    # -- Each test fails on its own. A two-line group, so one figure moves at a time.
+    def pair(a_qty, a_slip, b_qty, b_slip, extra=(), history=None):
+        lines = [ns(1, "S1", "BLK", "M", a_qty), ns(2, "S1", "BLK", "L", b_qty), *extra]
+        slip_ = [vendor("S1", "BLK", "M", a_slip)]
+        if b_slip is not None:
+            slip_.append(vendor("S1", "BLK", "L", b_slip))
+        return run(lines, slip_, history=history)[0]
+
+    check(pair(100, 97, 100, 110).proposed_quantity == 97,
+          "3 short on 100 (3 units, 3 percent), group covered: proposes")
+    four = pair(100, 96, 100, 110)
+    check(four.proposed_quantity is None and mt.NEVER_BELOW_ORDERED in four.attention_reason,
+          "4 short -- over the unit cap -- flags as before, however well the group is covered")
+    check(pair(20, 19, 100, 110).proposed_quantity == 19,
+          "1 short on 20 (exactly 5 percent): proposes")
+    check(pair(19, 18, 100, 110).proposed_quantity is None,
+          "1 short on 19 (over 5 percent): flags -- a small line cannot lose a big share")
+    check(pair(60, 57, 100, 110).proposed_quantity == 57
+          and pair(59, 56, 100, 110).proposed_quantity is None,
+          "3 short is allowed from a 60-unit line, not a 59-unit one")
+    missing = pair(100, 99, 100, None)
+    check(missing.proposed_quantity is None and mt.NEVER_BELOW_ORDERED in missing.attention_reason,
+          "1 short, but an open line of the group is not on the slip: flags")
+    # Isolates "every open line listed": XL has only 2 still to receive, inside the
+    # per-line threshold, so condition 3 passes it and the coverage total (209 of
+    # 202) passes too. Only its absence from the slip flags (review, 2026-11-11).
+    almost_received = ns(3, "S1", "BLK", "XL", 100, recv=98.0)
+    check(pair(100, 99, 100, 110, extra=[almost_received]).proposed_quantity is None,
+          "an open line missing from the slip flags even when nothing else would")
+    padded = pair(100, 99, 10, 200, extra=[ns(3, "S1", "BLK", "XL", 5)])
+    check(padded.proposed_quantity is None,
+          "an unlisted open line flags even when the units over-cover the group")
+    # -- No OTHER open line of the group short beyond the per-line threshold
+    #    (Kiko, 2026-11-11). Coverage is a total: 150 and 50 against two orders of
+    #    100 read as 100 percent, and B's 50 short says the group is not complete.
+    offset = run([ns(1, "S1", "BLK", "M", 100), ns(2, "S1", "BLK", "L", 100),
+                  ns(3, "S1", "BLK", "XL", 100)],
+                 [vendor("S1", "BLK", "M", 98), vendor("S1", "BLK", "L", 150),
+                  vendor("S1", "BLK", "XL", 50)])[0]
+    check(offset.proposed_quantity is None and mt.NEVER_BELOW_ORDERED in offset.attention_reason,
+          "an over-shipped size does not cover for another size 50 short: 298 of 300, flags",
+          offset.attention_reason[:140])
+    check(pair(100, 99, 100, 97).proposed_quantity == 99,
+          "a neighbour short by 3 of 100 (within the threshold): proposes")
+    check(pair(100, 99, 100, 96).proposed_quantity is None,
+          "a neighbour short by 4 (over the unit cap): flags")
+    check(pair(100, 99, 40, 38).proposed_quantity == 99,
+          "a neighbour short by 2 of 40 (exactly 5 percent): proposes")
+    check(pair(100, 99, 40, 37).proposed_quantity is None,
+          "a neighbour short by 3 of 40 (within the units, over 5 percent): flags")
+    check(pair(100, 99, 100, 91).proposed_quantity is None,
+          "group at 95 percent but a neighbour 9 short: flags (it proposed before this rule)")
+    # With no receipts, every line within 5 percent of its order already puts the
+    # group at 95 percent or more -- the boundary is reachable only with every line
+    # at the limit. The coverage test bites on its own only where lines have
+    # receipts: the per-line cap is a share of the ORDER, coverage of what is still
+    # to RECEIVE.
+    three = [ns(i, "S1", "BLK", size, 20) for i, size in ((1, "M"), (2, "L"), (3, "XL"))]
+    check(run(three, [vendor("S1", "BLK", s, 19) for s in ("M", "L", "XL")])[0].proposed_quantity
+          == 19, "every line 1 short of 20: 57 of 60, exactly 95 percent, proposes")
+    received_group = [ns(1, "S1", "BLK", "M", 20)] + [
+        ns(i, "S1", "BLK", size, 100, recv=90.0) for i, size in ((2, "L"), (3, "XL"), (4, "2X"))]
+    under = run(received_group, [vendor("S1", "BLK", "M", 19)] + [
+        vendor("S1", "BLK", s, 7) for s in ("L", "XL", "2X")])[0]
+    check(under.proposed_quantity is None,
+          "each line within the threshold (3 short of 10 still to receive, on orders of "
+          "100) but the group at 40 of 50: flags on coverage alone")
+    dup = run([ns(1, "S1", "BLK", "M", 100), ns(2, "S1", "BLK", "L", 50),
+               ns(3, "S1", "BLK", "L", 50)],
+              [vendor("S1", "BLK", "M", 99), vendor("S1", "BLK", "L", 100)])[0]
+    check(dup.proposed_quantity is None,
+          "a slip row matching two open lines cannot be placed per line: flags")
+    closed_line = ns(3, "S1", "BLK", "XL", 30, recv=10.0, is_open=False, closed=True)
+    not_open = ns(4, "S1", "BLK", "2X", 40, recv=40.0, is_open=False)
+    check(pair(100, 99, 50, 52, extra=[closed_line, not_open]).proposed_quantity == 99,
+          "a closed or no-longer-open line of the group is not 'missing' from the slip")
+    check(pair(100, 99, 50, 30).proposed_quantity is None,
+          "a group short overall (129 of 150) flags the 1-short line too")
+    part_received = run(
+        [ns(1, "S1", "BLK", "M", 100), ns(2, "S1", "BLK", "L", 100, recv=60.0)],
+        [vendor("S1", "BLK", "M", 99), vendor("S1", "BLK", "L", 40)])[0]
+    check(part_received.proposed_quantity == 99,
+          "coverage is against what is STILL TO RECEIVE (139 of 140), not the 200 ordered",
+          part_received.attention_reason[:200])
+    seen = mt.LineHistory(po_number="1650", line_id="1", observed_quantity=100.0,
+                          observed_at="2026-09-01T10:00:00")
+    again = pair(100, 99, 100, 110, history={("1650", "1"): seen})
+    check(again.proposed_quantity is None
+          and "seen this line on an earlier packing slip" in again.attention_reason,
+          "never on a line seen on an earlier slip: its final figure is the sum of slips")
+    other_po = run([ns(1, "S1", "BLK", "M", 100), ns(2, "S1", "BLK", "L", 100)],
+                   [vendor("S1", "BLK", "M", 99), vendor("S1", "BLK", "L", 110, po="9999")])[0]
+    check(other_po.proposed_quantity is None,
+          "a slip line for ANOTHER PO does not list this PO's line")
+
+    # -- An AMBIGUOUS colour name lists nothing (code review, 2026-11-11). `BLACK`
+    #    could be BLK or BK2 on this PO, so the L row cannot be placed; crediting it
+    #    to BK2 would make BK2's L line look listed and its group look covered.
+    from canonical import canonical
+
+    ambiguous_po = [ns(1, "S1", "BK2", "M", 100), ns(2, "S1", "BK2", "L", 100),
+                    ns(3, "S1", "BLK", "L", 100)]
+    lookup = mt.ColourLookup(by_name={canonical("BLACK"): {canonical("BK2"), canonical("BLK")}},
+                             display={canonical("BK2"): "Black 2", canonical("BLK"): "Black"})
+    amb = mt.build_proposed_changes(
+        [vendor("S1", "BK2", "M", 99), vendor("S1", "BLACK", "L", 110)],
+        NetSuiteClient(mock_data={"1650": ambiguous_po}),
+        colour_lookups={"1650": lookup})[0]
+    check(amb.proposed_quantity is None and mt.NEVER_BELOW_ORDERED in amb.attention_reason,
+          "a row whose colour is ambiguous does not list a line or add units: flags",
+          amb.attention_reason[:160])
+    # -- Two slip rows for one size (a transport-mode split, or a repeat): whether
+    #    they add up is what the tool does not decide, so the group is never covered.
+    split = run([ns(1, "S1", "BLK", "M", 100), ns(2, "S1", "BLK", "L", 100)],
+                [vendor("S1", "BLK", "M", 99),
+                 {**vendor("S1", "BLK", "L", 50), "recap_label": "By Sea"},
+                 {**vendor("S1", "BLK", "L", 50), "recap_label": "By UPS"}])[0]
+    check(split.proposed_quantity is None,
+          "a group with a size split across two slip rows is never a final count")
+    # -- The target must be one of the lines its group was measured over: an open
+    #    line that is also ticked closed is outside its own group.
+    ticked = ns(1, "S1", "BLK", "M", 100, closed=True)
+    closed_target = run([ticked, ns(2, "S1", "BLK", "L", 100)],
+                        [vendor("S1", "BLK", "M", 99), vendor("S1", "BLK", "L", 110)])[0]
+    check(closed_target.proposed_quantity is None,
+          "a target ticked closed is never proposed below ordered")
+
+    # -- The measure on its own, with colour resolved through the same matching.
+    groups = mt._group_coverage("1650", po_lines, slip)
+    g = groups[("w340039", "nin")]
+    check((g.open_lines, g.open_lines_on_slip, g.outstanding, g.slip_units, g.covered)
+          == (6, 6, 1050.0, 1063.0, True),
+          "group measure: 6 of 6 listed, 1,063 against 1,050", str(g))
+    check(not groups[("w100000", "plp")].covered, "an untouched group is not covered")
+
+    # -- Measured only when needed, like the PO sentence: once per PO, and never for
+    #    a PO with nothing below ordered.
+    calls = []
+    real = mt._group_coverage
+    try:
+        mt._group_coverage = lambda *a, **k: calls.append(a[0]) or real(*a, **k)
+        run(po_lines, [vendor("W340039", "NIN", "XS", 500)])
+        check(calls == [], "an over-shipment never measures a group", str(calls))
+        run(po_lines, slip + [vendor("W100000", "PLP", "M", 1)])
+        check(calls == ["1650"], "two lines below ordered on one PO measure it once", str(calls))
+    finally:
+        mt._group_coverage = real
 
 
 def test_colour_resolution(tmp: Path) -> None:
@@ -4399,7 +4620,8 @@ def main() -> int:
             test_line_aggregation, test_aggregation_wired_into_parsers,
             test_matcher_paula_rulings, test_sheet_selection, test_closed_po_line,
             test_duplicate_key_resolution, test_scope_boundaries,
-            test_line_balance_context, test_never_below_ordered, test_colour_resolution,
+            test_line_balance_context, test_never_below_ordered, test_final_count_reduction,
+            test_colour_resolution,
             test_line_fields_surfaced, test_colour_provenance, test_prompt_version,
             test_unopenable_files, test_size_value_space_failsafe,
             test_no_packing_sheet_becomes_manual_entry,

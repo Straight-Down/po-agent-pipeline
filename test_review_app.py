@@ -1225,9 +1225,28 @@ def test_the_wording_map_tracks_what_the_matcher_writes() -> None:
           "summary sentence: nothing matched")
 
     kind = wording.block_kind(blocked(accumulation_basis="FIRST_SHIPMENT", attention_reason=below))
-    check(kind == "below_ordered" and "never lowers an ordered quantity"
+    check(kind == "below_ordered" and "doesn't lower an ordered quantity unless"
           in wording.BLOCK_MESSAGES[kind],
           "and the disabled Approve explains it as below ordered, not as 'no quantity'", kind)
+
+    # The factory's final count (2026-11-11): the reduction IS proposed. Its sentence
+    # is shown verbatim, it is NOT read as the below-ordered refusal, and the line is
+    # approvable like any flagged line with a figure.
+    final = ("This packing slip ships less than is ordered on NetSuite line 51: 343 ordered, "
+             "342 on this slip. It lists all of W340039 NIN on this PO (1,063 units against "
+             "1,050 still to receive, every one of its 6 open lines listed, and no other line "
+             "more than a few units short), and this line is short by only 1 unit, so it reads as the factory's final count. Approving this PO lowers "
+             "line 51 from 343 to 342. If more is still coming for this line, don't approve it.")
+    got = wording.reasons(final)
+    check(got == [final], "the final-count reason is shown verbatim, as one sentence", str(got))
+    from review_app import data as rdata
+
+    row = {"state": "NEEDS_ATTENTION", "human_verdict": None, "ns_line_id": "51",
+           "ns_line_is_open": True, "proposed_quantity": 342, "current_quantity": 343,
+           "accumulation_basis": "FIRST_SHIPMENT", "attention_reason": final}
+    check(not wording.is_below_ordered(row) and rdata._disposition(row) == ("approve", ""),
+          "and the line is approvable, never left out as below ordered",
+          str(rdata._disposition(row)))
 
     many = wording.rows_lost_message({"lines_extracted": 44, "removed": [
         {"reason": "NOT SHIPMENT DATA (no carton backing)"}] * 16})

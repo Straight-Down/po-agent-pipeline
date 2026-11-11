@@ -673,7 +673,8 @@ not as history - a rule without its failure mode gets rationalised away.
   `_error_kind` records TRANSIENT, never PERMISSION or VALIDATION. Classifying by
   the final error alone recorded "nothing was changed" for a write that had
   landed and stranded the line for good (caught in review, 2026-11-04).
-- **Never propose a quantity below the line's ordered quantity** (Kiko, 2026-11-09;
+- **Never propose a quantity below the line's ordered quantity, except the
+  final-count case at the end of this entry** (Kiko, 2026-11-09;
   `matcher._never_below_ordered`, RUNBOOK §4). A first shipment's slip figure used
   to be proposed as-is. In the PO 1657 rehearsal that proposed 216→37, 315→111,
   250→128 and 360→200 from a slip covering 1,049 of 4,400 units. Written, the line
@@ -682,12 +683,35 @@ not as history - a rule without its failure mode gets rationalised away.
   gives both figures, the whole PO's coverage against what is STILL TO RECEIVE
   (ordered less received, on OPEN lines only - a line closed short expects
   nothing more - never the ordered total), and the exact figure to enter if
-  she reduces it. Do not "fix" the flag back into
+  she reduces it. Outside the final-count case, do not "fix" the flag back into
   a proposal, and do not move the rule into the review app (Phase 3 Requirements
   §8). The basis stays FIRST_SHIPMENT on purpose: a new value means a
   CHECK-constraint migration. A future line-picker for NEEDS_RESOLUTION /
   NEEDS_ASSIGNMENT must apply the same floor to the chosen line. Those rows still
   carry the raw slip figure.
+  **One exception, the factory's final count** (Kiko, 2026-11-11, from Paula's
+  answers of 2026-11-09; `matcher._final_count`, RUNBOOK §4). A first shipment on a
+  never-seen line IS proposed below ordered, still flagged, when ALL THREE hold:
+  - the slip covers the line's whole style/colour group: every OPEN line of it
+    listed, and at least 95% of what the group still has to receive;
+  - the line is short by at most 3 units AND 5% of its order;
+  - no OTHER open line of the group is short beyond that same threshold
+    (`_short_beyond_threshold`). Coverage is a total: 150 and 50 against two
+    orders of 100 read as 100%, so without this an over-shipped size covers
+    for a real shortfall. Do not drop it as "implied by the 95%": with no
+    receipts, condition 3 implies the 95%, but the 95% never implies condition 3.
+
+  Measure coverage on the GROUP, never the whole PO. Whole-PO coverage was
+  specified first and the staged data refuted it: PO 1650 (16.5% of its PO) must
+  propose and PO 1657 (23.8%) must flag, because factories ship complete styles,
+  not a fraction of every style. Never extend it to a line seen on an earlier slip
+  (its final figure is the sum of slips) or to the ACCUMULATED path. A slip row
+  whose colour is AMBIGUOUS on the PO must list nothing and add no units: it once
+  made a guessed colour's group read as covered (code review, 2026-11-11,
+  `test_final_count_reduction`). A group with two slip rows for one size, or one
+  row matching two open lines, is never covered. Do not loosen
+  the thresholds without evidence. They translate Paula's unwritten judgement
+  (RUNBOOK §6 item 32), so treat them as provisional.
 - **A NetSuite line NUMBER identifies a line only together with its PO.**
   Line numbers restart at 1 on every PO. Migration 0004's
   `ux_proposed_changes_one_line_per_shipment` keyed on (shipment, line number),

@@ -39,14 +39,24 @@ it — replacing a first shipment of 128 with a second of 100 would silently los
 figure, because the base is zero -- unless that figure is below what the line
 orders (next ruling).
 
-**Never below what is ordered (Kiko, 2026-11-09).** This engine never proposes a
-quantity below the line's current ordered quantity. A first shipment whose slip
-figure is lower proposes nothing and is flagged with both figures and, measured
-across the whole PO, how much of the order the slip covers. Writing it would set
-the line to one partial shipment's quantity; NetSuite would mark the line fully
-received once those units arrived, and no later slip could add the remainder.
-A short slip is a final short shipment or a partial delivery, and the numbers
-cannot say which, so the engine refuses to decide. See `_accumulated_quantity`.
+**Never below what is ordered (Kiko, 2026-11-09), with one exception for the
+factory's final count (2026-11-11).** This engine does not propose a quantity
+below the line's current ordered quantity. A first shipment whose slip figure is
+lower proposes nothing and is flagged with both figures and, measured across the
+whole PO, how much of the order the slip covers. Writing it would set the line to
+one partial shipment's quantity; NetSuite would mark the line fully received once
+those units arrived, and no later slip could add the remainder.
+
+The exception rests on Paula's answers of 2026-11-09: a slip well under the order
+is a partial shipment with more to come, and a line short by a few units is the
+factory's final count. A first-shipment reduction IS proposed, flagged with why,
+when ALL THREE hold: the slip covers the line's whole style/colour group (every
+open line of it listed, and at least `FINAL_COUNT_GROUP_COVERAGE` of what the group
+still has to receive); the line itself is short by at most
+`FINAL_COUNT_MAX_SHORT_UNITS` units and `FINAL_COUNT_MAX_SHORT_FRACTION` of its
+order; and no other open line of the group is short beyond that same threshold. Measured on the GROUP, not the PO: factories ship complete styles, not a
+fraction of every style, so a slip can cover a sixth of a PO and all of the
+styles it carries. See `_accumulated_quantity` and `_final_count`.
 
 **The arithmetic base is this tool's own record, never NetSuite's current
 quantity.** That is not an optimisation and it is not an oversight; see
@@ -298,7 +308,8 @@ class ProposedChange:
 
     #: The five quantity figures for this line, on EVERY change -- see
     #: `_line_balance`. Display context; nothing branches on THIS payload. The
-    #: never-below-ordered rule (2026-11-09) is enforced in `_accumulated_quantity`.
+    #: never-below-ordered rule (2026-11-09) and its final-count exception
+    #: (2026-11-11) are enforced in `_accumulated_quantity`.
     line_balance: dict = field(default_factory=dict)
 
     #: How `proposed_quantity` was arrived at -- see `_accumulated_quantity`.
@@ -704,7 +715,8 @@ def _line_balance(line: Optional[POLine], slip_quantity: Optional[float]) -> dic
 
     **This payload is not a gate.** But a gate on the same figures now exists:
     **SUPERSEDED IN PART 2026-11-09 (Kiko)** -- `_accumulated_quantity` refuses to
-    propose anything below the line's ordered quantity (RUNBOOK section 4). It is a
+    propose anything below the line's ordered quantity (RUNBOOK section 4), except a
+    first shipment that reads as the factory's final count (2026-11-11). It is a
     narrower rule than the one cancelled below: that one demanded slip == outstanding
     and so also blocked over-shipment; this one only blocks reductions. And the
     cancellation's main argument -- short-ship and partial delivery are the same
@@ -741,30 +753,227 @@ def _line_balance(line: Optional[POLine], slip_quantity: Optional[float]) -> dic
     }
 
 
+# -- the factory's final count (Kiko, 2026-11-11, from Paula's answers of 2026-11-09) --
+#
+# A reduction below ordered is proposed only when ALL hold (`_final_count`):
+#   1. the slip covers the line's whole style/colour group -- every OPEN line of the
+#      group is on it, and it lists at least FINAL_COUNT_GROUP_COVERAGE of what the
+#      group still has to receive;
+#   2. the line's own shortfall is small: at most FINAL_COUNT_MAX_SHORT_UNITS units
+#      AND at most FINAL_COUNT_MAX_SHORT_FRACTION of the line's ordered quantity; and
+#   3. (Kiko, 2026-11-11, after review) no OTHER open line of the group is short by
+#      more than that same per-line threshold. Coverage is a group TOTAL, so an
+#      over-shipment on one size can cover for a real shortfall on another: 150
+#      and 50 against two orders of 100 read as 100 percent. A line short beyond the
+#      threshold means the group is not complete, whatever the arithmetic says.
+#
+# Calibrated on the staged data (Sandbox 2, read 2026-11-11), which fixes the
+# direction, not the exact figures:
+#   - must propose: SD-219's three lines, each short by 1 unit (343/342, 70/69,
+#     51/50, i.e. 0.3 to 2.0 percent), in groups the slip covers at 101 to 103
+#     percent with every open line listed;
+#   - must flag: PO 1657, short by 44 to 83 percent per line, in groups covered at
+#     16 and 33 percent with 4 of 6 open lines missing.
+# 95 percent leaves room for a final count a few units light across a group; 5
+# percent and not 2 keeps PO 1704 line 15 (1 of 51, 1.96 percent) off the edge.
+# The unit cap stops "5 percent" meaning 50 units on a 1,000-unit line; the
+# fraction cap stops 3 units meaning most of a 4-unit line. Together: up to 3 short
+# on lines of 60 or more, 2 on 40 or more, 1 on 20 or more, and never below 20.
+#
+# Measured on the GROUP, not the PO. Whole-PO coverage was specified first and
+# refuted by this same data: PO 1650's slip covers 16.5 percent of its PO and must
+# propose, PO 1657's covers 23.8 percent and must flag. Factories ship complete
+# styles rather than a fraction of every style, so the group is the level at which
+# "this slip is all of it" can be read. RUNBOOK section 4.
+FINAL_COUNT_GROUP_COVERAGE = 0.95
+FINAL_COUNT_MAX_SHORT_UNITS = 3.0
+FINAL_COUNT_MAX_SHORT_FRACTION = 0.05
+
+#: The phrase the review app keys on (`review_app/wording.py`). Kept whole in ONE
+#: literal: `test_the_wording_map_tracks_what_the_matcher_writes` reads this file.
+FINAL_COUNT_PROPOSED = "reads as the factory's final count"
+
+
+@dataclass(frozen=True)
+class GroupCoverage:
+    """
+    How much of one style/colour group on a PO this slip covers, OPEN lines only.
+
+    `outstanding` is ordered less received per open line, floored at zero -- the
+    same measure `_po_coverage` uses for the whole PO. `slip_units` is every slip
+    quantity on this PO that matched an open line of the group.
+    `short_line_ids` are the group's open lines whose slip figure falls short of
+    what they still have to receive by more than the per-line threshold
+    (`_short_beyond_threshold`) -- the target among them, if it is.
+    """
+
+    label: str
+    open_lines: int
+    open_lines_on_slip: int
+    outstanding: float
+    slip_units: float
+    #: Some slip row in this group could not be placed one row to one line: two
+    #: rows for one style/colour/size, or one row matching two open lines. Its
+    #: units cannot be attributed per line, so the group is never covered.
+    rows_not_one_to_one: bool = False
+    short_line_ids: frozenset = frozenset()
+
+    @property
+    def every_open_line_listed(self) -> bool:
+        return self.open_lines > 0 and self.open_lines_on_slip == self.open_lines
+
+    @property
+    def covered(self) -> bool:
+        return (not self.rows_not_one_to_one and self.every_open_line_listed
+                and self.outstanding > QUANTITY_TOLERANCE
+                and self.slip_units >= FINAL_COUNT_GROUP_COVERAGE * self.outstanding
+                - QUANTITY_TOLERANCE)
+
+
+def _group_key(line: POLine) -> tuple:
+    return (canonical(line.style_number), canonical(line.color))
+
+
+def _group_coverage(
+    po_number: str,
+    ns_lines: list[POLine],
+    vendor_lines: Sequence[dict],
+    colour_lookup: Optional[ColourLookup] = None,
+) -> dict[tuple, GroupCoverage]:
+    """
+    `GroupCoverage` for every style/colour group with an open line on the PO, keyed
+    by `_group_key`. Slip lines are placed through `_find_matching_lines`, the same
+    matching the change records use (colour names included), so a group counts as
+    listed exactly when the tool matched it. Conservative wherever placement is in
+    doubt, because a group that wrongly reads as covered lets a reduction through:
+
+    - A slip line with no numeric quantity lists nothing: no figure to cover with.
+    - A slip line whose printed colour is AMBIGUOUS on the PO lists nothing and adds
+      no units. `_find_matching_lines` returns every candidate colour's lines for
+      it, and crediting the row to each would let a guess satisfy "every open line
+      is on the slip" for a colour it may not belong to.
+    - A slip row that cannot be placed one row to one line marks its group
+      `rows_not_one_to_one`, which is never `covered`: two or more rows for ONE
+      style/colour/size (a split across transport-mode recap rows, or a repeat),
+      or one row matching two OPEN lines (a duplicate key, NEEDS_RESOLUTION).
+      Whether such rows add up, or which line they belong to, is exactly what the
+      tool does not decide -- and the per-line shortfall test needs each line's own
+      figure.
+    """
+    counted = [line for line in ns_lines if line.is_open and not line.closed]
+    groups: dict[tuple, list[POLine]] = {}
+    for line in counted:
+        groups.setdefault(_group_key(line), []).append(line)
+    counted_ids = {id(line) for line in counted}
+    per_line: dict[int, float] = {}  # id(open line) -> the slip units placed on it
+    rows_per_line: dict[int, int] = {}
+    units: dict[tuple, float] = {}
+    unplaceable: set[tuple] = set()
+    for vl in vendor_lines:
+        if po_number_key(vl.get("po_number")) != po_number:
+            continue
+        quantity = _as_quantity(vl.get("quantity"))
+        if quantity is None:
+            continue
+        lines, _resolution, problem, _provenance = _find_matching_lines(vl, ns_lines, colour_lookup)
+        if problem:
+            continue
+        open_lines = [m for m in lines if id(m) in counted_ids]
+        for key in {_group_key(m) for m in open_lines}:
+            units[key] = units.get(key, 0.0) + quantity
+        if len(open_lines) > 1:
+            unplaceable.update(_group_key(m) for m in open_lines)
+        for m in open_lines:
+            per_line[id(m)] = per_line.get(id(m), 0.0) + quantity
+            rows_per_line[id(m)] = rows_per_line.get(id(m), 0) + 1
+    unplaceable.update(_group_key(m) for m in counted if rows_per_line.get(id(m), 0) > 1)
+
+    def still_to_receive(m: POLine) -> float:
+        return max(float(m.quantity or 0) - float(m.quantity_received or 0), 0.0)
+
+    return {
+        key: GroupCoverage(
+            label=f"{members[0].style_number} {members[0].color}".strip(),
+            open_lines=len(members),
+            open_lines_on_slip=sum(1 for m in members if id(m) in per_line),
+            outstanding=sum(still_to_receive(m) for m in members),
+            slip_units=units.get(key, 0.0),
+            rows_not_one_to_one=key in unplaceable,
+            short_line_ids=frozenset(
+                m.line_id for m in members
+                if _short_beyond_threshold(still_to_receive(m) - per_line.get(id(m), 0.0),
+                                           float(m.quantity or 0))),
+        )
+        for key, members in groups.items()
+    }
+
+
+def _short_beyond_threshold(short: float, ordered: float) -> bool:
+    """The per-line threshold, one definition for the target AND its group: short
+    by more than FINAL_COUNT_MAX_SHORT_UNITS units, or by more than
+    FINAL_COUNT_MAX_SHORT_FRACTION of what the line orders."""
+    return (short > FINAL_COUNT_MAX_SHORT_UNITS + QUANTITY_TOLERANCE
+            or short > FINAL_COUNT_MAX_SHORT_FRACTION * ordered + QUANTITY_TOLERANCE)
+
+
+def _final_count(ordered: float, slip: float, group: Optional[GroupCoverage],
+                 line_id: Optional[str] = None) -> bool:
+    """
+    The three tests of the factory's final count (2026-11-11): the slip covers the
+    line's whole group; the line's own shortfall is within the per-line threshold;
+    and no OTHER open line of the group is short beyond it. Any failing, or no
+    group measure, is False.
+    """
+    # The target's shortfall is ordered less slip, where its neighbours' is still-to-
+    # receive less slip. The same thing here: the exception only runs on the
+    # FIRST_SHIPMENT path, which a line with receipts never reaches (it takes the
+    # PRE_EXISTING_RECEIPT rule). If that ever changes, pass the target's
+    # still-to-receive figure instead, or the two definitions diverge.
+    short = ordered - slip
+    if group is None or short <= QUANTITY_TOLERANCE or slip < 0:
+        return False
+    others_short = group.short_line_ids - {line_id}
+    return (not _short_beyond_threshold(short, ordered) and group.covered
+            and not others_short)
+
+
 def _accumulated_quantity(
     line: Optional[POLine],
     slip_quantity: Optional[float],
     history: Optional[LineHistory],
     *,
     po_coverage: Union[str, Callable[[], str]] = "",
+    group_coverage: Optional[Callable[[POLine], Optional["GroupCoverage"]]] = None,
 ) -> tuple[Optional[float], dict, Optional[str]]:
     """
     What the line's quantity should become, given that slips accumulate.
 
     Returns `(proposed_quantity, accumulation, problem)`. A `problem` means the
     tool refused to compute anything: `proposed_quantity` comes back None and the
-    caller flags the line for Paula.
+    caller flags the line for Paula. A proposal that still needs saying something
+    about -- a reduction proposed as the factory's final count -- comes back with
+    no problem and the sentence in `accumulation["final_count_reason"]`, which the
+    caller adds to the line's reasons.
 
     ## Never below what is ordered (Kiko, 2026-11-09)
 
     Whatever the arithmetic below produces, a figure under the line's current
-    ordered quantity is never proposed: `proposed_quantity` comes back None, the
+    ordered quantity is not proposed: `proposed_quantity` comes back None, the
     payload carries `below_ordered`, and the problem states both figures plus
     `po_coverage` -- the caller's sentence on how much of the WHOLE PO this slip
     covers, which is better evidence of a partial shipment than one line. It may be
     a callable, so the caller only measures a PO when a line on it is refused. The
     `basis` stays what it was (normally FIRST_SHIPMENT): this is a refusal, not a
     different kind of history, and adding a basis value would mean a migration.
+
+    **The one exception: the factory's final count (2026-11-11).** On a first
+    shipment against a line the tool has never seen, the reduction IS proposed
+    when the slip covers the line's whole style/colour group and the line is short
+    by only a little, and no other line of the group is short by more --
+    `_final_count` holds the three tests and their thresholds.
+    `group_coverage` gives the caller's measure of the target line's group; without
+    it the exception never applies, so a caller that does not measure gets the
+    refusal, never an unexamined reduction.
 
     Why: writing a short slip's figure sets the line to one partial shipment.
     NetSuite marks it fully received and not open once those units arrive, and no
@@ -783,8 +992,9 @@ def _accumulated_quantity(
     have no target line, never reach this function's arithmetic, and keep the
     slip's raw figure in `proposed_quantity`. That is not a write today -- the
     review app cannot choose a line and `to_netsuite_fields` raises LineAmbiguous
-    -- but **whatever chooses the line later must apply this floor against the
-    chosen line's ordered quantity**, or it reopens the 216 -> 37 write.
+    -- but **whatever chooses the line later must apply this floor, and its
+    final-count exception, against the chosen line's ordered quantity**, or it
+    reopens the 216 -> 37 write.
 
     ## Why the base is not NetSuite's current quantity
 
@@ -899,7 +1109,8 @@ def _accumulated_quantity(
                 "this line should total"
             )
         payload["basis"] = BASIS_ACCUMULATED
-        return _never_below_ordered(expected + slip, payload, line, slip, history, po_coverage)
+        return _never_below_ordered(expected + slip, payload, line, slip, history, po_coverage,
+                                    group_coverage)
 
     payload.update({"base_quantity": 0.0, "prior_writes": 0})
     if history is not None and history.observed_quantity is not None:
@@ -946,7 +1157,7 @@ def _accumulated_quantity(
             "combined total"
         )
     payload["basis"] = BASIS_FIRST_SHIPMENT
-    return _never_below_ordered(slip, payload, line, slip, history, po_coverage)
+    return _never_below_ordered(slip, payload, line, slip, history, po_coverage, group_coverage)
 
 
 #: The phrase the review app keys on (`review_app/wording.py`). Kept whole in ONE
@@ -967,11 +1178,19 @@ def _never_below_ordered(
     slip: float,
     history: Optional[LineHistory],
     po_coverage: Union[str, Callable[[], str]],
+    group_coverage: Optional[Callable[[POLine], Optional[GroupCoverage]]] = None,
 ) -> tuple[Optional[float], dict, Optional[str]]:
     """
     The floor (Kiko, 2026-11-09): `proposed` passes through unless it is below
     the line's ordered quantity, in which case nothing is proposed and the line is
     flagged with what the tool knows. See `_accumulated_quantity`.
+
+    Except the factory's final count (2026-11-11): a FIRST_SHIPMENT reduction on a
+    line never seen before passes through when `_final_count` holds, with the
+    reason in `payload["final_count_reason"]`. Never on a line seen on an earlier
+    slip -- its final figure is this slip PLUS the earlier ones, which the tool
+    does not add up -- and never on the ACCUMULATED path, which only falls below
+    ordered on a negative slip.
 
     The text is written for the reviewer and contains no ';' -- the caller joins
     reasons with '; ', and the review app shows this one whole.
@@ -981,6 +1200,34 @@ def _never_below_ordered(
         return proposed, payload, None
 
     payload["below_ordered"] = True
+    seen_before = (history is not None and not history.has_written
+                   and history.observed_quantity is not None)
+    # The target must itself be one of the open lines its group was measured over
+    # (open AND not ticked closed), or the group is not its group.
+    if (payload.get("basis") == BASIS_FIRST_SHIPMENT and not seen_before
+            and group_coverage is not None and line.is_open and not line.closed):
+        group = group_coverage(line)
+        if _final_count(ordered, proposed, group, line.line_id):
+            short = ordered - proposed
+            payload["final_count"] = {
+                "group": group.label, "group_open_lines": group.open_lines,
+                "group_outstanding": group.outstanding, "group_slip_units": group.slip_units,
+                "short_by": short,
+            }
+            payload["final_count_reason"] = (
+                f"This packing slip ships less than is ordered on NetSuite line {line.line_id}: "
+                f"{_units(ordered)} ordered, {_units(proposed)} on this slip. It lists all of "
+                f"{group.label} on this PO ({_units(group.slip_units)} units against "
+                f"{_units(group.outstanding)} still to receive, every one of its "
+                f"{group.open_lines} open line{'s' if group.open_lines != 1 else ''} listed, "
+                "and no other line more than a few units short), and this "
+                f"line is short by only {_units(short)} unit{'s' if short != 1 else ''}, so it "
+                f"{FINAL_COUNT_PROPOSED}. Approving this PO lowers line {line.line_id} from "
+                f"{_units(ordered)} to {_units(proposed)}. If more is still coming for this "
+                "line, don't approve it."
+            ).replace(";", ",")
+            return proposed, payload, None
+
     if payload.get("basis") == BASIS_FIRST_SHIPMENT:
         first = (f"This packing slip ships less than is ordered on NetSuite line {line.line_id}: "
                  f"{_units(ordered)} ordered, {_units(slip)} on this slip.")
@@ -991,8 +1238,6 @@ def _never_below_ordered(
     coverage = po_coverage() if callable(po_coverage) else po_coverage
     if coverage:
         parts.append(coverage)
-    seen_before = (history is not None and not history.has_written
-                   and history.observed_quantity is not None)
     if seen_before:
         when = str(history.observed_at or "")[:10]
         parts.append(
@@ -1306,6 +1551,19 @@ def build_proposed_changes(
             return coverage_by_po[po]
         return measure
 
+    # Each style/colour group's coverage, for the final-count exception (2026-11-11).
+    # Same laziness: measured once per PO, and only when a line on it is below ordered.
+    groups_by_po: dict[str, dict[tuple, GroupCoverage]] = {}
+
+    def group_coverage_for(po: str) -> Callable[[POLine], Optional[GroupCoverage]]:
+        def measure(line: POLine) -> Optional[GroupCoverage]:
+            if po not in groups_by_po:
+                groups_by_po[po] = _group_coverage(
+                    po, ns_lines_by_po.get(po, []), vendor_lines,
+                    (colour_lookups or {}).get(po))
+            return groups_by_po[po].get(_group_key(line))
+        return measure
+
     # Shipment rows that share a key with each other -- i.e. one size split across
     # several transport-mode recap rows. Built once, keyed WITHOUT the recap label
     # so the siblings can see each other; see `_sibling_key`.
@@ -1368,7 +1626,8 @@ def build_proposed_changes(
         slip_quantity = _as_quantity(vl.get("quantity"))
         history = (line_history or {}).get((po_number, match.line_id)) if match else None
         proposed_quantity, accumulation, accumulation_problem = _accumulated_quantity(
-            match, slip_quantity, history, po_coverage=coverage_for(po_number)
+            match, slip_quantity, history, po_coverage=coverage_for(po_number),
+            group_coverage=group_coverage_for(po_number),
         )
         if not accumulation:
             # No accumulation applied: unmatched line, or a quantity that is not a
@@ -1430,6 +1689,11 @@ def build_proposed_changes(
             # line below what is ordered (2026-11-09). The figures go to Paula
             # verbatim: the tool does not pick one and does not reconcile them.
             reasons.append(accumulation_problem)
+        if accumulation.get("final_count_reason"):
+            # A reduction proposed as the factory's final count (2026-11-11). Proposed,
+            # and still flagged: the reviewer is told why the tool lowered an order,
+            # and that approving writes it.
+            reasons.append(accumulation["final_count_reason"])
         if match is None and candidates and all(line.closed for line in candidates):
             # Nothing writable and the candidates were deliberately closed. Keep
             # the structural guard alive: to_netsuite_fields() must still refuse,

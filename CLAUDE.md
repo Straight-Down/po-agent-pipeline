@@ -584,9 +584,17 @@ not as history - a rule without its failure mode gets rationalised away.
   3 attempts, backoff, link/timeout SQLSTATEs only), and only on engines built
   by `dialect_target.connect()` - the migration tests' `sc.connect(url)` engines
   and the Alembic subprocess get no retry and no count. Do not widen it to
-  statements or add `pool_pre_ping`: a retry inside a transaction can replay
-  work, and a silent one turns a bad link into a green run. The count prints at
+  statements: a retry inside a transaction can replay work. The count prints at
   the end of every `--mssql` run, zero included - read it.
+  **`pool_pre_ping` is a different case, and its rule is conditional** (corrected
+  2026-11-11; it was banned together with statement retries for the replay reason,
+  which does not apply to it). It tests a pooled connection when it is checked
+  out, before any statement runs, so it replays nothing. The risk is that
+  SQLAlchemy replaces a dead connection SILENTLY, outside the harness's counter.
+  A run could then report "0 connection retries" while connections were being
+  swapped, turning a bad link into a green run. **It may be enabled only if its
+  replacements are counted and printed alongside the connection-retry count**, at
+  the end of every server run, zero included. Not before.
 - **A whole TEST is re-run only when the link failed, at most twice, and never
   for an assertion** (`conftest.pytest_runtest_protocol`,
   `dialect_target.run_test_with_retries`; server targets only). Connection-class

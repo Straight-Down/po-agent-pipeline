@@ -1631,7 +1631,7 @@ Nothing was wrong with the flag. It asserts that a target is configured and reac
 - **`pool_pre_ping` was NOT enabled for the 2026-11-11 run.** It was proposed, and the proposer never confirmed it was applied, so this was checked in the code rather than assumed:
   - every server engine the harness builds comes from `schema.connect(url)`, which is a bare `create_engine(url)` with no pool arguments, and SQLAlchemy's default is `pool_pre_ping=False`;
   - the string appears nowhere in the code or its git history;
-  - the only mention is the CLAUDE.md gotcha added 2026-10-12, which rules it OUT ("Do not widen it to statements or add `pool_pre_ping`").
+  - the only mention is the CLAUDE.md gotcha added 2026-10-12, which ruled it out alongside statement retries. **Corrected 2026-11-11:** the replay reason given there applies to statement retries, not to `pool_pre_ping`, which tests a connection before any statement runs. The rule is now conditional. `pool_pre_ping` may be enabled only if its silent replacements are counted and printed beside the connection-retry count, since otherwise a run reports zero retries while connections are being swapped.
 
   So the clean run is **not** evidence for `pool_pre_ping`. No connection, pooling or retry code has changed since the test-level re-run landed on 2026-10-12 (`ab4079b`):
   - `dialect_target.py` is untouched since then;

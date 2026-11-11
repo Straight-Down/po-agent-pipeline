@@ -968,7 +968,7 @@ A change **requires** a SQL Server run if its diff does any of the following:
 - `.is_(True)` rendering `IS 1`;
 - tests that never reached the server (§8 lesson 33).
 
-**Applies from 2026-11-09.** The never-below-ordered change (§4) was the first change under it. It is pure Python: `matcher.py`, `wording.py`, a branch on fetched rows in `review_app/data.py`, and test fixtures. So it needed SQLite only; its in-progress full SQL Server run was stopped, and the full run is owed before this branch merges.
+**Applies from 2026-11-09.** The never-below-ordered change (§4) was the first change under it. It is pure Python: `matcher.py`, `wording.py`, a branch on fetched rows in `review_app/data.py`, and test fixtures. So it needed SQLite only; its in-progress full SQL Server run was stopped, and the full run was owed before the branch merged. **Discharged 2026-11-11:** the full `--mssql` suite ran on `phase4-write-path` at `3e99aac`, before the merge into `main`, and was clean (231 passed, 6 skipped, 0 connection retries, 0 tests re-run). The branch was merged on that result. The run's figures are logged under §8 lesson 33, "Full `--mssql` runs".
 
 ## 8. Lessons learned — debugging and validating against NetSuite
 
@@ -1619,6 +1619,27 @@ Nothing was wrong with the flag. It asserts that a target is configured and reac
 **The general form:** when a guarantee is delivered by things registering themselves -- a harness tests call, a hook modules install, a decorator functions wear -- the registry is a list of the compliant, and its length says nothing about coverage. Coverage needs the other list: everything that *should* have registered, enumerated independently, with the difference made to fail. Ask of any "N are covered" figure where N came from; if the covered things reported themselves, it is not a measurement of what is uncovered.
 
 **Also recorded here, because it was the other half of that session.** `sqldb-po-agent-test` is **Basic tier, 5 DTU** (not serverless, so it never auto-pauses): 300 sessions, 30 concurrent workers, max DOP 1. During four full `--mssql` runs it peaked at 91% CPU, under 4% of sessions and workers -- no limit was reached, and a limit would have answered with error 10928/40501, not with what was seen, which was `08S01` link failures and TCP timeouts. A full run takes over eight minutes on it and lost 5 to 11 tests to dropped connections each time, a different set each run, with and without the harness changes. The harness now retries **opening** a connection (three attempts, backoff, never a statement on an established connection) and prints the retry count at the end of every server run, zero included. Most of the observed drops were mid-statement and are deliberately NOT retried at that level: replaying a statement inside a transaction can repeat work. They are handled one level up instead: a test that fails with a connection-class error (SQLSTATE 08001/08S01/HYT00/HYT01, reached through SQLAlchemy's `.orig` or an explicit `raise ... from`; `TargetUnreachable` counts only when that is its cause, so a refused login is not re-run) is **re-run from the start, at most twice**, which is safe where a statement retry is not because every database-backed test starts by dropping and rebuilding the schema and inherits nothing -- true while every fixture is function-scoped, which they all are. An assertion failure is never re-run: not a test whose own `check()` recorded FALSE before the link dropped, and not an `assert` raised *while handling* a link error. The first draft got the last case wrong -- it followed the implicit `__context__`, so `except <link error>: assert ...` classified as the link and would have been re-run, and a re-run that passed would have buried the assertion. Review caught it before it was committed; the classification now takes the top-level exception's word and follows only explicit causes. Both counts print at the end of every server run, zero included, and the test-level line names each test that needed it -- a run that needed six re-runs is a different run from one that needed none, and says so. The retry is on engines built by `dialect_target.connect()` only; the migration tests build theirs with `sc.connect(url)` and run Alembic in a subprocess, so a dropped link there fails with no retry and no count. `08001` also covers DNS and TLS failures at connect, which would be counted as link retries. The tier and usage figures are session measurements from `sys.dm_user_db_resource_governance` and `sys.dm_db_resource_stats` on 2026-10-12, not derivable from the repo.
+
+**Full `--mssql` runs -- how the test database behaved.** One entry per full run. A run with re-runs is not a clean run (§7), so the two counts the harness prints at the end of every server run are recorded alongside the result.
+
+| Date | Commit | Result | Wall time | Connection retries | Tests re-run | Notes |
+|---|---|---|---|---|---|---|
+| 2026-10-12 | (four runs) | 5 to 11 tests lost per run to dropped links | over 8 min each | -- | -- | Before the test-level re-run existed. The lost tests were a different set each run. |
+| weeks before 2026-11-11 | -- | -- | -- | -- | **17-18 per run** | Recent history as reported by Kiko on 2026-11-11. The individual runs were not logged here, which is why this table now exists. |
+| **2026-11-11** | `3e99aac` (`phase4-write-path`, before merging into `main`) | **231 passed, 6 skipped** | **22 min** (1,333 s) | **0** | **0** | **The first clean run in several weeks.** The 6 skips are the same 6 as on SQLite. |
+
+- **`pool_pre_ping` was NOT enabled for the 2026-11-11 run.** It was proposed, and the proposer never confirmed it was applied, so this was checked in the code rather than assumed:
+  - every server engine the harness builds comes from `schema.connect(url)`, which is a bare `create_engine(url)` with no pool arguments, and SQLAlchemy's default is `pool_pre_ping=False`;
+  - the string appears nowhere in the code or its git history;
+  - the only mention is the CLAUDE.md gotcha added 2026-10-12, which rules it OUT ("Do not widen it to statements or add `pool_pre_ping`").
+
+  So the clean run is **not** evidence for `pool_pre_ping`. No connection, pooling or retry code has changed since the test-level re-run landed on 2026-10-12 (`ab4079b`):
+  - `dialect_target.py` is untouched since then;
+  - the later `conftest.py` change (`5f0eae9`) isolates the unrecorded-writes file and the NetSuite client;
+  - the later `schema.py` changes are table and migration definitions.
+
+  So the improvement most likely came from outside the code: the link, the server, or the time of day. One clean run is one data point. It does not show the link is fixed. **Keep logging runs here.** A table of runs is what will tell an improved link from a lucky one.
+- **The duration also moved.** §7 budgets about 30 minutes for a full run, and this one took 22 with no re-runs. Each re-run costs a test's whole duration again, so part of the usual 30 minutes is likely the re-runs themselves. That is an inference from this one run, not a measurement.
 
 ### 34. A line number is not an identity without its PO -- and a constraint can wait two months for the one input that trips it
 

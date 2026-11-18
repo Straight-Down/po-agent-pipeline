@@ -163,7 +163,7 @@ In short: everything from the mailbox to a NetSuite write is built and has been 
   - `review-test.db` (2026-09-30);
   - `e2e-sb2-20261104-test.db` and `e2e-sb2-1657-20261104-test.db`, from the 2026-11-04 Sandbox 2 rehearsal (§8 lesson 34);
   - `e2e-sb2-20261104-rerun0017-test.db`, the re-run after migration 0017 that the 2026-11-09 approvals were made in (§11);
-  - `e2e-sb2-sept-20261118-test.db`, the five September forwards re-run on current code, with its attachments in `e2e-sb2-sept-20261118-attachments/` beside it. Not yet written up in §11.
+  - `e2e-sb2-sept-20261118-test.db`, the five September forwards re-run on current code, with its attachments in `e2e-sb2-sept-20261118-attachments/` beside it. Written up in §11.
 
   The `*-test.db` names let Alembic migrate them without a confirmation; the older names need one.
 - **`po_agent.db`** in the project folder is `alembic.ini`'s default. It holds the 2026-09-14 live poll and that mailbox's watermark.
@@ -234,8 +234,17 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
 
    **Also recorded:** Inprotex uses `2XL`, `XXL` **and** `XXXL` in the *same file* for what NetSuite stores as `2X`/`3X` — three conventions from one vendor in one document. `SIZE_ALIASES` already covers all three.
 5. ~~**No handling yet for a corrupt or password-protected vendor file.**~~ **FIXED 2026-08-11.** All `openpyxl.load_workbook` / `pdfplumber.open` calls now go through `claude_extractor.open_workbook` / `open_pdf`, which raise `DocumentUnreadable` with a specific reason (truncated/corrupt zip, encrypted/password-protected, empty, wrong format, OS permission). Batch behaviour is the point: `build_source_documents` and attachment triage **flag the individual bad attachment and continue processing the rest** rather than aborting the shipment, and triage reports "could not open: &lt;reason&gt;" as its own condition, distinct from "has no size data". Two new fixtures cover it (`fixtures/corrupt_truncated.xlsx`, `fixtures/encrypted_password_protected.pdf`).
-6. **This entire system currently only runs from Kiko's laptop, using his own NetSuite employee record.** Not solved by this runbook — solved by the pending Azure migration (Key Vault, Function App) and, if audit clarity becomes important later, a dedicated NetSuite service account (currently a deliberate cost trade-off, documented in the architecture doc §6).
-7. **Vendor coverage for v1 is still undefined.** Three vendors are validated; the actual number Straight Down needs covered before this can fully replace Paula's manual process is unknown. Needs a vendor list from Paula.
+6. ~~**This entire system currently only runs from Kiko's laptop, using his own NetSuite employee record.**~~ **Corrected 2026-11-18. The login has changed; the laptop, and the NetSuite identity writes are attributed to, have not.**
+   - **Authentication is no longer Kiko's login.** Not his interactive session, and not the temporary CFO role of the planning session. The tool authenticates with the M2M certificate (OAuth 2.0 client credentials) under the dedicated least-privilege `PO Update Automation (M2M)` role, which has seven permissions (item 27; `NETSUITE-M2M-SETUP.md`).
+   - **The NetSuite identity is still Kiko's employee record.**
+     - The certificate mapping needs an employee as its entity, and the sandbox setup uses Kiko's existing record on purpose: a dedicated employee costs a paid licence (`NETSUITE-M2M-SETUP.md` Step 3).
+     - So NetSuite's own system notes attribute the tool's writes to Kiko, indistinguishable there from his manual edits. This tool's `audit_log` and `write_attempts` record which writes were automated.
+     - This repo does not record which employee the production mapping uses.
+     - If NetSuite-side attribution matters, decide on a dedicated service account before cutover. Per that doc, nothing else in the setup changes.
+   - **It still runs only on Kiko's laptop, started by hand:** the poll, the extraction and the review app (§2; §11, "Not started: production cutover"). Hosting (Function App, Key Vault) is the fix, and it is not provisioned.
+7. **Vendor coverage for v1 is still undefined.** ~~Three vendors are validated~~ **Five vendors are validated (corrected 2026-11-18):** Inprotex, Legendz, Symmetry, Tainan and CMG footwear, each against hand-derived, line-level ground truth (build plan Phase 1, `--live`, 2026-09-14).
+   - A sixth, the PL0730 vendor (POs 511 and 533), has been extracted from live mail twice (2026-09-14 and 2026-11-18). It was never graded: there is no ground truth for it, and none of its lines matched an open NetSuite line.
+   - The number of vendors Straight Down needs covered before this can fully replace Paula's manual process is still unknown. Needs a vendor list from Paula.
 8. ~~**The NetSuite least-privilege role can't do PO-number search/lookup**~~ **RESOLVED 2026-08-12.** Root cause: the `PO Update Automation (M2M)` role was missing **`Reports > SuiteAnalytics Workbook`**. Added at **Edit** level — which is the **only** level this permission offers, not a choice (see the closed sub-item below) — and `GET /purchaseOrder?limit=1` returns `200`. **Confirmed sole cause by bisect:** `Lists > Subsidiaries` and `Lists > Accounts` were added in the same batch, then removed, and the call still returns 200 without them.
 
    **The diagnostic signature, worth recognising on sight:** this one permission gates **all** of
@@ -1738,7 +1747,7 @@ See `PO-Update-Automation-Build-Plan.md` for full phase detail. **Restructured 2
   - a watermark with overlap, and per-message failure isolation;
   - a separate extraction driver, `extract_pending.py`.
 
-  Run against the live mailbox by hand on 2026-09-14 (§6 item 29) and 2026-11-18 (a dry run, then the September forwards re-run on current code; not yet written up). `.env` keeps `GRAPH_CLIENT=mock`, so live mail is read only when a single command sets `GRAPH_CLIENT=real`. Nothing polls on a schedule, because there is no hosting (below).
+  Run against the live mailbox by hand on 2026-09-14 (§6 item 29) and 2026-11-18 (a dry run, then the September forwards re-run on current code, written up below). `.env` keeps `GRAPH_CLIENT=mock`, so live mail is read only when a single command sets `GRAPH_CLIENT=real`. Nothing polls on a schedule, because there is no hosting (below).
 - **Phase 3: built (review UI v1 2026-09-30; Approve writes to NetSuite since 2026-11-02).** One gap remains: there is no picker for a line that matches several NetSuite lines (`NEEDS_RESOLUTION` / `NEEDS_ASSIGNMENT`). Those lines are left out of Approve, and §4 says what such a picker must apply. Its requirements are unusually complete but were scattered across **five** sources — the build plan, this runbook's §7, `PO-Update-Automation-Schema-Rationale.md`, `PO-Update-Automation-Architecture.md`, and several docstrings. **Consolidated 2026-09-16 into `PO-Update-Automation-Phase3-Requirements.md`**, which indexes all eleven and cites each back to its source; those sources stay authoritative. **Paula ruled on the last four open questions on 2026-09-16** (§6 item 30), so nothing in it is now pending a decision — the approval unit is per PO, partial failures retry per line, Paula is the sole approver, and multi-batch quantities accumulate. Only the fourth needed code. **The per-PO approval unit stands.** A 2026-10-21 decision to move to per-line approval was itself superseded on 2026-11-02 (Phase 4 decision 5 below); lines that can't be changed are left out of Approve instead. **Review UI v1 built 2026-09-30** (`review_app/`, local FastAPI on 127.0.0.1, no auth): the queue, the per-PO page, Approve / Reject per PO, and source documents served only through a proposal. A PO with no open NetSuite line when its slip was processed never appears to the reviewer; `/no-action` lists them for diagnosis, reachable by URL only and linked from nowhere (the setting that put them back in the queue was removed 2026-09-30). Every reviewer-facing message says whether anything is needed and what; internal detail sits behind a collapsed Details toggle, and `test_no_internal_detail_outside_the_details_toggle` enforces it. **Approve writes to NetSuite since 2026-11-02:** it records the verdicts, calls `write_path.write_po_batch` (one PATCH per PO; Phase 4 decision 2 below) while she waits, and shows a result page; the package may import that one function and nothing else from the write side (tested). Lines that can't be changed -- blocked, or needing a choice between NetSuite lines (NEEDS_RESOLUTION / NEEDS_ASSIGNMENT, for which there is still no picker) -- are left out of Approve and listed, instead of disabling it or refusing the page. A PRE_EXISTING_RECEIPT line never asks for a total (2026-10-21): one whose figures all agree is hidden from the reviewer and listed on `/no-action`, and a PO with nothing else left to decide is parked there too; one whose figures disagree blocks Approve with the figures stated, and is fixed in NetSuite. Run: `set PO_AGENT_REVIEWER=<name>` then `.venv\Scripts\python -m review_app --db sqlite:///<db>`.
 - **The Phase 4 decisions (Kiko, 2026-10-21): made, and four of six settled.** Decisions 2, 3 and 6 are built, and 5 is superseded (approval stays per PO). **Not built:**
   - decision 1, the daily digest email, which is blocked on Graph `Mail.Send`;
@@ -1924,6 +1933,90 @@ All 17 are increases, all `FIRST_SHIPMENT`. Each was recorded `SUCCESS` with HTT
 POs 1645, 1650, 1662 and 1704 remain undecided in that database.
 
 **Bearing on cutover (§12).** This shows the mechanics of the approved path work end to end against a real NetSuite account. It does **not** discharge §12 item 4: every figure here is Sandbox 2, which disagrees with production (§8 lesson 31).
+
+### Re-run of the September forwards on current code (Kiko, 2026-11-18): the pipeline runs on real documents, which says nothing about the quantities
+
+**Why it was run.** The seven live messages had been ingested twice before: 2026-09-14 (§6 item 29) and 2026-09-28 (`rerun10.db`). Both runs used the code of their day, before these changes:
+- receipts compared with the slip, never added to it (2026-10-21);
+- quantity only, with no dates (2026-11-02);
+- never below ordered (2026-11-09) and migration 0017;
+- the factory's final count (2026-11-11).
+
+The 2026-11-09 rehearsal used the mock client and the Inprotex email only. No run of the real forwards on current code was on record.
+
+**Set-up.**
+- **Run database:** a fresh `~/po-agent-runs/e2e-sb2-sept-20261118-test.db`, migrated to 0017.
+- **Attachments:** in their own folder beside it.
+- **NetSuite:** resolved to `1321665-sb2` (`is_sandbox` true) before ingesting. `PO_AGENT_ALLOW_PRODUCTION_WRITES` was unset.
+- **Mail:** `GRAPH_CLIENT=real` was set for the one poll command only, so `.env` stayed `mock`.
+- **Commands:** the poll, `poller.py --from-beginning`, then `extract_pending.py`.
+- **Writes:** none. No verdict and no `write_attempts` row were recorded.
+- **Checkpoint:** the local `po_agent.db` and its watermark were byte-identical before and after.
+
+**What came in.**
+- **7 messages, 0 poll errors, 0 extraction failures.** All 7 are marked extracted. They produced **4 shipments**:
+  - the two forwards of the Symmetry 1720/1721 notice were skipped as duplicates before any model call (`INGEST_SKIPPED_DUPLICATE`), because the seeded "Shipment updates" email carries the same rollup and had already produced that shipment;
+  - one message had no attachments.
+- **30 attachments, which are 18 distinct files:**
+
+  | Classified as | Files | What happened to them |
+  |---|---|---|
+  | Packing list | 6 | Symmetry rollup and carton detail, Tainan 1725, PL0730 (511/533), Inprotex SD-219, Legendz PL0801 |
+  | Commercial invoice | 5 | Includes the two PO 1624 workbooks. Their packing sheets carry the per-size data, and the Clearance Invoice was used as 1624's main source (the file gate is per-size content, not type). |
+  | Inspection report | 2 | Excluded permanently |
+  | Other | 2 | 1624 interim footwear sheet, 1624 draft bill of lading |
+  | Payment request | 1 | Excluded |
+  | Unreadable | 2 | Two inline images, excluded by file signature |
+
+- **Main sources:** the Symmetry covering sheet, the 1624 Clearance Invoice, PL0730 and Tainan.
+- **Cross-checks:** the Symmetry carton detail agreed exactly, on 25 keys and 1,669 units. Inprotex and Legendz were in the seeded email, so they were held as cross-checks, were not compared (different POs), and none of their lines were proposed (§6 item 29).
+- **Skipped sheets:** Tainan's hidden `REV` sheet, and an invoice sheet in each 1624 workbook.
+
+**Lines.**
+- **118 rows on 6 POs, all of which resolved**, `0001725` included.
+- **All 118 matched a NetSuite line by style, colour and size.** 81 matched an open line that could be updated. 37 matched lines that are closed or no longer open: every line of POs 511 and 533.
+- **51 proposals, all increases:**
+  - 1720: 6;
+  - 1721: 17;
+  - 1725: 28. PO 1725 ships 865 against 800 ordered, over on every size (+8%).
+- **28 lines need nothing,** because the slip agrees with NetSuite:
+  - 26 on PO 1624: already received, every figure agreeing, so kept off the reviewer's page;
+  - 2 on PO 1721.
+- **39 flagged, with nothing proposed** (`NEEDS_ATTENTION`). The 37 closed-line rows still store the slip's raw figure in `proposed_quantity`, as a row with no target line does (§4), so count proposals by state, never by `proposed_quantity IS NOT NULL`, which gives 88.
+  - **POs 511 and 533, all 37 lines:** the matching NetSuite line is closed (5) or no longer open (32). These are old POs, received or billed long ago.
+  - **PO 1624, lines 5 and 6:** Sandbox 2 shows 44 and 22 ordered and received, against slip figures of 52 and 23.
+    - **This is the case §8 lesson 31 is about, and against production these lines are still wrong, not resolved.**
+    - Production holds 44 and 22 **ordered** but 52 and 23 **received**. The warehouse received what the slip says, and the line quantities were never raised to match. So the slip is right, and these are two genuinely under-stated lines.
+    - In production the PO is fully billed and no line is open, so the tool could not write them there either.
+- **Medium extraction confidence, cleared by proof (38 lines).** The extractor marked 38 of the 51 proposals medium confidence:
+  - PO 1725's 28 lines, where the inseam was inferred from the recap block layout;
+  - 10 lines of PO 1721, where the style number was carried down from the row above.
+
+  On **all 38 the flag was cleared**: every field was proven from the carton grid (`confidence_discharge`; CLAUDE.md, the medium-confidence gotcha). So **none of the 38 is flagged on the review screen**; each shows as ready to approve, with the proof under Details. Only the stored `needs_review` column still reads 1, which is why a raw count of that column reads 38 "flagged" lines. It did, once, in this run's first report, and that was wrong.
+- **16 rows removed on PO 1624:** the `By UPS` recap rows, which no carton in the document backs ("not shipment data"; carton backing).
+  - That is **16 of 44 extracted lines (36%)**, over a third, so the escalation fired: it heads the shipment's warnings, and a `SHIPMENT_ROWS_LOST` audit event was written.
+  - These are the UPS portion whose lines (production 29-44) carry hand-set receipt dates (§12 item 1).
+  - **Working as designed, not an error.**
+
+**Errors: none in the pipeline.** Everything above is a designed outcome: unreadable files excluded, sheets skipped, the escalation. Two faults were the operator's, both harmless:
+- a report script crashed printing a Chinese filename to the console;
+- a stray read-only `alembic current` ran without a target, and the migration guard refused it.
+
+**Model usage:** about 151K input and 100K output tokens for extraction and cross-checks (`shipments`, `shipment_sources`). Classifier calls are not in those columns, and no dollar figure was computed.
+
+**Against the 2026-09-14 run of the same mail:** 51 proposals, against 10 then (`PENDING_REVIEW` with a NetSuite line; §6 item 29). That is not a clean measure of the code changes, because Sandbox 2's state may also have moved between the runs. §6 item 29's other count, "resolved to a real NetSuite line, 53 of 118", was measured differently, so it is not compared here.
+
+**THE CAVEAT, which is the point of this write-up.** Against production, **essentially none of the 51 proposals would stand as a proposal.** Measured in production on 2026-10-21 (§12 item 4):
+- every line of POs 1720 and 1721 is no longer open, so there is nothing to update;
+- every line of PO 1725 already has units received, so the tool would compare the slip with the receipts rather than propose (§4), and propose nothing.
+
+So this run **proves the pipeline runs end to end on real vendor documents on current code:**
+- intake;
+- classification and the per-size file gate;
+- extraction, carton backing and the confidence discharge;
+- matching, PO resolution and the escalation.
+
+**It proves nothing about the quantities.** The figures are Sandbox 2's (§8 lesson 31), and §12 item 4 stays open.
 
 ## 12. Production cutover checklist
 

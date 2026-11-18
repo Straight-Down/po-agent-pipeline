@@ -1,9 +1,9 @@
 # PO Update Automation — System Architecture
 
-**Project:** Automate NetSuite Purchase Order updates (quantity, expected/updated/override receipt dates) from vendor shipping documents.
+**Project:** Automate NetSuite Purchase Order updates from vendor shipping documents. The tool writes the line **quantity** only. The receipt dates (expected, updated, override) are Paula's, entered by hand, and the tool never writes them (since 2026-11-02; §6.3).
 **Owner:** Paula (Supply Chain Manager) — end user / approver. Kiko — build owner.
-**Status:** Scoping doc for handoff to Claude Code implementation.
-**Last updated:** 2026-08-10
+**Status:** Began as the scoping doc for handoff to Claude Code. Phases 1-3 are built; hosting and production cutover are not (`RUNBOOK.md` §2 and §11). Sections not marked as corrected describe the design as scoped.
+**Last updated:** 2026-11-18. The database tier, the intake mailbox, the review and approval design, and the trigger design in §4 were reconciled with what was built.
 
 ---
 
@@ -53,7 +53,7 @@ Build **Option B**. Option A was the right way to validate the parsing logic and
 
 ```mermaid
 flowchart TD
-    A[Vendor email arrives<br/>Outlook / M365 mailbox] -->|Timer trigger, poll every 15-30 min| B[Intake service]
+    A[Vendor email arrives<br/>shipments@ shared mailbox] -->|Timer trigger, poll every 15-30 min| B[Intake service]
     B --> C[Attachment extraction<br/>xlsx + pdf]
     C --> D{Known vendor format?}
     D -->|Yes| E[Deterministic parser<br/>openpyxl / pdfplumber]
@@ -63,17 +63,30 @@ flowchart TD
     G --> H[NetSuite matcher<br/>find existing PO + item lines]
     H --> I[Diff engine<br/>old vs proposed values]
     I --> J[(Database:<br/>shipments, proposed_changes,<br/>audit_log)]
-    J --> K[Review & approve<br/>web UI or email approval]
-    K -->|Approved, via HTTP trigger| L[NetSuite write-back<br/>REST API]
-    K -->|Rejected / edited| J
-    L --> M[Confirmation notification<br/>to Paula]
+    J --> K[Review screen<br/>web app, per PO]
+    K -->|Approve: written while she waits| L[NetSuite write-back<br/>one batch PATCH per PO]
+    K -->|Rejected| J
+    L --> M[Result page<br/>per line]
     L --> J
 ```
+
+*Corrected 2026-11-18.* The diagram showed Paula's own mailbox, email approval through an HTTP trigger, and a confirmation notification. The design is now:
+- the `shipments@` shared mailbox (§4.1, Intake);
+- a review web app where Approve writes synchronously and shows the result per line (`RUNBOOK.md` §11, Phase 4 decisions 2-3);
+- a once-daily digest email, which only says changes are waiting, not built (decision 1).
+
+The polling job is built. The timer trigger that would run it unattended is not, because there is no hosting yet.
 
 ### 4.1 Components
 
 **Intake service**
-**Decided by Paula (2026-08-10): direct app-only Graph API access to her own mailbox — not a shared "PO updates" mailbox.** Registers an Azure AD (Entra ID) app with Microsoft Graph `Mail.Read` (app-only) permission against Paula's own inbox directly. Simpler than the shared-mailbox alternative: no forwarding rule for her to maintain, no separate mailbox for IT to provision. **Confirmed volume is 10–20 shipment emails/week — polling is sufficient and is the recommended approach; a real-time Graph webhook subscription is not worth building for this volume** (it adds a public HTTPS endpoint and subscription-renewal logic for a use case where a 15–30 minute delay is a non-issue). A scheduled job checks for new messages in a designated folder on that interval. Revisit only if actual volume grows well beyond this range.
+**The intake reads a dedicated shared mailbox, `shipments@`, never Paula's own** (corrected 2026-11-18; decided 2026-08-24, built and closed with Phase 2 on 2026-09-14).
+- **How it is scoped.** An Entra ID app holds Microsoft Graph `Mail.Read` (app-only), scoped to that one mailbox by **RBAC for Applications**. The scoping is observed, not asserted: `scripts/probe_graph_auth.py` reads `shipments@` and is refused (`403 ErrorAccessDenied`) on a second mailbox.
+- **How mail reaches it.** Vendors are redirected there, or Paula forwards into it (`RUNBOOK.md` §6 item 11). The mail it holds today is historical forwards, used for testing.
+- **The code.** `poller.py` and `graph_client.py`.
+- **Superseded:** "direct app-only access to her own mailbox" (Paula, 2026-08-10). Graph's `Mail.Read` application permission is mailbox-level, not folder-level, so that would have exposed her whole inbox to the service. Her willingness to allow it did not make it the right scope (§7; `RUNBOOK.md` §6 item 11).
+
+**Confirmed volume is 10–20 shipment emails/week — polling is sufficient and is the recommended approach; a real-time Graph webhook subscription is not worth building for this volume** (it adds a public HTTPS endpoint and subscription-renewal logic for a use case where a 15–30 minute delay is a non-issue). A scheduled job checks the mailbox for new messages on that interval: all of `shipments@`, not one folder, from a watermark with an overlap. Revisit only if actual volume grows well beyond this range.
 
 **Parsing layer**
 **Confirmed by Paula: every vendor sends a completely different packing slip layout.** That rules out "one deterministic parser per vendor" as the primary strategy — it doesn't scale, and every new vendor would block on new engineering work. Build order, revised accordingly:
@@ -87,19 +100,39 @@ flowchart TD
 Calls NetSuite's REST Record API to look up each parsed PO number, then aligns parsed (style, color, size) to the PO's existing item lines. **Match key confirmed live against sandbox (§6):** exact match on `custcol_sd_tmpl_style` (or equivalently `custcol_cmo_parentitem.refName`) for style, plus `custcol_product_color.refName` and `custcol_product_size.refName` (size-normalized — see §6) for color/size. Prefer these dedicated fields over parsing the Item display name (e.g. "M120246 : M120246-Waterman Polo-TID-S") — the display name is still useful for human-readable logging and as a cross-check, but the exact-match custom fields are the authoritative key. `matcher.py` already implements this.
 
 **Diff / staging**
-Computes proposed new Quantity, Expected Receipt Date, Override Expected Receipt Date, and Updated Receipt Date per line, compared to what's currently in NetSuite. Writes a `proposed_changes` record per line with status `PENDING_REVIEW`. Nothing touches NetSuite yet.
+Computes a proposed new **Quantity** per line, compared with what is currently in NetSuite, under the rules in `RUNBOOK.md` §4: quantities accumulate, receipts are compared rather than added to, and nothing is proposed below ordered except the factory's final count. It writes a `proposed_changes` record per line, in whatever state the matcher assigned. Nothing touches NetSuite yet.
+
+*Corrected 2026-11-18:* this said it also computed the three receipt-date fields. **No date is proposed or written** (Kiko, 2026-11-02; §6.3 and `RUNBOOK.md` §4, "Dates are never written").
 
 **Review & approve**
-Human-in-the-loop step, permanent by design (per Paula's and Kiko's decision this session). Two viable implementations, roughly in order of build effort:
-- *Simplest*: an email digest with an approve/reject link **per PO**, no custom UI to build. **The unit was ruled per PO** (Paula, 2026-09-16; `PO-Update-Automation-Phase3-Requirements.md` §6, which also consolidates every other requirement this step has to satisfy) **and is superseded 2026-10-21: per line, every line ticked by default**, so one doubtful line does not block the rest. Not built yet; see `RUNBOOK.md` §11, Phase 4 decision 5.
-- *Small dashboard*: a lightweight internal web page (e.g., a single FastAPI + HTMX or Next.js page) listing pending shipments with a diff table and Approve/Reject/Edit buttons — closer to what the sample spreadsheet we generated this session (`Proposed_PO_Updates_SD-219.xlsx`) shows, but interactive and persistent instead of a one-off file.
-- **Decided by Paula (2026-08-10): receipt dates are never auto-proposed.** She determines Expected Receipt Date / Updated Receipt Date herself — "it's a receiving date and includes buffers," not the vendor's port ETA or any other vendor-stated date. This means the simple approve/reject-a-computed-value pattern **does not work for the date fields specifically**, even though it's fine for Quantity. The review step needs an input, not just a decision: show the vendor's raw ETD/ETA as reference only (clearly labeled as reference, not a proposal), and require Paula to type in the actual receipt date before the write-back can proceed. An email-link flow needs a lightweight form for this (even a simple "reply with the date" or a linked mini-form), not a bare Approve button, for any shipment carrying a date field. Quantity can still move through a plain approve/reject, since that value is decided by policy, not by Paula's judgment.
+Human-in-the-loop step, permanent by design (per Paula's and Kiko's decision this session).
+
+**Built: a review web app, approval per PO** (corrected 2026-11-18). This is the "small dashboard" option below.
+- **The app.** `review_app/`, built 2026-09-30, is a FastAPI app with a queue and a page per PO, running locally on 127.0.0.1 with no login for now.
+- **Approve and Reject are per PO** (Paula, 2026-09-16). Lines that can't be changed are left out of Approve and listed. Reject requires a reason and confirms what it covers first.
+- **Approve writes to NetSuite while she waits** and shows a result page, line by line.
+- **Requirements:** `PO-Update-Automation-Phase3-Requirements.md`. Decisions: `RUNBOOK.md` §11.
+
+**The two options as first set out, kept for the reasoning:**
+- ~~*Simplest*: an email digest with an approve/reject link **per PO**, no custom UI to build.~~ **Abandoned.**
+  - Approval happens in the review app. Email carries only a once-daily digest saying changes are waiting, with no approve or reject link (`RUNBOOK.md` §11, Phase 4 decision 1).
+  - The per-line approval decided on 2026-10-21 was itself superseded on 2026-11-02 (decision 5): approval stays per PO.
+- *Small dashboard*: a lightweight internal web page listing pending shipments with a diff table and Approve/Reject buttons. Closer to what the sample spreadsheet from this session (`Proposed_PO_Updates_SD-219.xlsx`) shows, but interactive and persistent instead of a one-off file. **This is what was built.**
+
+**Decided by Paula (2026-08-10): receipt dates are never auto-proposed.** She determines Expected Receipt Date and Updated Receipt Date herself: "it's a receiving date and includes buffers", not the vendor's port ETA or any other vendor-stated date. The vendor's ETD/ETA are shown as reference only.
+- **Since 2026-11-02 the tool writes no date at all, and the review step asks for none** (Kiko; §6.3). Paula enters receipt dates in NetSuite herself.
+- The date form this section once called for was built and then removed. Approve is a plain approval of quantities.
 
 **NetSuite write-back**
-On approval, calls NetSuite's REST API (or a SuiteScript RESTlet, if the standard REST record API doesn't cleanly support editing item-line sublists — needs validation once access is restored) to apply the approved values. Records the NetSuite response (success/error) back to the audit log.
+On approval, calls NetSuite's standard REST Record API to apply the approved quantities. No RESTlet is needed: sublist edits through the standard API were confirmed on 2026-08-04 (§6). `write_path.write_po_batch`:
+- re-reads the PO;
+- sends one batch PATCH carrying `quantity` only;
+- re-reads the PO and reports what actually landed, line by line.
+
+Every attempt is recorded in `write_attempts`, and the outcome in `audit_log` (`RUNBOOK.md` §11, Phase 4 decision 2). *Corrected 2026-11-18:* the RESTlet question was still listed here as open.
 
 **Audit log / database**
-Every shipment processed, every proposed change, who approved it and when, and the NetSuite write result — stored durably (Azure SQL Database, serverless tier — see §4.2). This is something Option A can't really give us.
+Every shipment processed, every proposed change, who approved it and when, and the NetSuite write result — stored durably (Azure SQL Database, Basic tier; see §4.2). This is something Option A can't really give us.
 
 **Notifications**
 ~~Confirms success/failure back to Paula (and optionally Kiko) — email or Teams message.~~ **Decided 2026-10-21** (`RUNBOOK.md` §11, Phase 4 decisions 1-2): a once-daily email digest to the approver when changes are waiting, blocked on Graph `Mail.Send` scoped to `shipments@`, with no notification until then. Write success and failure are shown on screen per line when she approves, not sent afterwards.
@@ -109,31 +142,38 @@ Every shipment processed, every proposed change, who approved it and when, and t
 | Layer | Choice | Why |
 |---|---|---|
 | Backend | Python (FastAPI) | Parsing code (openpyxl, pdfplumber) is already Python; Anthropic's Python SDK is first-class |
-| **Hosting** | **Azure Functions, Consumption (serverless) plan** | See "Hosting & trigger decision" below |
-| **Trigger** | **Timer trigger (poll every 15–30 min) + HTTP trigger (approval-link clicks)** | See below |
+| **Hosting** | **Azure Functions, Consumption (serverless) plan.** Not provisioned as of 2026-11-18: every run is started by hand on Kiko's laptop | See "Hosting & trigger decision" below |
+| **Trigger** | **Timer trigger (poll every 15–30 min)** for intake. ~~HTTP trigger (approval-link clicks)~~: approval is in the review web app, not by link (corrected 2026-11-18) | See below |
 | Email intake | Microsoft Graph API | Straight Down already uses M365/Outlook |
 | NetSuite | SuiteTalk REST Web Services | Confirmed available on the account; standard REST API handles the sublist writes directly, no RESTlet needed (§6) |
 | LLM | Anthropic API (Claude) | Flexible-format extraction, human-readable change summaries |
-| Database | **Azure SQL Database, serverless compute tier** | See below |
-| Review UI | **v1 built 2026-09-30: a local FastAPI app** (`review_app/`, 127.0.0.1, no auth), **approve/reject per PO** — CONFIRMED by Paula 2026-09-16 (see `PO-Update-Automation-Phase3-Requirements.md` §6). Hosting it (Azure, auth) is later work | Keeps v1 scope small and matches the HTTP-trigger design below. **Not per shipment:** one Inprotex sheet interleaves six POs, so a shipment-level click fires writes across unrelated orders (§6.2). Any PO carrying a date needs a form, not a bare Approve button (§4.1, §6.1) |
+| Database | **Azure SQL Database, Basic tier (DTU)**: `sqldb-po-agent` (production) and `sqldb-po-agent-test`. ~~Serverless compute tier~~ was the plan (corrected 2026-11-18) | See below |
+| Review UI | **v1 built 2026-09-30: a FastAPI web app** (`review_app/`), **approve/reject per PO** (confirmed by Paula 2026-09-16; see `PO-Update-Automation-Phase3-Requirements.md` §6). Approve writes to NetSuite synchronously (since 2026-11-02). It runs locally today (127.0.0.1, no login); how it is hosted, and its login, are not decided | Keeps v1 scope small. **Not per shipment:** one Inprotex sheet interleaves six POs, so a shipment-level click fires writes across unrelated orders (§6.2). No date is written, so Approve needs no date input (§6.3) |
 
 #### Hosting & trigger decision
 
 **Hosting: Azure Functions, Consumption plan.**
 Straight Down is already an M365/Entra ID shop — that's a hard requirement anyway for the Graph API mailbox access this pipeline needs, so Azure hosting doesn't add a new vendor relationship. Consumption plan means Straight Down pays per execution, not for an always-on server: at 10–20 shipments/week plus a poll every 15–30 minutes, the monthly compute cost is a few dollars, and there's no VM to patch, size, or leave running idle. No server to maintain is also the easiest line to defend to a non-technical approver.
 
-**Database: Azure SQL Database, serverless compute tier** (auto-pauses when idle, auto-resumes on the next query).
-Azure Functions' compute is stateless and ephemeral between invocations, so a locally-stored SQLite file isn't a good fit — there's no durable disk to keep it on between runs. A small managed relational database matches the three-table data model in §5 (`shipments` / `proposed_changes` / `audit_log`) without any redesign, and the serverless compute tier keeps cost near-zero at this volume since it pauses when nothing is happening.
+**Database: Azure SQL Database, Basic tier (DTU)** (corrected 2026-11-18). Server `sql-po-agent-prod`, two databases:
+- `sqldb-po-agent`, production, ring-fenced until cutover;
+- `sqldb-po-agent-test`, the `--mssql` test target, measured at Basic, 5 DTU (`RUNBOOK.md` §5 and §8 lesson 33).
 
-**Trigger design — two triggers in one Function App:**
-1. **Timer trigger**, every 15–30 minutes: polls the mailbox via Graph API for new vendor shipping emails, runs parsing → matching → diff, and writes `PENDING_REVIEW` rows plus sends Paula a review email.
-2. **HTTP trigger**: handles the "Approve" / "Reject" link click from that review email, then executes (or skips) the NetSuite write-back.
+Basic does not auto-pause. The production database's tier is as stated by Kiko on 2026-11-18, not measured in the repo. The serverless compute tier planned here (auto-pause when idle, auto-resume on the next query) is not what was provisioned.
 
-This two-trigger split avoids building a persistent server process just to keep a webhook connection alive, while still giving an instant response to Paula's click rather than waiting for the next poll cycle.
+The reasoning for a managed database still holds. Azure Functions' compute is stateless and ephemeral between invocations, so a locally stored SQLite file isn't a good fit: there's no durable disk to keep it on between runs. A small managed relational database fits the data model (§5) without redesign. Locally, SQLite remains the fast test loop and the format of the run databases.
+
+**Trigger design** (corrected 2026-11-18; the second trigger belonged to the approve-by-link design, which was abandoned):
+1. **Timer trigger**, every 15–30 minutes. It polls `shipments@` via Graph API for new vendor shipping emails, then runs parsing, matching and diff, and writes the proposed changes. **Not built**: there is no hosting. The job it would run is built (`poller.py`, then `extract_pending.py`), and today it is started by hand. The once-daily digest it would also send is blocked on Graph `Mail.Send` (`RUNBOOK.md` §11, Phase 4 decision 1).
+2. ~~**HTTP trigger**: handles the "Approve" / "Reject" link click from that review email, then executes (or skips) the NetSuite write-back.~~ **Abandoned with approve-by-link.** There is no approve or reject link in any email. Approve and Reject are form submissions in the review web app, and Approve writes to NetSuite in that request, while she waits, showing the result per line (Phase 4 decision 2). How the review app is hosted, and how it authenticates its user, is not decided. It is a FastAPI app, not a Functions HTTP trigger as written.
+
+~~This two-trigger split avoids building a persistent server process just to keep a webhook connection alive, while still giving an instant response to Paula's click rather than waiting for the next poll cycle.~~ The instant response this was for now comes from the review app's synchronous Approve.
 
 **Secrets convention (established during Phase 1):** the M2M private key lives at `C:\Users\<user>\.po-agent\keys\` — deliberately *outside* the `PO Agent` project folder, because that folder is OneDrive-synced. A private key placed inside it would sync to Microsoft's cloud and be inherited by anyone the folder is ever shared with, which is not acceptable for a credential that authenticates as a NetSuite service account. Only the public certificate (safe to expose) gets uploaded to NetSuite; the private key never leaves the local machine. Keep this convention for any future secrets this project accumulates (Graph API app credentials, Anthropic API keys, etc.) — nothing that authenticates should live inside the synced folder.
 
 ## 5. Data model (draft)
+
+*Corrected 2026-11-18: this is the scoping-era draft, kept for the record.* The built schema is `schema.py`, at migration 0017, with its reasoning in `PO-Update-Automation-Schema-Rationale.md`. In particular, the `proposed_*_date` and `proposed_override_flag` fields below were never built: no date is proposed or written (§6.3).
 
 ```
 shipments

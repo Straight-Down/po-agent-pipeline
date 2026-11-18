@@ -25,7 +25,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from review_app import data
+from review_app import data, wording
 from review_app.settings import Settings
 from write_path import write_po_batch
 
@@ -50,6 +50,9 @@ def create_app(settings: Settings, engine=None, now=None) -> FastAPI:
     app = FastAPI(title="PO review", docs_url=None, redoc_url=None, openapi_url=None)
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.filters["qty"] = _qty
+    # The fallback sentence for a reason wording.py does not recognise. po.html never
+    # states it once for several lines: their raw reasons may differ behind it.
+    templates.env.globals["UNRECOGNISED_REASON"] = wording.UNRECOGNISED
     app.state.csrf = csrf
 
     def unrecorded_landed() -> list:

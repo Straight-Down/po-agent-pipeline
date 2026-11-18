@@ -1018,6 +1018,84 @@ def test_one_shared_block_reason_is_said_once() -> None:
               "and each line's own explanation")
 
 
+def test_one_shared_flag_reason_is_said_once() -> None:
+    section("every flagged line shares one reason: said once above the flagged table")
+    with _World() as w:
+        c = w.client()
+        url = f"/po/{w.po_id('1662')}"
+
+        # One flagged line (M): nothing to share, so its reason stays on its row.
+        main = main_text(c.get(url).text)
+        check("1 line to check before approving" in main and "Each says what to check" in main
+              and "given once here" not in main and main.count("work out part of this line") == 1,
+              "a single flagged line keeps its reason on its own row")
+
+        # Flag S the same way as M: two approvable flagged lines, the same reason.
+        m = w.lines("1662")["M"]
+        s_id = w.lines("1662")["S"]["id"]
+        with w.engine.begin() as conn:
+            conn.execute(proposed_changes.update().where(proposed_changes.c.id == s_id)
+                         .values(state=m["state"], attention_reason=m["attention_reason"],
+                                 extraction_confidence=m["extraction_confidence"],
+                                 needs_review=m["needs_review"]))
+        html = c.get(url).text
+        main = main_text(html)
+        check("2 lines to check before approving" in main
+              and "They all need the same check, so it's given once here" in main
+              and "For each of these 2 lines:" in main,
+              "the flagged section says the check is shared, and by how many lines")
+        check(main.count("work out part of this line") == 1,
+              "and states the shared reason once, not under each row",
+              str(main.count("work out part of this line")))
+        check(main.count("Check, then approve with the PO") == 2 and html.count("State: ") == 3,
+              "each flagged row keeps its status, and every row its Details",
+              f"{main.count('Check, then approve with the PO')} statuses, {html.count('State: ')} Details")
+        check("(2 flagged)" in html and 'name="fingerprint"' in html,
+              "what is flagged is unchanged: Approve still counts both flagged lines")
+        check(not INTERNAL.findall(main), "nothing internal leaks into the shared reason",
+              str(INTERNAL.findall(main)))
+
+        # Same reason, but one line can't be approved (its NetSuite line closed): the
+        # statuses differ, so a shared "check, then approve" would mislead. Per line.
+        with w.engine.begin() as conn:
+            conn.execute(proposed_changes.update().where(proposed_changes.c.id == s_id)
+                         .values(ns_line_is_open=False))
+        main = main_text(c.get(url).text)
+        check("given once here" not in main and main.count("work out part of this line") == 2
+              and main.count("Can't be changed here") == 1,  # the row's pill, not the form's list
+              "an approvable and a blocked line keep their reasons per line",
+              str(main.count("work out part of this line")))
+        with w.engine.begin() as conn:
+            conn.execute(proposed_changes.update().where(proposed_changes.c.id == s_id)
+                         .values(ns_line_is_open=True))
+
+        # Two reasons the wording does not recognise read identically ("needs a look")
+        # but differ underneath: never stated once.
+        for change_id, raw in ((s_id, "an unrecognised reason, one"),
+                               (m["id"], "an unrecognised reason, two")):
+            with w.engine.begin() as conn:
+                conn.execute(proposed_changes.update().where(proposed_changes.c.id == change_id)
+                             .values(attention_reason=raw))
+        main = main_text(c.get(url).text)
+        check("given once here" not in main and main.count("This line needs a look") == 2,
+              "the needs-a-look fallback stays on each row", str(main.count("This line needs a look")))
+        with w.engine.begin() as conn:
+            conn.execute(proposed_changes.update().where(proposed_changes.c.id == m["id"])
+                         .values(attention_reason=m["attention_reason"]))
+
+        # One of the two gains a second reason: mixed, so per line again.
+        with w.engine.begin() as conn:
+            conn.execute(proposed_changes.update().where(proposed_changes.c.id == s_id)
+                         .values(attention_reason=m["attention_reason"]
+                                 + "; carton backing unverifiable: test"))
+        main = main_text(c.get(url).text)
+        check("given once here" not in main and "Each says what to check" in main
+              and main.count("work out part of this line") == 2
+              and "confirm this quantity against carton counts" in main,
+              "reasons that differ keep every flagged line's reasons on its own row",
+              str(main.count("work out part of this line")))
+
+
 def test_source_documents_are_served_only_through_a_proposal() -> None:
     section("GET /source/{change_id}: one proposal's document, nothing else")
     with _World() as w:

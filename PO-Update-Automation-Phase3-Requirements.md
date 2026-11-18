@@ -147,6 +147,17 @@ line leads with one plain sentence saying what to check — generated from the m
 the packing slip before approving."* The extractor's own note, the raw reason and the confidence
 level are behind a collapsed **Details** toggle on the row. No confidence badge anywhere.
 
+**Said once where every flagged line shares it (2026-11-18, presentation only).** If more than one
+line on a PO is flagged and all of them give exactly the same plain sentences, the sentences appear
+once, above the flagged table, introduced "For each of these N lines". Each row keeps its status and
+its Details. A wholly blocked PO already did this for its block reason, and that banner takes
+precedence. Every flagged line keeps its own sentences when:
+- any flagged line's sentences differ;
+- the flagged lines' statuses differ (an approvable line beside a blocked one);
+- the sentence is the "needs a look" fallback, which can stand for raw reasons that differ.
+
+What is flagged, and why, is unchanged (`test_one_shared_flag_reason_is_said_once`).
+
 **Why:** the reviewer needs to know what to check, not the parser's phrasing. The note stays one
 click away for when the plain sentence is not enough.
 

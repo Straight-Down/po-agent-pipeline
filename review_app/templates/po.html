@@ -15,8 +15,10 @@
 {%- endmacro %}
 
 {# same_block: every line on the PO is blocked for one reason, which is then said
-   once above the tables (see the content block) instead of on every row. #}
-{% macro rows(lines, flagged_group=False, same_block=False) %}
+   once above the tables (see the content block) instead of on every row.
+   shared_reason: every flagged line has the same reasons, said once above the
+   flagged table; each row keeps its status, tags and Details. #}
+{% macro rows(lines, flagged_group=False, same_block=False, shared_reason=False) %}
 <div class="table-scroll{{ ' group-flag' if flagged_group }}">
 <table>
   <thead><tr>
@@ -29,7 +31,7 @@
                  else "is-flag" if ln.flagged
                  else "is-change" if ln.disposition == "approve" else "" -%}
   {%- set show_rejection = ln.disposition == "decided" and ln.human_verdict == "REJECTED" and ln.human_verdict_note -%}
-  {%- set has_why = (ln.plain_reasons and not same_block) or show_rejection -%}
+  {%- set has_why = (ln.plain_reasons and not same_block and not shared_reason) or show_rejection -%}
   <tbody class="{{ tone }}">
     <tr{% if has_why %} class="has-why"{% endif %}>
       <td class="item">{{ ln.label }}{% if ln.src_recap_label %}<br><span class="muted">{{ ln.src_recap_label }}</span>{% endif %}</td>
@@ -138,17 +140,38 @@
 </div>
 {% endif %}
 
+{#- Presentation only, like same_block: every FLAGGED line gives the same
+    plain-English reasons, so they are said once above the flagged table instead of
+    under each row. Each row keeps its status, tags and Details; nothing about what
+    is flagged, or why, changes. Any flagged line whose reasons differ keeps them all
+    per line. same_block, which already says it once for the whole PO, wins.
+    Also per line: flagged lines whose statuses differ (approvable beside blocked),
+    approvable-PO wording over lines that are not approvable, and the "needs a look"
+    fallback, which can stand for raw reasons that differ. -#}
+{%- set flagged = view.flagged_lines -%}
+{%- set first_flag = flagged[0] if flagged else none -%}
+{%- set same_flag = not same_block and flagged|length > 1 and first_flag.plain_reasons
+      and UNRECOGNISED_REASON not in first_flag.plain_reasons
+      and (first_flag.disposition == "approve" or not view.can_approve)
+      and flagged|rejectattr("disposition", "equalto", first_flag.disposition)|list|length == 0
+      and flagged|rejectattr("plain_reasons", "equalto", first_flag.plain_reasons)|list|length == 0 -%}
 {% if view.flagged_lines %}
 {% if view.can_approve %}
 <h2>{{ view.flagged_lines|length }} line{{ "s" if view.flagged_lines|length != 1 }} to check before approving</h2>
-<p class="muted">Approving the PO includes these. Each says what to check.</p>
+<p class="muted">{% if same_flag %}Approving the PO includes these. They all need the same check, so it's given once here:
+{%- else %}Approving the PO includes these. Each says what to check.{% endif %}</p>
 {% else %}
 <h2>{{ view.flagged_lines|length }} line{{ "s" if view.flagged_lines|length != 1 }} that need attention</h2>
 <p class="muted">{% if same_block and first_line.plain_reasons %}The reason is the same for every line, so it's given once above. Your decision is at the bottom of the page.
 {%- elif same_block %}The reason is the same for every line; it's given with your decision at the bottom of the page.
+{%- elif same_flag %}The reason is the same for each of these lines, so it's given once here. Your decision is at the bottom of the page.
 {%- else %}Each says why. Your decision is at the bottom of the page.{% endif %}</p>
 {% endif %}
-{{ rows(view.flagged_lines, flagged_group=True, same_block=same_block) }}
+{% if same_flag %}
+<div class="card flag-all"><p class="plain"><strong>For each of these {{ flagged|length }} lines:</strong></p>
+  {% for r in first_flag.plain_reasons %}<p class="plain">{{ r }}</p>{% endfor %}</div>
+{% endif %}
+{{ rows(view.flagged_lines, flagged_group=True, same_block=same_block, shared_reason=same_flag) }}
 {% endif %}
 {% if view.other_lines %}
 <h2>{{ "Other lines" if view.flagged_lines else "Lines" }} ({{ view.other_lines|length }})</h2>

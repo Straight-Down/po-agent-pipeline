@@ -25,12 +25,12 @@ Paula (Supply Chain Manager) gets emails from vendors when a shipment goes out, 
 | **Carton verification** (`carton_backing.py`) | **Built.** A quantity row counts as shipped only if cartons in the selected documents add up to it. Unbacked rows are removed and named, and losing more than a third of a shipment's lines is escalated. A medium-confidence flag is cleared only when every field is proven from the grid (CLAUDE.md gotchas). |
 | **Matching and proposal rules** (`matcher.py`) | **Built.** Matches exactly on NetSuite's custom fields, resolving sizes and colours. When several open lines match, a human chooses. Quantities accumulate onto this tool's own write record, and lines with earlier receipts are compared, never added to. Nothing is proposed below ordered except the factory's final count (§4). |
 | **Persistence** (`ingest.py`, `schema.py`, migrations 0001-0017) | **Built.** Runs on SQLite and on Azure SQL (§5; testing policy in §7). |
-| **Review screen** (`review_app/`) | **Built, and runs locally only:** FastAPI on 127.0.0.1, no login, with the reviewer named by `PO_AGENT_REVIEWER`. Approve and Reject are per PO. Lines that can't be changed are left out of Approve, and Reject confirms what it covers first (§11). **There is no picker** for a line that matches several NetSuite lines (`NEEDS_RESOLUTION` / `NEEDS_ASSIGNMENT`); such lines are left out, to be fixed in NetSuite. |
+| **Review screen** (`review_app/`) | **Built, and runs locally only:** FastAPI on 127.0.0.1, no login, with the reviewer named by `PO_AGENT_REVIEWER`. That name is an unauthenticated label, so **the approval record is not yet trustworthy**. A sign-in that establishes the reviewer is a cutover prerequisite (§12 item 8). Approve and Reject are per PO. Lines that can't be changed are left out of Approve, and Reject confirms what it covers first (§11). **There is no picker** for a line that matches several NetSuite lines (`NEEDS_RESOLUTION` / `NEEDS_ASSIGNMENT`); such lines are left out, to be fixed in NetSuite. |
 | **Write path** (`write_path.py`) | **Built.** Approve writes `quantity` and nothing else, in one batch PATCH per PO, re-reading the PO before and after, while the reviewer waits (§11 decision 2). It refuses a production account unless `PO_AGENT_ALLOW_PRODUCTION_WRITES` names it. Rehearsed end to end on Sandbox 2 on 2026-11-09: 17 lines written (§11). |
 | **Hosting** (Azure Functions, Key Vault, monitoring) | **Not built.** Azure SQL exists (§5); nothing else is provisioned. Every run is started by hand on Kiko's laptop, and nothing monitors it. |
 | **Daily digest email** (§11 decision 1) | **Not built.** Blocked on the Graph `Mail.Send` permission, requested 2026-10-21. Until it lands, the approver checks the screen herself. |
 | **Reject reason picker** (§11 decision 4) | **Not built.** It needs a migration adding a reject-reason column. Reject takes a free-text reason today. |
-| **Production cutover** (§12) | **Not started.** One of the six checklist items is ticked. **Production NetSuite has been read and has never been written to.** |
+| **Production cutover** (§12) | **Not started.** One of the eight checklist items is ticked. **Production NetSuite has been read and has never been written to.** |
 
 In short: everything from the mailbox to a NetSuite write is built and has been exercised against Sandbox 2. What remains is running it unattended (hosting), the two unbuilt decisions, and cutover. Cutover starts by re-reading every affected PO from production (§12 item 4), because Sandbox 2's figures are known to disagree with production's (§8 lesson 31).
 
@@ -238,9 +238,9 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
    - **Authentication is no longer Kiko's login.** Not his interactive session, and not the temporary CFO role of the planning session. The tool authenticates with the M2M certificate (OAuth 2.0 client credentials) under the dedicated least-privilege `PO Update Automation (M2M)` role, which has seven permissions (item 27; `NETSUITE-M2M-SETUP.md`).
    - **The NetSuite identity is still Kiko's employee record.**
      - The certificate mapping needs an employee as its entity, and the sandbox setup uses Kiko's existing record on purpose: a dedicated employee costs a paid licence (`NETSUITE-M2M-SETUP.md` Step 3).
-     - So NetSuite's own system notes attribute the tool's writes to Kiko, indistinguishable there from his manual edits. This tool's `audit_log` and `write_attempts` record which writes were automated.
+     - So NetSuite's own system notes attribute the tool's writes to Kiko by name (observed 2026-11-18; §12 item 7). By name alone they cannot be told apart from his manual edits. The note's role (PO Update) and context (REST Web Services) do mark them as the integration's. This tool's `audit_log` and `write_attempts` record which writes were automated.
      - This repo does not record which employee the production mapping uses.
-     - If NetSuite-side attribution matters, decide on a dedicated service account before cutover. Per that doc, nothing else in the setup changes.
+     - Recording the production mapping's employee, and deciding whether it stays the integration owner, is now a cutover step: §12 item 7.
    - **It still runs only on Kiko's laptop, started by hand:** the poll, the extraction and the review app (§2; §11, "Not started: production cutover"). Hosting (Function App, Key Vault) is the fix, and it is not provisioned.
 7. **Vendor coverage for v1 is still undefined.** ~~Three vendors are validated~~ **Five vendors are validated (corrected 2026-11-18):** Inprotex, Legendz, Symmetry, Tainan and CMG footwear, each against hand-derived, line-level ground truth (build plan Phase 1, `--live`, 2026-09-14).
    - A sixth, the PL0730 vendor (POs 511 and 533), has been extracted from live mail twice (2026-09-14 and 2026-11-18). It was never graded: there is no ground truth for it, and none of its lines matched an open NetSuite line.
@@ -1764,7 +1764,8 @@ See `PO-Update-Automation-Build-Plan.md` for full phase detail. **Restructured 2
 - **Production NetSuite has been read and never written to.** Two things stop a production write today:
   - the production role's Purchase Order permission is View, as reported on 2026-10-21 and not re-read since (§12 items 5 and 6);
   - `write_path` refuses a production account unless `PO_AGENT_ALLOW_PRODUCTION_WRITES` names it, and that variable is not set in `.env`.
-- **The §12 checklist has one of its six items ticked.** Item 4, re-reading every affected PO from production before anything is approved for real, is the gate. Sandbox 2's figures are known to disagree with production's (§8 lesson 31).
+- **No sign-in on the review app.** The reviewer recorded on an approval is an unauthenticated label from `PO_AGENT_REVIEWER`. A sign-in that establishes who approved is a cutover prerequisite (§12 item 8; decision 2).
+- **The §12 checklist has one of its eight items ticked.** Item 4, re-reading every affected PO from production before anything is approved for real, is the gate. Sandbox 2's figures are known to disagree with production's (§8 lesson 31).
 - **Three production re-verification items** (tranId, colour resolution and the size vocabulary; build plan Phase 4 items 3-5) share one shape: §8 lesson 16.
 
 Cutover follows the checklist in §12.
@@ -1840,6 +1841,11 @@ Decided, not proposed. **Built 2026-11-02: decision 2 (writes while she waits, o
 - **Requires the "review app must not import the NetSuite client" rule to be NARROWED, not removed** (Kiko, 2026-10-21). Today the app must never import `netsuite_client` (or `matcher`/`ingest`), and `test_review_app_never_imports_netsuite_client` fails if it does. Under this decision the app may call **one write function with a defined signature, and nothing else** from the write side. `test_review_app_never_imports_netsuite_client` is **rewritten to enforce exactly that**: the one permitted call is allowed, and any other import or use of the client, matcher or ingest still fails. Deleting the test, or loosening it to "imports allowed", does not satisfy this decision.
 - **Built 2026-11-02, now the batch's per-line fallback:** `write_path.write_approved_quantity(engine, change_id, *, client=None, now=None)`. Per line it re-reads the line from NetSuite; refuses a line that is closed, not open, gone, or whose quantity no longer equals the proposal's `current_quantity` (someone else's edit); sends `quantity` and nothing else (no date field, `expectedReceiptDate` included; Kiko, 2026-11-02); and records every attempt that reached NetSuite in `write_attempts` as SUCCESS, ALREADY_PRESENT (migration 0015), CONFIRMED (migration 0016), REFUSED or FAILED, with the re-read value in `previous_quantity` (migration 0014). Refusals and NetSuite errors are returned as a displayable per-line result, never raised; a write NetSuite accepted but the database could not record comes back as `WRITTEN_NOT_RECORDED`. Two calls racing on one line cannot drop a real write from the accumulation base. A production account is refused unless `PO_AGENT_ALLOW_PRODUCTION_WRITES` names it (§12 item 5). A refusal or failure leaves the line WRITE_FAILED, retryable without re-approval. The import rule is narrowed as above: `test_review_app_never_imports_netsuite_client` pins the import, the call's keywords and the signature. Tests: `test_write_path.py`, run on SQLite and on the Azure SQL test database.
 - **Settled 2026-11-02:** the receipt date was removed from Approve, so no new line carries a date scope. An older row that does is written to WRITTEN on a successful quantity write, and its date is left unused (§4, "The receipt-date columns are unused").
+- **The approval record is not yet trustworthy** (Kiko, 2026-11-18). This decision makes Approve write to NetSuite, so who clicked it now matters as much as what was written. Today neither system can show who it was:
+  - **The review app has no login.** `verdict_by`, and the actor on the approval's audit events, is whatever `PO_AGENT_REVIEWER` was set to when the app started. It is an unauthenticated label, not an identity.
+  - **NetSuite attributes the write to the integration's employee record**, not to the approver. Observed in Sandbox 2 on 2026-11-18: the system note on PO 1640 line 91 names Kiko Barroso, with role PO Update and context REST Web Services (§12 item 7).
+
+  **A sign-in that establishes the reviewer's identity is therefore a cutover prerequisite, not a convenience of hosting the app:** §12 item 8, which says what "done" means. Until it lands, an approval recorded by this tool says what was approved and when, but not, verifiably, by whom.
 
 **3. No undo button.** The previous quantity is stored and shown in the line's history. A reversal is done by editing the PO in NetSuite directly, and the screen tells her what the value was before.
 - **Why:** an undo is a second write to NetSuite based on a value the tool believes was there, which is riskier than the first write.
@@ -2020,7 +2026,7 @@ So this run **proves the pipeline runs end to end on real vendor documents on cu
 
 ## 12. Production cutover checklist
 
-Added 2026-10-21. Do these in order and tick each one only once it is verified. Steps 1-4 can be done any time before cutover. Steps 5-6 happen at the moment of cutover and not before.
+Added 2026-10-21. Do these in order and tick each one only once it is verified. Steps 1-4, 7 and 8 can be done any time before cutover. Steps 5-6 happen at the moment of cutover and not before. (Steps 7 and 8 were added on 2026-11-18 and numbered last so that the existing references to 5 and 6 stay valid.)
 
 - [x] **1. The write path never sends `custcol_override_expected_receipt` or `custcol_sd_updatedreceiptdate`, and code enforces it.** A test must fail if either field is sent. Production PO 1624's sixteen UPS lines (29-44) carry deliberate human-entered values in both fields.
   **VERIFIED 2026-11-02, and settled more broadly than asked: no date field at all, `expectedReceiptDate` included.** Two layers, each with a test that fails if a date field is sent:
@@ -2043,3 +2049,51 @@ Added 2026-10-21. Do these in order and tick each one only once it is verified. 
 - [ ] **5. At cutover, and not before: change the production role's Purchase Order permission from View to Edit.** View is the production setting as reported 2026-10-21. `NETSUITE-M2M-SETUP.md` Step 2 gives the target, Edit. Until this change, every write fails with a permission error. Expect `400 USER_ERROR` rather than a clean 403 (§9). Leaving it at View until this moment is deliberate: a read-only role is the current safety net. It is a second layer behind the human-approval gate in code, never a reason to relax that gate.
   **The code has its own production gate too (2026-11-02):** `write_path` refuses any non-sandbox account unless `PO_AGENT_ALLOW_PRODUCTION_WRITES` equals that account's id. Set it in the hosting environment's configuration at this step, with the production account id, and not before. Leaving it unset keeps every production write refused in code, whatever the role allows.
 - [ ] **6. Verify the change by reading the role's permissions back.** Do not assume the save took: a selection not pushed with `Add` before `Save` is silently discarded (§8 lesson 1). Run **Setup > Users/Roles > Show Role Differences** (Base Role `Administrator`, Compare To the production role, Only Show Differences), which shows actual state. Confirm Transactions > Purchase Order reads **Edit** and that nothing else on the role moved. Do not "verify" with a test write against a real production PO, because that is a real write.
+- [ ] **7. Before cutover: record which employee the production M2M credential is mapped to, and decide whether it stays the integration owner** (Kiko, 2026-11-18). This belongs with items 1-4, done any time before cutover. It is numbered 7 so that items 5 and 6 keep the numbers referenced elsewhere.
+  - **Why it matters.** NetSuite's client-credentials grant ties the certificate to an (entity, role, integration) triple, and the entity is an employee record (`NETSUITE-M2M-SETUP.md` Step 3 and Step 5; Architecture §6). So **NetSuite's own system notes attribute every write the tool makes to that employee, not to the approver who clicked Approve.** In the sandbox setup that employee is Kiko, chosen to avoid a paid licence.
+  - **Observed, 2026-11-18, in Sandbox 2.** System note `434135997` on PO 1640 (internal id 8408234), line 91: field `TRANLINE.RITEMCOUNT` (quantity), 60 → 61, dated 2026-11-09. That is the tool's write from the rehearsal (§11).
+    - **Name: Kiko Barroso**, entity `3012508`;
+    - **Role: PO Update**, role `1824`;
+    - **Context: REST Web Services** (`RWS`).
+
+    The read was GET plus a SuiteQL SELECT only, with update methods disabled, after confirming the account was `1321665-sb2`.
+  - **So the name cannot separate a tool write from a hand edit, but the note can.** The role (PO Update, the integration's least-privilege role) and the context (REST Web Services) also identify the write as the integration's, as long as nobody edits POs through REST under that role. `NETSUITE-M2M-SETUP.md` Step 3 says as much: "not distinguishable … by employee identity alone". **Neither field says who approved.**
+  - **One quantity write produces more than one note.** NetSuite recalculates the amount, so the same write also left `TRANLINE.MAMOUNT` notes on each line and a `TRANDOC.MAMOUNTMAIN` note for the PO total, under the same name, role and context. An auditor will see amount changes attributed to the employee, not only quantities.
+  - **This observation is of Sandbox 2's mapping only.** What is still to do in production is listed under the recommendation below.
+  - **The two options:**
+    - **(a) Keep that employee as the integration owner,** with this tool's own records as the record of who approved each change:
+      - `proposed_changes.verdict_by` and the `REVIEW_APPROVED` events in `audit_log`, for who approved;
+      - `write_attempts`, for which request carried the change, under one idempotency key per PATCH.
+
+      Whoever reads NetSuite's system notes then has to know two things. Notes under that name with role PO Update and context REST Web Services are the tool's. Who approved them is in this tool's records, not in NetSuite. Write that down where an auditor will find it.
+    - **(b) A dedicated integration employee record** (for example "PO Update Automation"), at the cost of a NetSuite user licence, so that NetSuite separates the tool's writes from any person's by name as well. This also means repointing the Step 3 role assignment and the Step 5 certificate mapping's entity to the new employee. That doc says nothing else in the setup changes.
+
+    **Either is defensible. What isn't is discovering it during an audit:** writes under a person's name that the person did not make, with nobody able to say which ones.
+  - **Recommendation (Kiko, 2026-11-18): option (a). Keep the integration mapped to an employee record.**
+    - **Why.** The role and context on the system note already distinguish the tool's writes from manual edits (observed above). A dedicated employee record would buy a different name on notes that are already identifiable, at a licence cost.
+    - **What it rests on: the PO Update role is used only by the integration.** That is the design. The setup also gives the role **Web Services Only Role** (`NETSUITE-M2M-SETUP.md` Steps 2 and 8), which stops anyone signing in to the NetSuite UI under it, so a hand edit made in the UI cannot carry that role. If the role is ever given to a person for other work, the recommendation falls and option (b) is the answer.
+    - **Still to do, in production, before this item is ticked:**
+      1. **Record which employee the production mapping uses.** The repo does not say (§6 item 6). Read it from **Setup > Integration > OAuth 2.0 Client Credentials (M2M) Setup**.
+      2. **Confirm the production role is configured as the recommendation assumes:** Web Services Only Role is checked, and no employee holds the role except the mapping's entity.
+      3. **Confirm the same role and context appear on a production system note for a tool write.** Production has never been written to, so this can only be read after the first write at cutover (items 5-6). Do it then, before approving a second PO.
+         - Record the role by its actual name and id: Sandbox 2's note says `PO Update` (`1824`), while `NETSUITE-M2M-SETUP.md` Step 2 suggests `PO Update Automation (M2M)`.
+         - If the production note shows another role or context, the recommendation is re-decided before anything else is approved.
+  - **The recommendation depends entirely on item 8.** Option (a) rests on this tool's own records showing who approved, and those are not trustworthy until the review app has a login. **If item 8 is never done, option (a) leaves nothing anywhere showing who approved a change:**
+    - NetSuite shows the integration's employee;
+    - this tool shows an unauthenticated label.
+
+    Option (b) would not fix that. It changes the name on NetSuite's notes, not who approved.
+- [ ] **8. Before cutover: a sign-in that establishes the reviewer's identity.** (Kiko, 2026-11-18.) **This is a cutover prerequisite, not a convenience of hosting the review app.**
+  - **The approval record is not yet trustworthy.** The review app has no login. `verdict_by`, and the actor on every `REVIEW_APPROVED` and `WRITE_GIVEN_UP` audit event, is whatever `PO_AGENT_REVIEWER` was set to when the app started (`review_app/settings.py`; CLAUDE.md gotchas). Anyone who can open the app approves under that name. Today that is anyone using the laptop it runs on (it binds to 127.0.0.1). Once it is hosted, it is anyone who can reach it. Nothing ties the name to the person who clicked.
+  - **So neither system can currently show who approved a change:**
+    - NetSuite attributes the write to the integration's employee record (observed in Sandbox 2 on 2026-11-18; item 7). Its role and context identify the integration, not the approver;
+    - this tool attributes the approval to an unauthenticated label.
+  - **Done means:**
+    - every field that records the reviewer comes from an authenticated sign-in, not from configuration: `verdict_by`, `quantity_approved_by`, and the actor on `REVIEW_APPROVED`, `REVIEW_REJECTED` and `WRITE_GIVEN_UP`;
+    - `PO_AGENT_REVIEWER` no longer decides who a verdict names;
+    - a test fails if a verdict can be recorded without an authenticated reviewer.
+
+    Today's rule that `review_app` refuses to start without `PO_AGENT_REVIEWER` stays until then: no default name, ever.
+  - **Who may sign in is part of the item.** Paula is the sole approver, with no delegation (her ruling of 2026-09-16; §6 item 30). A sign-in that admits anyone in the tenant would authenticate the name but not enforce the ruling.
+  - **Item 7's recommendation rests on this item.** Option (a) keeps NetSuite showing the integration's employee and leaves who approved to this tool's records. Without this item, nothing anywhere shows who approved a change.
+  - **Recorded in §11, Phase 4 decision 2,** because that decision is what makes Approve write to NetSuite.

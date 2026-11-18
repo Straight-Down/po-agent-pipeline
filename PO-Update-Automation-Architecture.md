@@ -108,7 +108,7 @@ Computes a proposed new **Quantity** per line, compared with what is currently i
 Human-in-the-loop step, permanent by design (per Paula's and Kiko's decision this session).
 
 **Built: a review web app, approval per PO** (corrected 2026-11-18). This is the "small dashboard" option below.
-- **The app.** `review_app/`, built 2026-09-30, is a FastAPI app with a queue and a page per PO, running locally on 127.0.0.1 with no login for now.
+- **The app.** `review_app/`, built 2026-09-30, is a FastAPI app with a queue and a page per PO, running locally on 127.0.0.1 with no login for now. The reviewer it records is therefore an unauthenticated label (`PO_AGENT_REVIEWER`), and **a sign-in that establishes the reviewer's identity is a cutover prerequisite** (`RUNBOOK.md` §12 item 8).
 - **Approve and Reject are per PO** (Paula, 2026-09-16). Lines that can't be changed are left out of Approve and listed. Reject requires a reason and confirms what it covers first.
 - **Approve writes to NetSuite while she waits** and shows a result page, line by line.
 - **Requirements:** `PO-Update-Automation-Phase3-Requirements.md`. Decisions: `RUNBOOK.md` §11.
@@ -148,7 +148,7 @@ Every shipment processed, every proposed change, who approved it and when, and t
 | NetSuite | SuiteTalk REST Web Services | Confirmed available on the account; standard REST API handles the sublist writes directly, no RESTlet needed (§6) |
 | LLM | Anthropic API (Claude) | Flexible-format extraction, human-readable change summaries |
 | Database | **Azure SQL Database, Basic tier (DTU)**: `sqldb-po-agent` (production) and `sqldb-po-agent-test`. ~~Serverless compute tier~~ was the plan (corrected 2026-11-18) | See below |
-| Review UI | **v1 built 2026-09-30: a FastAPI web app** (`review_app/`), **approve/reject per PO** (confirmed by Paula 2026-09-16; see `PO-Update-Automation-Phase3-Requirements.md` §6). Approve writes to NetSuite synchronously (since 2026-11-02). It runs locally today (127.0.0.1, no login); how it is hosted, and its login, are not decided | Keeps v1 scope small. **Not per shipment:** one Inprotex sheet interleaves six POs, so a shipment-level click fires writes across unrelated orders (§6.2). No date is written, so Approve needs no date input (§6.3) |
+| Review UI | **v1 built 2026-09-30: a FastAPI web app** (`review_app/`), **approve/reject per PO** (confirmed by Paula 2026-09-16; see `PO-Update-Automation-Phase3-Requirements.md` §6). Approve writes to NetSuite synchronously (since 2026-11-02). It runs locally today (127.0.0.1, no login). How it is hosted is not decided. A sign-in that establishes the reviewer's identity is required before cutover (`RUNBOOK.md` §12 item 8), and how it is implemented is not decided | Keeps v1 scope small. **Not per shipment:** one Inprotex sheet interleaves six POs, so a shipment-level click fires writes across unrelated orders (§6.2). No date is written, so Approve needs no date input (§6.3) |
 
 #### Hosting & trigger decision
 
@@ -165,7 +165,7 @@ The reasoning for a managed database still holds. Azure Functions' compute is st
 
 **Trigger design** (corrected 2026-11-18; the second trigger belonged to the approve-by-link design, which was abandoned):
 1. **Timer trigger**, every 15–30 minutes. It polls `shipments@` via Graph API for new vendor shipping emails, then runs parsing, matching and diff, and writes the proposed changes. **Not built**: there is no hosting. The job it would run is built (`poller.py`, then `extract_pending.py`), and today it is started by hand. The once-daily digest it would also send is blocked on Graph `Mail.Send` (`RUNBOOK.md` §11, Phase 4 decision 1).
-2. ~~**HTTP trigger**: handles the "Approve" / "Reject" link click from that review email, then executes (or skips) the NetSuite write-back.~~ **Abandoned with approve-by-link.** There is no approve or reject link in any email. Approve and Reject are form submissions in the review web app, and Approve writes to NetSuite in that request, while she waits, showing the result per line (Phase 4 decision 2). How the review app is hosted, and how it authenticates its user, is not decided. It is a FastAPI app, not a Functions HTTP trigger as written.
+2. ~~**HTTP trigger**: handles the "Approve" / "Reject" link click from that review email, then executes (or skips) the NetSuite write-back.~~ **Abandoned with approve-by-link.** There is no approve or reject link in any email. Approve and Reject are form submissions in the review web app, and Approve writes to NetSuite in that request, while she waits, showing the result per line (Phase 4 decision 2). How the review app is hosted is not decided. That it authenticates its user is decided: a sign-in establishing the reviewer is a cutover prerequisite (`RUNBOOK.md` §12 item 8). How it does so is not decided. It is a FastAPI app, not a Functions HTTP trigger as written.
 
 ~~This two-trigger split avoids building a persistent server process just to keep a webhook connection alive, while still giving an instant response to Paula's click rather than waiting for the next poll cycle.~~ The instant response this was for now comes from the review app's synchronous Approve.
 

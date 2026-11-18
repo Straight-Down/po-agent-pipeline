@@ -4,7 +4,7 @@
 
 **Audience:** assumes general technical competence, no prior context on this specific project. Where more depth exists elsewhere, this doc points to it rather than repeating it — `PO-Update-Automation-Architecture.md` is the full design rationale; this doc is the "how do I actually run/fix/hand this off" companion.
 
-**Last updated:** 2026-09-01
+**Last updated:** 2026-11-18: §2, §3 item 1, §5 and §11 brought up to date. Other sections carry their own dates. Migrations run 0001-0017, and 0017 is head.
 
 ---
 
@@ -12,26 +12,31 @@
 
 Paula (Supply Chain Manager) gets emails from vendors when a shipment goes out, with attached documents showing the quantities the factory says it shipped, and dates. Those emails come at dispatch, weeks before the goods arrive (§4). Today she reads those by hand and re-types the numbers into NetSuite Purchase Orders. This system automates the reading and matching, and stages the proposed NetSuite changes — but it never writes to NetSuite without Paula explicitly approving each change first. That human approval step is permanent by design, not a temporary safeguard.
 
-## 2. Current status (as of 2026-08-11)
+## 2. Current status (as of 2026-11-18)
+
+**Rewritten 2026-11-18.** The previous table dated from 2026-08-11 and still listed intake, review and write-back as not built. Each row points to where the detail lives.
 
 | Piece | Status |
 |---|---|
-| NetSuite auth (M2M/JWT, least-privilege role) | **Built and validated in sandbox.** All four target fields write correctly. Not yet moved to production. |
-| Document parsing (3 real vendors: Inprotex, Legendz, Symmetry) | **Built and validated against real vendor files**, live-tested via the Anthropic API. Only 3 vendors confirmed — total vendor count for v1 is still unknown (open item, §6 below). |
-| Attachment triage (choosing which email attachment to actually parse) | **Built and validated** against a real 6-attachment vendor email. |
-| Matching (vendor line → NetSuite PO line) | **Built**, exact-match on custom fields, size-alias normalization for letter sizes only (see §6, known gap). |
-| Business rules (dates, quantity, absent lines) | **Built**, based on Paula's direct answers (2026-08-10/11) — see §4. |
-| Email intake (reading Paula's inbox automatically) | **Not built.** Design decided (direct Graph API access to her mailbox), nothing implemented yet. |
-| Review/approval step (the actual UI/email Paula interacts with) | **Not built.** |
-| NetSuite write-back triggered by approval | **Not built** (the underlying write call is proven from Phase 1, but nothing wires an approval to it yet). |
-| Hosting (Azure Functions, database, Key Vault) | **Not provisioned.** Everything currently runs only on Kiko's laptop. |
-| This runbook | You're reading it. |
+| **NetSuite auth** (M2M/JWT, least-privilege role) | **Built.** The role has seven permissions (§6 item 27; `NETSUITE-M2M-SETUP.md` Step 2). The production role exists with Purchase Order at **View** (as reported 2026-10-21) until cutover (§12 item 5). |
+| **Email intake** (`poller.py`, `graph_client.py`) | **Built.** Reads the `shipments@` shared mailbox through Microsoft Graph, using app-only `Mail.Read` scoped to that one mailbox (§3, §6 item 11). It has a content-addressed attachment store, a watermark with overlap, per-message failure isolation and a dry-run mode. It has been run against the live mailbox **by hand** (2026-09-14 and 2026-11-18). `.env` keeps `GRAPH_CLIENT=mock`, and nothing polls on a schedule. |
+| **Attachment classification** (`attachment_classifier.py`) | **Built.** Judges what a document is by its content and what format a file is by its signature, never by its name. A file is admitted on per-size content, not document type, and each sheet is judged on its own. Hidden sheets are skipped, and an inspection report is never a data source. Verdicts are stored and replayed, never re-asked (migrations 0011 and 0012). |
+| **Extraction** (`claude_extractor.py`, `document_parsers.py`, `parse_packing_slip.py`) | **Built.** The Anthropic API is the primary path, because every vendor's layout differs. A free deterministic parser handles Inprotex. Validated against five real vendors (§11). |
+| **Carton verification** (`carton_backing.py`) | **Built.** A quantity row counts as shipped only if cartons in the selected documents add up to it. Unbacked rows are removed and named, and losing more than a third of a shipment's lines is escalated. A medium-confidence flag is cleared only when every field is proven from the grid (CLAUDE.md gotchas). |
+| **Matching and proposal rules** (`matcher.py`) | **Built.** Matches exactly on NetSuite's custom fields, resolving sizes and colours. When several open lines match, a human chooses. Quantities accumulate onto this tool's own write record, and lines with earlier receipts are compared, never added to. Nothing is proposed below ordered except the factory's final count (§4). |
+| **Persistence** (`ingest.py`, `schema.py`, migrations 0001-0017) | **Built.** Runs on SQLite and on Azure SQL (§5; testing policy in §7). |
+| **Review screen** (`review_app/`) | **Built, and runs locally only:** FastAPI on 127.0.0.1, no login, with the reviewer named by `PO_AGENT_REVIEWER`. Approve and Reject are per PO. Lines that can't be changed are left out of Approve, and Reject confirms what it covers first (§11). **There is no picker** for a line that matches several NetSuite lines (`NEEDS_RESOLUTION` / `NEEDS_ASSIGNMENT`); such lines are left out, to be fixed in NetSuite. |
+| **Write path** (`write_path.py`) | **Built.** Approve writes `quantity` and nothing else, in one batch PATCH per PO, re-reading the PO before and after, while the reviewer waits (§11 decision 2). It refuses a production account unless `PO_AGENT_ALLOW_PRODUCTION_WRITES` names it. Rehearsed end to end on Sandbox 2 on 2026-11-09: 17 lines written (§11). |
+| **Hosting** (Azure Functions, Key Vault, monitoring) | **Not built.** Azure SQL exists (§5); nothing else is provisioned. Every run is started by hand on Kiko's laptop, and nothing monitors it. |
+| **Daily digest email** (§11 decision 1) | **Not built.** Blocked on the Graph `Mail.Send` permission, requested 2026-10-21. Until it lands, the approver checks the screen herself. |
+| **Reject reason picker** (§11 decision 4) | **Not built.** It needs a migration adding a reject-reason column. Reject takes a free-text reason today. |
+| **Production cutover** (§12) | **Not started.** One of the six checklist items is ticked. **Production NetSuite has been read and has never been written to.** |
 
-In short: the hard, uncertain part (can this reliably read messy vendor documents and figure out what changed) is proven. The remaining work is wiring it into something that runs unattended.
+In short: everything from the mailbox to a NetSuite write is built and has been exercised against Sandbox 2. What remains is running it unattended (hosting), the two unbuilt decisions, and cutover. Cutover starts by re-reading every affected PO from production (§12 item 4), because Sandbox 2's figures are known to disagree with production's (§8 lesson 31).
 
 ## 3. How email-to-PO matching works
 
-1. **Intake** (not yet built) will read new emails via Microsoft Graph API from a **new shared mailbox** (`shipments@`), app-only `Mail.Read` scoped to that one mailbox via RBAC for Applications. **This reverses the 2026-08-10 "direct access to Paula's inbox" decision** — `Mail.Read` is mailbox-level, not folder-level, so that route would have exposed her whole inbox. See §6 item 11.
+1. **Intake** (`poller.py`, built 2026-09-14) reads new emails via Microsoft Graph API from a **dedicated shared mailbox** (`shipments@`), app-only `Mail.Read` scoped to that one mailbox via RBAC for Applications. **This reverses the 2026-08-10 "direct access to Paula's inbox" decision** — `Mail.Read` is mailbox-level, not folder-level, so that route would have exposed her whole inbox. See §6 item 11.
 2. **Attachment triage** (`attachment_classifier.py`) looks at every attachment in the email and decides what it is — packing list, invoice, payment request, inspection report, shipping schedule. **Filenames are not trusted for this** — one real vendor's invoice was literally named "...PACKING LIST.pdf." Classification looks at document content instead (does this sheet/page actually break quantities out by size). Only a document whose content breaks quantities out per size gets parsed for shipment data; everything else is set aside. **The type is recorded but does not gate** (2026-09-23): PO 1624's clearance workbook is typed a commercial invoice and holds the only size-level sheets for that PO, so a type check threw them away. Inspection reports stay excluded whatever they contain (Paula's ruling), and within an admitted workbook each sheet is still judged on its own, so an invoice sheet is not read as data.
 3. **Parsing** (`document_parsers.py`, `claude_extractor.py`, `parse_packing_slip.py`) extracts PO number, style, color, size, and quantity from the packing list.
    - If the file is a known, previously-validated format (currently just Inprotex), a fast deterministic parser handles it for free.
@@ -137,9 +142,34 @@ In short: the hard, uncertain part (can this reliably read messy vendor document
 
 **Why the split:** anything that can authenticate on its own (a private key, an API key) must never sit in the OneDrive-synced folder — it would sync to the cloud and be inherited by anyone the folder is ever shared with. Identifiers that are meaningless without a separate secret are fine in the synced `.env`. If a new secret gets added to this project in the future (a Graph API app secret, a database connection string), it follows the same rule: outside the synced folder, ideally eventually into Azure Key Vault once that's provisioned.
 
-**NetSuite environments:** sandbox is `1321665-sb2`, currently the only one this touches. Production is a separate account with its own Integration record and role, not yet set up (Phase 4 work).
+**NetSuite environments** (corrected 2026-11-18):
+- **Sandbox 2, `1321665-sb2`.** All development and every write so far, including the 2026-11-09 rehearsal (§11).
+- **Production, `1321665`.** It has its own Integration record and role, with Purchase Order at View (as reported 2026-10-21) until cutover (§12 item 5).
+  - **Read, never written.** Reads were GET only, of POs 1624, 1650, 1657, 1662, 1704, 1720, 1721 and 1725.
+  - 1624, 1662, 1720, 1721 and 1725 are recorded in §8 lesson 31, §11 and §12 item 4. 1650, 1657 and 1704 are per Kiko, 2026-11-18, with no record in this repo; their figures elsewhere in this runbook are Sandbox 2's.
+  - **The first production write will be the first one ever**, governed by §12.
 
-**Database:** doesn't exist yet. Planned as Azure SQL Database (serverless tier), not built.
+**Database** (corrected 2026-11-18; it said "doesn't exist yet"). Azure SQL, server `sql-po-agent-prod`, Basic tier, two databases. The tier is **Basic, not the serverless tier** the architecture doc planned (Architecture §4.2).
+- **`sqldb-po-agent`: production.** Ring-fenced: nothing in this project runs against it before cutover (§8 lesson 25).
+  - The test harness refuses it by name (not `*-test`), and separately refuses to run under a `dbo` login on any database.
+  - Alembic refuses it unless `PO_AGENT_MIGRATE_CONFIRM=sqldb-po-agent` is set for that one command.
+  - `PO_AGENT_DB_URL` is deliberately unset in `.env`. It gets set in the hosting configuration at cutover (§12 item 3).
+  - Its Basic tier is as stated by Kiko on 2026-11-18. Nothing in this repo measured it.
+- **`sqldb-po-agent-test`: the `--mssql` test target.** Basic tier, 5 DTU, never auto-pauses (measured 2026-10-12, §8 lesson 33).
+  - The harness drops every table on it once per database-backed test, so it holds nothing worth keeping.
+  - It is reached as a contained user of that database only, never the server admin (CLAUDE.md, "Dual-dialect runs").
+- **Local SQLite run databases** in `~/po-agent-runs/`, outside OneDrive because they hold vendor data. Each is a disposable record of one run:
+  - `rerun10.db` (2026-09-28) and its review copies `rerun10-kiko.db` and `rerun10-paula.db`;
+  - `review-test.db` (2026-09-30);
+  - `e2e-sb2-20261104-test.db` and `e2e-sb2-1657-20261104-test.db`, from the 2026-11-04 Sandbox 2 rehearsal (§8 lesson 34);
+  - `e2e-sb2-20261104-rerun0017-test.db`, the re-run after migration 0017 that the 2026-11-09 approvals were made in (§11);
+  - `e2e-sb2-sept-20261118-test.db`, the five September forwards re-run on current code, with its attachments in `e2e-sb2-sept-20261118-attachments/` beside it. Not yet written up in §11.
+
+  The `*-test.db` names let Alembic migrate them without a confirmation; the older names need one.
+- **`po_agent.db`** in the project folder is `alembic.ini`'s default. It holds the 2026-09-14 live poll and that mailbox's watermark.
+  - It is git-ignored, like every `*.db`.
+  - Alembic refuses it without `PO_AGENT_MIGRATE_CONFIRM=po_agent.db`.
+  - The poller's default attachment store is `%USERPROFILE%\.po-agent\attachments`.
 
 **Version control — the `.git` layout is deliberately unusual.** The working tree stays here in the OneDrive-synced `PO Agent` folder, but **`.git` is a FILE, not a directory**, containing a single line:
 
@@ -1697,12 +1727,38 @@ The SD-219 email was the first input to meet all three conditions, and it is als
 
 ## 11. What's left to build
 
-See `PO-Update-Automation-Build-Plan.md` for full phase detail. **Corrected 2026-09-14** — this section had said Phase 2 had not started, which stopped being true on 2026-08-26.
+See `PO-Update-Automation-Build-Plan.md` for full phase detail. **Restructured 2026-11-18.** This section used to say "Phase 4 — not started" directly above a list of Phase 4 decisions marked built. Both were true, of different things: the **decisions** of 2026-10-21 are made and mostly built, while **cutover** has not started. They are now separated.
 
-- **Phase 1 — done**, and the write-back test re-run under the current seven-permission role (§6 item 27). The parsing/matching layer is validated live against **five** real vendors.
-- **Phase 2 — done against the mock.** Schema and migrations, `ingest.py`, and now the mailbox intake job: a four-method Graph interface with a mock and a real client, a content-addressed attachment store, watermark with overlap, per-message failure isolation, and a separate extraction driver. `GRAPH_CLIENT` is still `mock`; pointing it at the live mailbox is the next step and should be watched, not scheduled.
-- **Phase 3 — in progress (review UI v1 built 2026-09-30; Approve writes to NetSuite since 2026-11-02).** Its requirements are unusually complete but were scattered across **five** sources — the build plan, this runbook's §7, `PO-Update-Automation-Schema-Rationale.md`, `PO-Update-Automation-Architecture.md`, and several docstrings. **Consolidated 2026-09-16 into `PO-Update-Automation-Phase3-Requirements.md`**, which indexes all eleven and cites each back to its source; those sources stay authoritative. **Paula ruled on the last four open questions on 2026-09-16** (§6 item 30), so nothing in it is now pending a decision — the approval unit is per PO, partial failures retry per line, Paula is the sole approver, and multi-batch quantities accumulate. Only the fourth needed code. **The per-PO approval unit stands.** A 2026-10-21 decision to move to per-line approval was itself superseded on 2026-11-02 (Phase 4 decision 5 below); lines that can't be changed are left out of Approve instead. **Review UI v1 built 2026-09-30** (`review_app/`, local FastAPI on 127.0.0.1, no auth): the queue, the per-PO page, Approve / Reject per PO, and source documents served only through a proposal. A PO with no open NetSuite line when its slip was processed never appears to the reviewer; `/no-action` lists them for diagnosis, reachable by URL only and linked from nowhere (the setting that put them back in the queue was removed 2026-09-30). Every reviewer-facing message says whether anything is needed and what; internal detail sits behind a collapsed Details toggle, and `test_no_internal_detail_outside_the_details_toggle` enforces it. **Approve writes to NetSuite since 2026-11-02:** it records the verdicts, calls `write_path.write_po_batch` (one PATCH per PO; Phase 4 decision 2 below) while she waits, and shows a result page; the package may import that one function and nothing else from the write side (tested). Lines that can't be changed -- blocked, or needing a choice between NetSuite lines (NEEDS_RESOLUTION / NEEDS_ASSIGNMENT, for which there is still no picker) -- are left out of Approve and listed, instead of disabling it or refusing the page. A PRE_EXISTING_RECEIPT line never asks for a total (2026-10-21): one whose figures all agree is hidden from the reviewer and listed on `/no-action`, and a PO with nothing else left to decide is parked there too; one whose figures disagree blocks Approve with the figures stated, and is fixed in NetSuite. Run: `set PO_AGENT_REVIEWER=<name>` then `.venv\Scripts\python -m review_app --db sqlite:///<db>`.
-- **Phase 4 — not started.** Three production re-verification items (tranId, colour resolution, the size vocabulary) share one shape: §8 lesson 16. Phase 3's review UI v1 exists (local), and its Approve writes to NetSuite through the batch write function (wired 2026-11-02). Phase 4 (production cutover, monitoring) has not started. Cutover follows the checklist in §12.
+### Decided and built
+
+- **Phase 1: done.** The write-back test was re-run under the current seven-permission role (§6 item 27). The parsing and matching layer is validated live against **five** real vendors.
+- **Phase 2: done.** Schema and migrations, `ingest.py`, and the mailbox intake job, which has:
+  - a four-method Graph interface with a mock and a real client;
+  - a content-addressed attachment store;
+  - a watermark with overlap, and per-message failure isolation;
+  - a separate extraction driver, `extract_pending.py`.
+
+  Run against the live mailbox by hand on 2026-09-14 (§6 item 29) and 2026-11-18 (a dry run, then the September forwards re-run on current code; not yet written up). `.env` keeps `GRAPH_CLIENT=mock`, so live mail is read only when a single command sets `GRAPH_CLIENT=real`. Nothing polls on a schedule, because there is no hosting (below).
+- **Phase 3: built (review UI v1 2026-09-30; Approve writes to NetSuite since 2026-11-02).** One gap remains: there is no picker for a line that matches several NetSuite lines (`NEEDS_RESOLUTION` / `NEEDS_ASSIGNMENT`). Those lines are left out of Approve, and §4 says what such a picker must apply. Its requirements are unusually complete but were scattered across **five** sources — the build plan, this runbook's §7, `PO-Update-Automation-Schema-Rationale.md`, `PO-Update-Automation-Architecture.md`, and several docstrings. **Consolidated 2026-09-16 into `PO-Update-Automation-Phase3-Requirements.md`**, which indexes all eleven and cites each back to its source; those sources stay authoritative. **Paula ruled on the last four open questions on 2026-09-16** (§6 item 30), so nothing in it is now pending a decision — the approval unit is per PO, partial failures retry per line, Paula is the sole approver, and multi-batch quantities accumulate. Only the fourth needed code. **The per-PO approval unit stands.** A 2026-10-21 decision to move to per-line approval was itself superseded on 2026-11-02 (Phase 4 decision 5 below); lines that can't be changed are left out of Approve instead. **Review UI v1 built 2026-09-30** (`review_app/`, local FastAPI on 127.0.0.1, no auth): the queue, the per-PO page, Approve / Reject per PO, and source documents served only through a proposal. A PO with no open NetSuite line when its slip was processed never appears to the reviewer; `/no-action` lists them for diagnosis, reachable by URL only and linked from nowhere (the setting that put them back in the queue was removed 2026-09-30). Every reviewer-facing message says whether anything is needed and what; internal detail sits behind a collapsed Details toggle, and `test_no_internal_detail_outside_the_details_toggle` enforces it. **Approve writes to NetSuite since 2026-11-02:** it records the verdicts, calls `write_path.write_po_batch` (one PATCH per PO; Phase 4 decision 2 below) while she waits, and shows a result page; the package may import that one function and nothing else from the write side (tested). Lines that can't be changed -- blocked, or needing a choice between NetSuite lines (NEEDS_RESOLUTION / NEEDS_ASSIGNMENT, for which there is still no picker) -- are left out of Approve and listed, instead of disabling it or refusing the page. A PRE_EXISTING_RECEIPT line never asks for a total (2026-10-21): one whose figures all agree is hidden from the reviewer and listed on `/no-action`, and a PO with nothing else left to decide is parked there too; one whose figures disagree blocks Approve with the figures stated, and is fixed in NetSuite. Run: `set PO_AGENT_REVIEWER=<name>` then `.venv\Scripts\python -m review_app --db sqlite:///<db>`.
+- **The Phase 4 decisions (Kiko, 2026-10-21): made, and four of six settled.** Decisions 2, 3 and 6 are built, and 5 is superseded (approval stays per PO). **Not built:**
+  - decision 1, the daily digest email, which is blocked on Graph `Mail.Send`;
+  - decision 4, the reject reason picker, which needs a migration.
+
+  Each decision is set out in full under "Phase 4 decisions" below.
+- **Rehearsed end to end on Sandbox 2, 2026-11-09:** email, ingest, review app, Approve, batch PATCH and closing re-read, then confirmed independently (below).
+
+### Not started: production cutover
+
+**Cutover has not started** (build plan Phase 4). Specifically:
+- **No hosting.** Azure SQL exists (§5), but Azure Functions and Key Vault are not provisioned. Every run is started by hand on Kiko's laptop: the poll, the extraction and the review app.
+- **No monitoring or alerting** (build plan Phase 4 item 8).
+- **Production NetSuite has been read and never written to.** Two things stop a production write today:
+  - the production role's Purchase Order permission is View, as reported on 2026-10-21 and not re-read since (§12 items 5 and 6);
+  - `write_path` refuses a production account unless `PO_AGENT_ALLOW_PRODUCTION_WRITES` names it, and that variable is not set in `.env`.
+- **The §12 checklist has one of its six items ticked.** Item 4, re-reading every affected PO from production before anything is approved for real, is the gate. Sandbox 2's figures are known to disagree with production's (§8 lesson 31).
+- **Three production re-verification items** (tranId, colour resolution and the size vocabulary; build plan Phase 4 items 3-5) share one shape: §8 lesson 16.
+
+Cutover follows the checklist in §12.
 
 ### Phase 4 decisions (Kiko, 2026-10-21)
 

@@ -2,10 +2,27 @@
 
 This file is the entry point for Claude Code. Everything in this folder came out
 of a planning/scoping session in Cowork — read this first, then pull in the
-other docs as needed. Nothing here has touched production data; all NetSuite
-interaction so far has been against the sandbox, authenticated via a temporary
-CFO-role workaround in the Cowork chat — NOT the least-privilege role the
-standalone build should actually use (see "Current blockers" below, item 1).
+other docs as needed.
+
+**Production NetSuite (account `1321665`) has been READ and has NEVER been
+WRITTEN TO** (as of 2026-11-18; this replaces "nothing here has touched
+production data", which stopped being true).
+- **Read:** GET only, POs 1624, 1650, 1657, 1662, 1704, 1720, 1721 and 1725, to
+  grade the tool against production and check staged proposals. 1624, 1662,
+  1720, 1721 and 1725 are recorded in RUNBOOK §8 lesson 31, §11 and §12 item 4.
+  1650, 1657 and 1704 are per Kiko, 2026-11-18.
+- **Never written.** Every write so far went to Sandbox 2 (`1321665-sb2`): the
+  Phase 1 write/verify/revert tests, the 2026-11-02 timing runs and the
+  2026-11-09 rehearsal's 17 lines. **This is the half that matters at cutover:**
+  the first production write will be the first one ever, and RUNBOOK §12
+  governs it. Two things refuse it today. The production role's Purchase Order
+  permission is View, as reported on 2026-10-21 and not re-read since. And
+  `write_path` refuses production unless `PO_AGENT_ALLOW_PRODUCTION_WRITES`
+  names the account, which `.env` does not set.
+
+The 2026-08-04 planning session's NetSuite work used a temporary CFO-role
+workaround in the Cowork chat, against the sandbox. The standalone build uses
+the least-privilege role instead (see "Current blockers" below, item 1).
 
 ## What this project is
 
@@ -165,18 +182,21 @@ structure, tests, packaging) to whatever standard you'd normally build to.
 
 The sections above describe the project as of **2026-08-04**. Several
 statements in them are no longer true, and Claude Code weights this file more
-heavily than the code it can read. Known drift as of 2026-09-14:
+heavily than the code it can read. Known drift, last reviewed 2026-11-18:
 
 - The file-table entry for `netsuite_client.py` calls it a "stub" whose
   "method bodies are mocked/`NotImplementedError`". It is not. It is a
-  1,293-line client making real REST calls, with zero `NotImplementedError`
+  1,541-line client making real REST calls, with zero `NotImplementedError`
   remaining.
 - The file table lists only the Phase 0 prototypes. The repo now also contains
   `ingest.py`, `schema.py`, `extraction_schema.py`, `claude_extractor.py`,
   `document_parsers.py`, `attachment_classifier.py`, `size_vocabulary.py`,
-  `canonical.py`, `config.py`, `carton_backing.py`, alembic migrations
-  0001-0017, and ten test
-  modules as of 2026-11-02 — plus, since Phase 2 closed on 2026-09-14, the mailbox intake:
+  `canonical.py`, `config.py`, `carton_backing.py`, `dialect_target.py` and
+  `conftest.py` (the dual-dialect test harness), `scripts/` (read-only probes:
+  `probe_graph_auth.py`, `read_po_line_states.py`,
+  `estimate_pre_existing_receipts.py`), alembic migrations 0001-0017 (0017,
+  of 2026-11-09, is head as of 2026-11-18), and ten test modules. Since Phase 2
+  closed on 2026-09-14 it also has the mailbox intake:
   `graph_client.py` (a four-method Graph interface with a mock and a real
   client), `poller.py` (the polling job and the content-addressed attachment
   store) and `extract_pending.py` (the ingest -> extraction driver, a separate
@@ -187,8 +207,11 @@ heavily than the code it can read. Known drift as of 2026-09-14:
   quantities in one PATCH, re-read before and after, refusals returned, an
   attempt row per line; `write_approved_quantity` is its per-line fallback) and
   `test_write_path.py` -- wired to the review app's Approve on 2026-11-02.
-- "Nothing here has touched production data" should be re-confirmed rather
-  than assumed, given how much has been built since.
+- ~~"Nothing here has touched production data"~~ **Corrected 2026-11-18** at the
+  top of this file. Production has been read (eight POs, GET only; three of
+  the reads are per Kiko with no repo record) and has never been written to.
+- For what is built and what is not, read RUNBOOK §2 (rewritten 2026-11-18)
+  before this file's older sections.
 
 **Rule: when a change makes a statement in this file untrue, fix the statement
 in the same turn.** A wrong line here costs more than a missing one, because

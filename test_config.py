@@ -1076,6 +1076,10 @@ ENGINES_BUILT_OUTSIDE_THE_HARNESS = {
         "builds from dialect_target.migration_url(), so it DOES follow the switch (but "
         "gets no connection retry); Alembic must build the schema, which "
         "fresh_engine() would pre-empt",
+    ("test_schema.py", "test_0018_downgrade_refuses_an_unprocessable_message"):
+        "builds from dialect_target.migration_url(), so it DOES follow the switch (but "
+        "gets no connection retry); it drives Alembic up and down, which needs a "
+        "database Alembic built, not one fresh_engine() pre-empts",
 }
 
 

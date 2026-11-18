@@ -64,10 +64,23 @@ def create_app(settings: Settings, engine=None, now=None) -> FastAPI:
         return [e for e in config.read_unrecorded_writes(settings.unrecorded_writes)
                 if e.get("reached_netsuite") in (True, "unknown") or "unparsed" in e]
 
+    def unreadable_emails() -> tuple[list, bool]:
+        """Emails recorded as unprocessable and not yet cleared, for EVERY page, like
+        the unrecorded writes above. If the database cannot be asked, the page says
+        so rather than showing nothing: an empty list would read as "none"."""
+        try:
+            with engine.connect() as conn:
+                return data.unprocessable_messages(conn), False
+        except Exception:  # noqa: BLE001 -- the banner must not take the page down
+            logger.exception("could not read unprocessable messages for the banner")
+            return [], True
+
     def page(request: Request, name: str, status: int = 200, **context) -> HTMLResponse:
+        unreadable, unreadable_unknown = unreadable_emails()
         context.update(request=request, reviewer=settings.reviewer, csrf=csrf,
                        unrecorded=unrecorded_landed(),
-                       unrecorded_file=settings.unrecorded_writes)
+                       unrecorded_file=settings.unrecorded_writes,
+                       unreadable=unreadable, unreadable_unknown=unreadable_unknown)
         return templates.TemplateResponse(request, name, context, status_code=status)
 
     def refuse(request: Request, exc: data.ReviewRefused) -> HTMLResponse:

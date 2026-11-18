@@ -217,7 +217,10 @@ messages = Table(
     Column("mailbox", Unicode(320), nullable=False),
     Column("subject", Unicode(1000)),
     Column("from_address", Unicode(320)),
-    # Set when Paula forwards rather than the vendor mailing the box directly.
+    # Intended for "Paula forwarded this, rather than the vendor mailing the box",
+    # but NOTHING FILLS IT: the poller never writes it and extract_pending never
+    # passes it, so it is NULL on every row (RUNBOOK section 6 item 33). NULL does
+    # not mean "not forwarded".
     Column("forwarded_by", Unicode(320)),
     Column("sent_at", DateTime),
     Column("received_at", DateTime, nullable=False),
@@ -244,6 +247,17 @@ messages = Table(
     # without touching Graph.
     Column("extracted_at", DateTime),
     Column("extraction_error", Unicode(1000)),
+    # A PERMANENT intake failure, and deliberately NOT `poll_error` (migration
+    # 0018). An attachment Graph has no file bytes for -- a forwarded email
+    # attached as an .eml/.msg, a cloud link -- can never be fetched, so retrying
+    # it held the watermark behind it forever. Such a message is recorded here
+    # with its reason. It is never retried and never extracted, none of its
+    # attachments are stored, and the review app shows it on every page until a
+    # person clears it (`unprocessable_resolved_at`, with an audit event naming
+    # them). The reason is kept after clearing: the record is permanent, only
+    # the banner goes.
+    Column("unprocessable_reason", Unicode(1000)),
+    Column("unprocessable_resolved_at", DateTime),
     UniqueConstraint("graph_message_id", name="uq_messages_graph_message_id"),
 )
 

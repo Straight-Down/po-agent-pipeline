@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import logging
 import os
 import uuid
@@ -52,8 +53,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
+from sqlalchemy import select
+
 import graph_client as gc
-from schema import attachments, message_attachments, messages, poll_state
+from schema import attachments, audit_log, message_attachments, messages, poll_state
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +145,25 @@ class MessageOutcome:
     attachments_new: int = 0
     attachments_linked: int = 0
     error: str = ""
+    #: Set when this poll RECORDED the message as unprocessable: an attachment
+    #: Graph has no file bytes for. Not an `error` -- it will not be retried and
+    #: does not hold the watermark -- and not `stored` either, because nothing
+    #: of it was. It is surfaced instead (`messages.unprocessable_reason`).
+    unprocessable: str = ""
+
+
+#: Who the poller's audit events name. A system actor, like `write_path.ACTOR`.
+ACTOR = "poller"
+MESSAGE_UNPROCESSABLE = "MESSAGE_UNPROCESSABLE"
+MESSAGE_UNPROCESSABLE_RESOLVED = "MESSAGE_UNPROCESSABLE_RESOLVED"
+
+
+class _Unprocessable(Exception):
+    """Raised inside a message's transaction so that NOTHING of it is stored."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass
@@ -177,6 +199,12 @@ class PollReport:
     def failed(self) -> list:
         return [o for o in self.outcomes if o.error]
 
+    @property
+    def unprocessable(self) -> list:
+        """Messages THIS poll recorded as unprocessable. Never retried, so a later
+        poll skips them as already had; the review app keeps showing them."""
+        return [o for o in self.outcomes if o.unprocessable]
+
     def summary(self) -> str:
         if self.dry_run:
             atts = sum(len(o.attachment_preview) for o in self.outcomes)
@@ -185,7 +213,8 @@ class PollReport:
                     f"at {self.watermark_before}")
         cut = f" (capped at {self.seen} of {self.available})" if self.truncated else ""
         return (f"{self.seen} seen, {self.stored} stored, {self.skipped} already had, "
-                f"{len(self.failed)} failed{cut} | watermark "
+                f"{len(self.failed)} failed, {len(self.unprocessable)} unprocessable{cut} "
+                f"| watermark "
                 f"{'->' if self.watermark_advanced else 'held at'} {self.watermark_after}")
 
 
@@ -326,8 +355,11 @@ def _handle_message(engine, client, store, mailbox, envelope, now) -> MessageOut
             ).one_or_none()
 
             # DEDUP. A row with no `poll_error` is complete -- nothing to redo.
-            # A row WITH one is a previous failure being retried, which is why
-            # the marker is cleared and the attachments re-fetched below.
+            # That includes an UNPROCESSABLE row (`unprocessable_reason` set,
+            # `poll_error` NULL): recorded once, never retried, and shown in the
+            # review app instead. A row WITH `poll_error` is a previous failure
+            # being retried, which is why the marker is cleared and the
+            # attachments re-fetched below.
             if existing and not existing.poll_error:
                 outcome.skipped_existing = True
                 return outcome
@@ -356,17 +388,187 @@ def _handle_message(engine, client, store, mailbox, envelope, now) -> MessageOut
                 conn.execute(messages.insert(), {"id": message_id, **row})
 
             for meta in declared:
-                new_content, linked = _store_attachment(
-                    conn, client, store, message_id, graph_id, meta, now
-                )
+                try:
+                    new_content, linked = _store_attachment(
+                        conn, client, store, message_id, graph_id, meta, now
+                    )
+                except gc.AttachmentNotFetchable as exc:
+                    # Raised INSIDE the transaction, so every row this message
+                    # wrote is rolled back: none of its attachments is stored,
+                    # and extraction can never see half of it.
+                    raise _Unprocessable(_unprocessable_reason(meta, declared, exc)) from exc
                 outcome.attachments_new += int(new_content)
                 outcome.attachments_linked += int(linked)
             outcome.stored = True
+    except _Unprocessable as exc:
+        # PERMANENT: the same attachment will never have file bytes, so a retry
+        # would fail on every poll and hold the watermark behind it for good.
+        # Recorded instead, and surfaced. If even the recording fails, fall back
+        # to an ordinary failure: retried, watermark held. Never a silent skip.
+        # The counts were for attachments the rollback just undid.
+        outcome.attachments_new = outcome.attachments_linked = 0
+        if _record_unprocessable(engine, mailbox, graph_id, envelope, received, now,
+                                 exc.reason, declared):
+            outcome.unprocessable = exc.reason
+            logger.error("poll: message %s is UNPROCESSABLE and will not be retried: %s",
+                         graph_id, exc.reason)
+        else:
+            outcome.error = f"unprocessable, but recording that failed: {exc.reason}"[:1000]
+            logger.error("poll: message %s failed: %s", graph_id, outcome.error)
+            _record_failure(engine, mailbox, graph_id, envelope, received, now, outcome.error)
     except Exception as exc:  # noqa: BLE001 -- a failure here is data, not a crash
         outcome.error = f"{type(exc).__name__}: {exc}"[:1000]
         logger.warning("poll: message %s failed: %s", graph_id, outcome.error)
         _record_failure(engine, mailbox, graph_id, envelope, received, now, outcome.error)
     return outcome
+
+
+def _unprocessable_reason(meta: dict, declared: Sequence[dict],
+                          exc: gc.AttachmentNotFetchable) -> str:
+    """What a person reads about an unprocessable message: which attachment, what
+    it is, and that nothing of the message was taken in."""
+    name = str(meta.get("name") or "an attachment")
+    kind = {
+        "#microsoft.graph.itemAttachment": "a forwarded email attached as an item (.eml/.msg)",
+        "#microsoft.graph.referenceAttachment": "a link to a file stored elsewhere",
+    }.get(exc.odata_type or "", "an attachment Graph has no file bytes for")
+    return (f"attachment {name!r} is {kind}, so it cannot be read as a file. "
+            f"None of this message's {len(declared)} attachment(s) were taken in. "
+            f"Graph: {exc}")[:1000]
+
+
+def _record_unprocessable(engine, mailbox, graph_id, envelope, received, now,
+                          reason: str, declared: Sequence[dict]) -> bool:
+    """
+    Record the message as unprocessable, in its own transaction, with an audit
+    event. Returns False if it could not be recorded, so the caller can fall back
+    to an ordinary, retried failure rather than move the watermark past a message
+    nothing records.
+    """
+    try:
+        with engine.begin() as conn:
+            found = conn.execute(
+                messages.select().with_only_columns(messages.c.id,
+                                                    messages.c.unprocessable_reason)
+                .where(messages.c.graph_message_id == graph_id)
+            ).one_or_none()
+            if found is not None and found.unprocessable_reason is not None:
+                # Already recorded (a concurrent poll, or a retry after a failed
+                # recording). Write nothing: a second audit event would double the
+                # trail, and resetting `unprocessable_resolved_at` would put a
+                # message a person already cleared back on the banner.
+                return True
+            existing = found.id if found is not None else None
+            sender = (envelope.get("from") or {}).get("emailAddress") or {}
+            row = {
+                "graph_message_id": graph_id,
+                "internet_message_id": envelope.get("internetMessageId"),
+                "mailbox": mailbox,
+                "subject": (envelope.get("subject") or "")[:1000],
+                "from_address": (sender.get("address") or "")[:320] or None,
+                "sent_at": (_naive(gc._parse_graph_time(envelope["sentDateTime"]))
+                            if envelope.get("sentDateTime") else None),
+                "received_at": received,
+                "ingested_at": now,
+                "folder_id": envelope.get("parentFolderId"),
+                "attachment_count": len(declared),
+                "poll_error": None,
+                "unprocessable_reason": reason,
+                "unprocessable_resolved_at": None,
+            }
+            message_id = existing or str(uuid.uuid4())
+            if existing:
+                conn.execute(messages.update().where(messages.c.id == existing).values(**row))
+            else:
+                conn.execute(messages.insert(), {"id": message_id, **row})
+            conn.execute(audit_log.insert(), {
+                "id": str(uuid.uuid4()),
+                "occurred_at": now,
+                "workflow": "PACKING_SLIP",
+                "actor": ACTOR,
+                "actor_kind": "SYSTEM",
+                "event": MESSAGE_UNPROCESSABLE,
+                "message_id": message_id,
+                "detail_json": json.dumps({"graph_message_id": graph_id, "reason": reason,
+                                           "attachments": [str(m.get("name") or "")
+                                                           for m in declared]}),
+            })
+        return True
+    except Exception:  # noqa: BLE001 -- the caller falls back to a retried failure
+        # A concurrent poll may have inserted the row first (the unique constraint
+        # on graph_message_id). If what is there now records it, it IS recorded.
+        try:
+            with engine.connect() as conn:
+                recorded = conn.execute(
+                    messages.select().with_only_columns(messages.c.unprocessable_reason)
+                    .where(messages.c.graph_message_id == graph_id)
+                ).scalar()
+            if recorded is not None:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        logger.exception("poll: could not record message %s as unprocessable", graph_id)
+        return False
+
+
+def unprocessable_messages(engine, *, include_resolved: bool = False) -> list[dict]:
+    """Messages recorded as unprocessable, oldest first. Unresolved only, unless asked."""
+    query = (select(messages.c.id, messages.c.graph_message_id, messages.c.subject,
+                    messages.c.from_address, messages.c.received_at,
+                    messages.c.attachment_count, messages.c.unprocessable_reason,
+                    messages.c.unprocessable_resolved_at)
+             .where(messages.c.unprocessable_reason.is_not(None))
+             .order_by(messages.c.received_at, messages.c.id))
+    if not include_resolved:
+        query = query.where(messages.c.unprocessable_resolved_at.is_(None))
+    with engine.connect() as conn:
+        return [dict(r._mapping) for r in conn.execute(query)]
+
+
+class ResolveRefused(RuntimeError):
+    """A resolve request that would not be honest to record."""
+
+
+def resolve_unprocessable(engine, message_ref: str, *, by: str, note: str,
+                          now: Optional[dt.datetime] = None) -> dict:
+    """
+    Take one unprocessable message off the review app's banner, deliberately.
+
+    The record stays: `unprocessable_reason` is kept, `unprocessable_resolved_at`
+    is set, and an audit event names who cleared it and why. `message_ref` is the
+    row id or the Graph message id. Refuses a blank name or note, a message that
+    is not unprocessable, and one already cleared.
+    """
+    by, note = (by or "").strip(), (note or "").strip()
+    if not by or not note:
+        raise ResolveRefused("both --by (who) and --note (what was done) are required")
+    now = now or _utcnow()
+    with engine.begin() as conn:
+        row = conn.execute(
+            messages.select().where(
+                (messages.c.id == message_ref) | (messages.c.graph_message_id == message_ref))
+        ).one_or_none()
+        if row is None:
+            raise ResolveRefused(f"no message {message_ref!r}")
+        if row.unprocessable_reason is None:
+            raise ResolveRefused(f"message {message_ref!r} is not recorded as unprocessable")
+        if row.unprocessable_resolved_at is not None:
+            raise ResolveRefused(f"message {message_ref!r} was already cleared at "
+                                 f"{row.unprocessable_resolved_at}")
+        conn.execute(messages.update().where(messages.c.id == row.id)
+                     .values(unprocessable_resolved_at=now))
+        conn.execute(audit_log.insert(), {
+            "id": str(uuid.uuid4()),
+            "occurred_at": now,
+            "workflow": "PACKING_SLIP",
+            "actor": by[:320],
+            "actor_kind": "HUMAN",
+            "event": MESSAGE_UNPROCESSABLE_RESOLVED,
+            "message_id": row.id,
+            "detail_json": json.dumps({"graph_message_id": row.graph_message_id,
+                                       "note": note, "reason": row.unprocessable_reason}),
+        })
+    return {"id": row.id, "graph_message_id": row.graph_message_id, "resolved_at": now}
 
 
 def _store_attachment(conn, client, store, message_id, graph_id, meta, now):
@@ -418,13 +620,18 @@ def _record_failure(engine, mailbox, graph_id, envelope, received, now, error) -
     """
     try:
         with engine.begin() as conn:
-            exists = conn.execute(
-                messages.select().with_only_columns(messages.c.id)
+            found = conn.execute(
+                messages.select().with_only_columns(messages.c.id,
+                                                    messages.c.unprocessable_reason)
                 .where(messages.c.graph_message_id == graph_id)
-            ).scalar()
-            if exists:
+            ).one_or_none()
+            if found is not None and found.unprocessable_reason is not None:
+                # Recorded as unprocessable (by a concurrent poll): leave it. A
+                # poll_error here would make the next poll retry it and re-record it.
+                return
+            if found is not None:
                 conn.execute(messages.update()
-                             .where(messages.c.id == exists)
+                             .where(messages.c.id == found.id)
                              .values(poll_error=error, ingested_at=now))
             else:
                 sender = (envelope.get("from") or {}).get("emailAddress") or {}
@@ -570,9 +777,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="list what WOULD be stored and store nothing. Fetches "
                          "attachment metadata only, never content.")
+    ap.add_argument("--list-unprocessable", action="store_true",
+                    help="list messages recorded as unprocessable and not yet cleared, "
+                         "then stop. Reads no mail.")
+    ap.add_argument("--resolve-unprocessable", metavar="MESSAGE", default=None,
+                    help="clear one unprocessable message from the review app's banner "
+                         "(row id or Graph message id), then stop. Needs --by and --note. "
+                         "The record and its reason are kept. Reads no mail.")
+    ap.add_argument("--by", default="", help="who is clearing it (with --resolve-unprocessable)")
+    ap.add_argument("--note", default="", help="what was done about it (with --resolve-unprocessable)")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    # Housekeeping on the record, not a poll: no Graph configuration needed.
+    if args.list_unprocessable or args.resolve_unprocessable:
+        engine = create_engine(args.db)
+        if args.resolve_unprocessable:
+            try:
+                done = resolve_unprocessable(engine, args.resolve_unprocessable,
+                                             by=args.by, note=args.note)
+            except ResolveRefused as exc:
+                print(f"REFUSED: {exc}")
+                return 2
+            print(f"Cleared {done['graph_message_id']} at {done['resolved_at']}. "
+                  "Its reason stays on record.")
+            return 0
+        held = unprocessable_messages(engine)
+        print(f"{len(held)} unprocessable message(s) not yet cleared.")
+        for row in held:
+            print(f"  {row['id']}  {row['received_at']}  {row['from_address'] or '(no sender)'}")
+            print(f"      {row['subject'] or '(no subject)'}")
+            print(f"      {row['unprocessable_reason']}")
+        return 0
+
     cfg = config_module.GraphConfig.from_env()
     client = gc.build_graph_client(cfg)
     mailbox = cfg.mailbox or "mock@local"
@@ -621,10 +859,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"[{report.client_kind}] {report.summary()}")
     for outcome in report.failed:
         print(f"  FAILED {outcome.graph_message_id}: {outcome.error}")
+    for outcome in report.unprocessable:
+        print(f"  UNPROCESSABLE {outcome.graph_message_id}: {outcome.unprocessable}")
+    if report.unprocessable:
+        print("  Unprocessable messages are never retried. The review app shows them until "
+              "cleared with --resolve-unprocessable.")
     if report.truncated:
         print(f"  {report.available - report.seen} message(s) left for the next run.")
     print("\nNothing has been extracted. Run extract_pending.py to parse what landed.")
-    return 1 if report.failed else 0
+    return 1 if (report.failed or report.unprocessable) else 0
 
 
 if __name__ == "__main__":

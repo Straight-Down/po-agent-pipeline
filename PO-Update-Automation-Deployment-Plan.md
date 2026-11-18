@@ -99,7 +99,7 @@ The library code (`poller.poll_once`, `extract_pending.extract_pending`, `ingest
     - It shows while the unrecorded-writes record lists a write that reached, or may have reached, NetSuite with no `write_attempts` row.
     - Clearing it means the operator checks each listed line in NetSuite, then archives the file. In hosting the file becomes an append blob (§5), and "archive" becomes a copy-then-reset done by hand in the storage account.
     - **It also carries an instruction for the approver:** "Don't approve those POs again until Kiko has checked them." So, unlike the other banner, it cannot be wholly addressed away from her.
-  - **The unprocessable-message banner** (migration 0018, on branch `unprocessable-messages` and merging into `main` after its SQL Server run; RUNBOOK §6 item 33 and §9 once merged).
+  - **The unprocessable-message banner** (migration 0018; RUNBOOK §6 item 33 and §9).
     - It shows an email whose attachment cannot be read as a file until someone runs `poller.py --resolve-unprocessable <id> --by <name> --note <text>` against the database.
     - It says "Kiko clears this message once that's done", so it is implicitly addressed to the operator. Its only instruction for the approver is to ask the sender for the files again.
   - **What breaks once hosted, for both.**
@@ -374,7 +374,7 @@ For the hosted rehearsal against Sandbox 2 (§9), the approver list is Kiko, set
 | Attachment bytes | The blob container (§2.3) |
 | The unrecorded-writes record | The append blob (§5) |
 | Secrets (NetSuite and Graph private keys, Anthropic API key, CSRF key) | Key Vault |
-| **The system of record** | **Azure SQL `sqldb-po-agent`**, migrated to head (0017 on `main` as of this writing; 0018 once the `unprocessable-messages` branch merges) by hand before the app first runs against it |
+| **The system of record** | **Azure SQL `sqldb-po-agent`**, migrated to head (0018 today) by hand before the app first runs against it |
 
 ### 8.2 Stays local
 

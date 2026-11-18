@@ -194,8 +194,8 @@ heavily than the code it can read. Known drift, last reviewed 2026-11-18:
   `canonical.py`, `config.py`, `carton_backing.py`, `dialect_target.py` and
   `conftest.py` (the dual-dialect test harness), `scripts/` (read-only probes:
   `probe_graph_auth.py`, `read_po_line_states.py`,
-  `estimate_pre_existing_receipts.py`), alembic migrations 0001-0017 (0017,
-  of 2026-11-09, is head as of 2026-11-18), and ten test modules. Since Phase 2
+  `estimate_pre_existing_receipts.py`), alembic migrations 0001-0018 (0018,
+  of 2026-11-18, is head as of 2026-11-18), and ten test modules. Since Phase 2
   closed on 2026-09-14 it also has the mailbox intake:
   `graph_client.py` (a four-method Graph interface with a mock and a real
   client), `poller.py` (the polling job and the content-addressed attachment
@@ -763,4 +763,23 @@ not as history - a rule without its failure mode gets rationalised away.
   line of one PATCH); that table is the record. In the docs, identify a
   request by PO, NetSuite internal id, lines and time. Leave the scan's
   pattern as it is, and add no file exception to quiet it.
+- **An attachment Graph cannot return as a file makes the message UNPROCESSABLE:
+  recorded, surfaced, never retried, never skipped** (2026-11-18, migration 0018).
+  An item attachment (a forwarded email attached as an .eml/.msg) or a cloud
+  link has no `contentBytes`. As a `poll_error`, it failed on every poll and held
+  the watermark behind it forever. `graph_client.AttachmentNotFetchable` is the
+  ONLY permanent case, and it is decided by the attachment's TYPE
+  (`NON_FILE_ATTACHMENT_TYPES`), not by the missing bytes: a FILE attachment
+  without bytes stays an ordinary, retried failure. Everything else stays a
+  retried `poll_error` that holds the watermark: do not widen it to "any 4xx",
+  "any GraphError" or "no contentBytes". Recording it twice writes nothing, and
+  never un-clears a cleared message.
+  The message stores none of its attachments, and `extract_pending` must
+  exclude it explicitly. Without that filter it reached extraction with no paths
+  and was retired as "a message with no attachments", which is a silent skip of a
+  shipment (`test_an_unfetchable_attachment_is_recorded_not_retried` fails).
+  Every review-app page shows it until `poller.py --resolve-unprocessable` clears
+  it with a name and a note. Clearing keeps the reason. If recording it fails, it
+  falls back to a `poll_error`, never to moving the watermark past a message
+  nothing records.
 - <add the next one here>

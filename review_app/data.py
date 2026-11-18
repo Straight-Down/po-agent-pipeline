@@ -771,6 +771,25 @@ def _attempt_messages(conn, change_ids: list) -> dict:
     return out
 
 
+def unprocessable_messages(conn) -> list[dict]:
+    """
+    Emails the poller recorded as unprocessable and nobody has cleared yet
+    (migration 0018): an attachment that could not be read as a file, so NONE of
+    the email was taken in and its shipment is in no queue. Every page shows them,
+    like an unrecorded write, until a person clears one with
+    `poller.py --resolve-unprocessable`.
+    """
+    rows = conn.execute(
+        select(messages.c.id, messages.c.graph_message_id, messages.c.subject,
+               messages.c.from_address, messages.c.received_at,
+               messages.c.attachment_count, messages.c.unprocessable_reason)
+        .where(messages.c.unprocessable_reason.is_not(None))
+        .where(messages.c.unprocessable_resolved_at.is_(None))
+        .order_by(messages.c.received_at, messages.c.id)
+    )
+    return [dict(r._mapping) for r in rows]
+
+
 def has_write_results(conn, shipment_po_id: str) -> bool:
     """Whether this PO has anything for the result page: an attempt, or an approved
     line not yet sent."""

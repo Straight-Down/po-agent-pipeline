@@ -85,6 +85,11 @@ def pending_messages(engine, *, include_extracted: bool = False) -> list[dict]:
     # partial attachment set would produce a shipment missing documents, which
     # is worse than waiting for the next poll to complete it.
     query = query.where(messages.c.poll_error.is_(None))
+    # An UNPROCESSABLE message stored none of its attachments (migration 0018).
+    # Without this filter it would reach the loop below with no paths and be
+    # retired as "a message with no attachments" -- a silent skip of a shipment.
+    # It is shown in the review app instead, until a person clears it.
+    query = query.where(messages.c.unprocessable_reason.is_(None))
 
     with engine.connect() as conn:
         rows = [dict(r._mapping) for r in conn.execute(query)]

@@ -79,6 +79,30 @@ class GraphError(RuntimeError):
         self.status = status
 
 
+#: Attachment types Graph never returns file bytes for: an email attached as an
+#: item (.eml/.msg) and a link to a file stored elsewhere. Only these make a
+#: message permanently unprocessable.
+NON_FILE_ATTACHMENT_TYPES = frozenset({
+    "#microsoft.graph.itemAttachment",
+    "#microsoft.graph.referenceAttachment",
+})
+
+
+class AttachmentNotFetchable(GraphError):
+    """
+    The attachment exists but Graph has no file bytes for it, and never will.
+
+    An item attachment (a forwarded email attached as an .eml/.msg) or a reference
+    attachment (a cloud link) carries no `contentBytes`. Retrying cannot change
+    that, so the poller records the message as UNPROCESSABLE instead of retrying
+    it on every poll and holding the watermark behind it forever.
+    """
+
+    def __init__(self, message: str, *, odata_type: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.odata_type = odata_type
+
+
 class GraphClient(abc.ABC):
     """
     The four calls. Nothing else is reachable.
@@ -392,10 +416,19 @@ class RealGraphClient(GraphClient):
         )
         content = payload.get("contentBytes")
         if content is None:
+            odata_type = payload.get("@odata.type")
+            # PERMANENT only for the two types that never carry file bytes. A file
+            # attachment arriving without them is an oddity that might not recur,
+            # so it stays an ordinary failure: retried, watermark held.
+            if odata_type in NON_FILE_ATTACHMENT_TYPES:
+                raise AttachmentNotFetchable(
+                    f"attachment {attachment_id!r} carries no contentBytes -- it is "
+                    f"an item or reference attachment, not a file. type={odata_type!r}",
+                    odata_type=odata_type,
+                )
             raise GraphError(
-                f"attachment {attachment_id!r} carries no contentBytes -- it is "
-                f"probably an item attachment (a forwarded mail) rather than a file. "
-                f"type={payload.get('@odata.type')!r}"
+                f"attachment {attachment_id!r} carries no contentBytes, and its type "
+                f"{odata_type!r} should have them; treated as a transient failure."
             )
         return base64.b64decode(content)
 

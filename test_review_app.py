@@ -1096,6 +1096,60 @@ def test_one_shared_flag_reason_is_said_once() -> None:
               str(main.count("work out part of this line")))
 
 
+def test_an_unprocessable_email_is_on_every_page_until_cleared() -> None:
+    section("an email the poller could not read: every page says so until a person clears it")
+    import poller
+    from schema import messages
+
+    with _World() as w:
+        with w.engine.begin() as conn:
+            conn.execute(messages.insert(), {
+                "id": sc.new_id(), "graph_message_id": "graph-unreadable-1",
+                "mailbox": "shipments@example.test", "subject": "Fw: SD 1730 packing list",
+                "from_address": "forwarder@example.test", "received_at": NOW,
+                "ingested_at": NOW, "attachment_count": 1,
+                "unprocessable_reason": "attachment 'Fw: SD 1730.msg' is a forwarded email "
+                                        "attached as an item (.eml/.msg), so it cannot be "
+                                        "read as a file. None of this message's 1 "
+                                        "attachment(s) were taken in.",
+            })
+        c = w.client()
+        pages = {"queue": c.get("/").text, "PO page": c.get(f"/po/{w.po_id('1662')}").text,
+                 "no-action": c.get("/no-action").text}
+        for label, html in pages.items():
+            main = main_text(html)
+            check("1 email couldn't be read" in main and "Fw: SD 1730 packing list" in main
+                  and "sent again as ordinary attachments" in main,
+                  f"the {label} names the email, says nothing of it was taken in, and what to do")
+            check(not INTERNAL.findall(main) and "item (.eml" not in main
+                  and "--resolve-unprocessable" not in main,
+                  f"the {label} keeps the raw reason and the command in Details",
+                  str(INTERNAL.findall(main)))
+        check("graph-unreadable-1" in pages["queue"] and "--resolve-unprocessable" in pages["queue"],
+              "Details carries the ids and how to clear it")
+
+        poller.resolve_unprocessable(w.engine, "graph-unreadable-1", by="Kiko Test",
+                                     note="asked for the files as attachments", now=NOW)
+        check("couldn't be read" not in main_text(c.get("/").text),
+              "once a person clears it, the banner goes")
+
+        # The banner must not read as "none" when it could not ask.
+        from review_app import data
+
+        original = data.unprocessable_messages
+
+        def broken(conn):
+            raise RuntimeError("simulated: database unavailable")
+
+        data.unprocessable_messages = broken
+        try:
+            html = c.get("/").text
+        finally:
+            data.unprocessable_messages = original
+        check("couldn't check for emails it was unable to read" in main_text(html),
+              "if it cannot ask the database, the page says so instead of showing nothing")
+
+
 def test_source_documents_are_served_only_through_a_proposal() -> None:
     section("GET /source/{change_id}: one proposal's document, nothing else")
     with _World() as w:
@@ -1160,6 +1214,18 @@ def main_text(html: str) -> str:
 def test_no_internal_detail_outside_the_details_toggle() -> None:
     section("the rule: nothing internal in the main text of any page Paula sees")
     with _World() as w:
+        # An unprocessable email, so every page below also carries its banner and
+        # the rule covers that banner too. Its raw reason is deliberately internal.
+        from schema import messages
+
+        with w.engine.begin() as conn:
+            conn.execute(messages.insert(), {
+                "id": sc.new_id(), "graph_message_id": "graph-unreadable-leak",
+                "mailbox": "shipments@example.test", "subject": "Fw: packing list",
+                "received_at": NOW, "ingested_at": NOW, "attachment_count": 1,
+                "unprocessable_reason": "NEEDS_ATTENTION sha256 R12 !A1 #microsoft.graph."
+                                        "itemAttachment 100%",
+            })
         c = w.client()
         pages = {
             "queue": c.get("/").text,

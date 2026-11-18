@@ -475,6 +475,56 @@ def test_migration_round_trip() -> None:
         engine.dispose()
 
 
+def test_0018_downgrade_refuses_an_unprocessable_message() -> None:
+    section("0018 down: refused while a message is recorded as unprocessable")
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import text
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "unprocessable-test.db"
+        config = Config(str(HERE / "alembic.ini"))
+        config.set_main_option("script_location", str(HERE / "migrations"))
+        url = dt_target.migration_url(db)
+        config.set_main_option("sqlalchemy.url", url)
+        if not dt_target.is_sqlite():
+            dt_target._drop_everything(sc.connect(url))
+        command.upgrade(config, "head")
+
+        engine = sc.connect(url)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO messages (id, graph_message_id, mailbox, received_at, "
+                "ingested_at, attachment_count, unprocessable_reason) VALUES "
+                "('m-1', 'g-1', 'shipments@example.test', :t, :t, 1, 'an item attachment')"
+            ), {"t": dt.datetime(2026, 11, 18, 12, 0, 0)})  # noqa: DTZ001
+        engine.dispose()
+        try:
+            command.downgrade(config, "0017")
+            refused = ""
+        except Exception as exc:  # noqa: BLE001 -- alembic wraps the migration's own error
+            refused = str(exc)
+        check("refusing to downgrade 0018" in refused,
+              "the downgrade refuses: dropping the columns would forget the message is "
+              "unprocessable, and the old schema would treat it as complete",
+              refused[:90] or "no refusal")
+        engine = sc.connect(url)
+        cols = {c["name"] for c in inspect(engine).get_columns("messages")}
+        check({"unprocessable_reason", "unprocessable_resolved_at"} <= cols,
+              "and the columns are still there", str(sorted(cols))[:90])
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM messages WHERE id = 'm-1'"))
+        engine.dispose()
+
+        command.downgrade(config, "0017")
+        engine = sc.connect(url)
+        cols = {c["name"] for c in inspect(engine).get_columns("messages")}
+        engine.dispose()
+        check("unprocessable_reason" not in cols and "unprocessable_resolved_at" not in cols,
+              "with no such row, it downgrades and removes both columns")
+        command.upgrade(config, "head")
+
+
 def test_message_id_dedup() -> None:
     section("dedup axis 1: the Graph message id")
     engine = fresh_db()
@@ -1402,6 +1452,7 @@ def main() -> int:
     REGISTERED = (
         test_a_hand_run_alembic_refuses_a_non_test_database,
         test_migration_round_trip,
+        test_0018_downgrade_refuses_an_unprocessable_message,
         test_message_id_dedup,
         test_content_hash_dedup,
         test_subset_reforward,

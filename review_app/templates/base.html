@@ -181,6 +181,21 @@
   </details>
 </div>
 {% endif %}
+{% if unreadable %}{% set n = unreadable|length %}
+<div class="card warn" role="alert">
+  <p class="plain"><strong>{{ n }} email{{ "s" if n != 1 }} couldn't be read, so {{ "their shipments aren't" if n != 1 else "its shipment isn't" }} in this list:</strong>
+  {% for m in unreadable %}“{{ m.subject or "no subject" }}”{% if m.from_address %} from {{ m.from_address }}{% endif %}, received {{ m.received_at }}{{ "; " if not loop.last else "." }}{% endfor %}</p>
+  <p class="plain">An attachment couldn't be opened as a file, so nothing from {{ "those emails" if n != 1 else "that email" }} was taken in. Usually the documents were sent as a forwarded email attached inside the email. Ask for them to be sent again as ordinary attachments. Kiko clears this message once that's done.</p>
+  <details class="more"><summary>Details</summary>
+    <ul class="muted">{% for m in unreadable %}<li>{{ m.id }} · Graph {{ m.graph_message_id }} · {{ m.attachment_count }} attachment(s) · {{ m.unprocessable_reason }}</li>{% endfor %}</ul>
+    <p class="muted">Clear one with: python poller.py --db &lt;url&gt; --resolve-unprocessable &lt;id&gt; --by &lt;name&gt; --note &lt;what was done&gt;. The record stays.</p>
+  </details>
+</div>
+{% elif unreadable_unknown %}
+<div class="card warn" role="alert">
+  <p class="plain"><strong>The tool couldn't check for emails it was unable to read.</strong> Some shipments may be missing from this list. Let Kiko know.</p>
+</div>
+{% endif %}
 {% block content %}{% endblock %}
 </main>
 </div>

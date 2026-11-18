@@ -321,6 +321,237 @@ def test_mid_batch_failure_holds_the_watermark(tmp: Path) -> None:
     check(retry.watermark_advanced, "only then does the watermark move past it")
 
 
+class _ItemAttachmentClient(gc.MockGraphClient):
+    """One message's Nth attachment is an item attachment (a forwarded .eml/.msg):
+    Graph has no file bytes for it, on this poll or any other. Counts fetches."""
+
+    def __init__(self, bad_message_id: str, bad_index: int = 0) -> None:
+        super().__init__()
+        self.bad, self.bad_index = bad_message_id, bad_index
+        self.calls: dict = {}
+
+    def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        self.calls[message_id] = self.calls.get(message_id, 0) + 1
+        if message_id == self.bad and attachment_id.endswith(f"-att-{self.bad_index}"):
+            raise gc.AttachmentNotFetchable(
+                f"attachment {attachment_id!r} carries no contentBytes",
+                odata_type="#microsoft.graph.itemAttachment")
+        return super().get_attachment(message_id, attachment_id)
+
+
+def test_an_unfetchable_attachment_is_recorded_not_retried(tmp: Path) -> None:
+    section("an item attachment: unprocessable, recorded, never retried, never skipped")
+    from schema import audit_log
+
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    # Inprotex carries TWO attachments; the SECOND is the item attachment, so the
+    # first was fetched before the failure. Nothing of the message may survive.
+    client = _ItemAttachmentClient("msg-inprotex-001", bad_index=1)
+    report = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+
+    check(not report.failed and len(report.unprocessable) == 1,
+          "it is unprocessable, not an ordinary failure",
+          f"failed={len(report.failed)} unprocessable={len(report.unprocessable)}")
+    check("1 unprocessable" in report.summary(), "and the poll's summary says so",
+          report.summary())
+    with engine.connect() as conn:
+        row = conn.execute(select(messages).where(
+            messages.c.graph_message_id == "msg-inprotex-001")).one()
+        links = conn.execute(select(func.count()).select_from(message_attachments).where(
+            message_attachments.c.message_id == row.id)).scalar()
+        events = conn.execute(select(audit_log).where(
+            audit_log.c.message_id == row.id)).all()
+    check(row.unprocessable_reason and "forwarded email" in row.unprocessable_reason
+          and "None of this message's 2 attachment(s)" in row.unprocessable_reason,
+          "the reason is recorded: what the attachment is, and that nothing was taken in",
+          (row.unprocessable_reason or "")[:90])
+    check(row.poll_error is None and row.attachment_count == 2 and links == 0,
+          "no poll_error, both attachments declared, and NEITHER stored -- not even the "
+          "first, fetched before the failure", f"poll_error={row.poll_error} links={links}")
+    check([(e.event, e.actor, e.actor_kind) for e in events]
+          == [(poller.MESSAGE_UNPROCESSABLE, poller.ACTOR, "SYSTEM")],
+          "an audit event records it", str([(e.event, e.actor) for e in events]))
+    newest = max(o.received_at for o in report.outcomes)
+    check(report.watermark_after == newest,
+          "the watermark moves PAST it, to the newest message",
+          f"watermark={report.watermark_after} newest={newest}")
+
+    # Extraction never sees it. Without the filter it would have no paths and be
+    # retired as "a message with no attachments": a silent skip of a shipment.
+    pending = ep.pending_messages(engine)
+    check("msg-inprotex-001" not in {p["graph_message_id"] for p in pending},
+          "it is not pending extraction")
+    calls: list = []
+    original = ep.ingest_module.ingest_shipment
+    try:
+        ep.ingest_module.ingest_shipment = lambda engine_, paths, **kw: (
+            calls.append(kw["message"].graph_message_id) or ingest_result())
+        extracted = ep.extract_pending(engine)
+    finally:
+        ep.ingest_module.ingest_shipment = original
+    check("msg-inprotex-001" not in calls and extracted.skipped_no_attachments == 1,
+          "and is not retired as an empty message either: only symmetry-004 is",
+          extracted.summary())
+
+    # NOT RETRIED: the next poll -- the same client, then a healthy one -- skips it.
+    before = client.calls.get("msg-inprotex-001", 0)
+    again = poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+    check(client.calls.get("msg-inprotex-001", 0) == before and not again.unprocessable
+          and not again.failed, "the next poll does not fetch it again",
+          f"fetches {before} -> {client.calls.get('msg-inprotex-001', 0)}")
+    check(again.watermark_after is not None and again.watermark_after >= newest,
+          "and the watermark is not held behind it", str(again.watermark_after))
+    poller.poll_once(engine, gc.MockGraphClient(), MAILBOX, store, now=NOW)
+    with engine.connect() as conn:
+        still = conn.execute(select(messages).where(messages.c.id == row.id)).one()
+    check(still.unprocessable_reason == row.unprocessable_reason
+          and still.unprocessable_resolved_at is None,
+          "even a healthy client leaves it recorded: permanent means permanent")
+
+    # SURFACED until a person clears it, deliberately; the record stays.
+    check([m["id"] for m in poller.unprocessable_messages(engine)] == [row.id],
+          "it is listed as unprocessable and not cleared")
+    for by, note in (("", "re-sent"), ("Kiko Test", "  ")):
+        try:
+            poller.resolve_unprocessable(engine, row.id, by=by, note=note, now=NOW)
+            refused = False
+        except poller.ResolveRefused:
+            refused = True
+        check(refused, "clearing needs a name AND a note", f"by={by!r} note={note!r}")
+    done = poller.resolve_unprocessable(engine, "msg-inprotex-001", by="Kiko Test",
+                                        note="asked Inprotex to re-send as files", now=NOW)
+    check(done["id"] == row.id, "it can be cleared by its Graph message id")
+    try:
+        poller.resolve_unprocessable(engine, row.id, by="Kiko Test", note="again", now=NOW)
+        twice = False
+    except poller.ResolveRefused:
+        twice = True
+    check(twice, "and cannot be cleared twice")
+    with engine.connect() as conn:
+        cleared = conn.execute(select(messages).where(messages.c.id == row.id)).one()
+        resolved = conn.execute(select(audit_log).where(
+            audit_log.c.event == poller.MESSAGE_UNPROCESSABLE_RESOLVED)).one()
+    check(cleared.unprocessable_reason == row.unprocessable_reason
+          and cleared.unprocessable_resolved_at is not None,
+          "clearing keeps the reason and records when")
+    check((resolved.actor, resolved.actor_kind) == ("Kiko Test", "HUMAN")
+          and "re-send" in (resolved.detail_json or ""),
+          "and an audit event names who cleared it, and why")
+    check(not poller.unprocessable_messages(engine)
+          and len(poller.unprocessable_messages(engine, include_resolved=True)) == 1,
+          "it leaves the unresolved list, and stays on the full one")
+    check("msg-inprotex-001" not in {p["graph_message_id"] for p in ep.pending_messages(engine)},
+          "clearing does not make it extractable: there is nothing of it to extract")
+
+
+def test_an_unprocessable_message_nothing_records_holds_the_watermark(tmp: Path) -> None:
+    section("if recording it fails, it is an ordinary failure: retried, watermark held")
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    original = poller._record_unprocessable
+    poller._record_unprocessable = lambda *a, **k: False
+    try:
+        report = poller.poll_once(engine, _ItemAttachmentClient("msg-tainan-005"),
+                                  MAILBOX, store, now=NOW)
+    finally:
+        poller._record_unprocessable = original
+    check(not report.unprocessable and [o.graph_message_id for o in report.failed]
+          == ["msg-tainan-005"], "it is reported as FAILED, not unprocessable",
+          str([(o.graph_message_id, o.error[:80]) for o in report.failed]))
+    failed_at = report.failed[0].received_at
+    check(report.watermark_after is None or report.watermark_after < failed_at,
+          "and the watermark does NOT move past a message nothing records",
+          f"watermark={report.watermark_after} failure={failed_at}")
+    with engine.connect() as conn:
+        row = conn.execute(select(messages).where(
+            messages.c.graph_message_id == "msg-tainan-005")).one()
+    check(row.poll_error and "recording that failed" in row.poll_error
+          and row.unprocessable_reason is None,
+          "its row carries a poll_error, so the next poll retries it",
+          (row.poll_error or "")[:60])
+
+
+def test_real_client_names_an_unfetchable_attachment(tmp: Path) -> None:
+    section("RealGraphClient: no contentBytes raises AttachmentNotFetchable")
+    cfg = SimpleNamespace(mailbox="m@x", tenant_id="t", client_id="c",
+                          cert_path=Path("k"), cert_public_path=Path("c"),
+                          cert_thumbprint="T")
+    client = gc.RealGraphClient(cfg)
+    client._get_json = lambda url, params=None: {
+        "@odata.type": "#microsoft.graph.itemAttachment", "name": "Fw: shipment.msg"}
+    try:
+        client.get_attachment("msg", "att")
+        raised = None
+    except gc.AttachmentNotFetchable as exc:
+        raised = exc
+    check(raised is not None and isinstance(raised, gc.GraphError)
+          and raised.odata_type == "#microsoft.graph.itemAttachment",
+          "an item attachment raises the PERMANENT error, carrying its type",
+          repr(raised))
+    client._get_json = lambda url, params=None: {"contentBytes": "aGk="}
+    check(client.get_attachment("msg", "att") == b"hi", "a file attachment still returns bytes")
+    client._get_json = lambda url, params=None: {"@odata.type": "#microsoft.graph.fileAttachment"}
+    try:
+        client.get_attachment("msg", "att")
+        odd = None
+    except gc.GraphError as exc:
+        odd = exc
+    check(odd is not None and not isinstance(odd, gc.AttachmentNotFetchable),
+          "a FILE attachment with no bytes is an ordinary failure: retried, never "
+          "made permanent on a missing field", repr(odd))
+
+
+def test_unprocessable_transitions(tmp: Path) -> None:
+    section("transient then permanent; recorded once; a cleared message stays cleared")
+    from schema import audit_log
+
+    engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")
+    poller.poll_once(engine, _ExplodingClient("msg-tainan-005"), MAILBOX, store, now=NOW)
+    with engine.connect() as conn:
+        first = conn.execute(select(messages).where(
+            messages.c.graph_message_id == "msg-tainan-005")).one()
+    check(first.poll_error and first.unprocessable_reason is None,
+          "a transient failure first: an ordinary poll_error")
+
+    poller.poll_once(engine, _ItemAttachmentClient("msg-tainan-005"), MAILBOX, store, now=NOW)
+
+    def state():
+        with engine.connect() as conn:
+            row = conn.execute(select(messages).where(
+                messages.c.graph_message_id == "msg-tainan-005")).one()
+            events = conn.execute(select(func.count()).select_from(audit_log).where(
+                audit_log.c.event == poller.MESSAGE_UNPROCESSABLE)).scalar()
+        return row, events
+
+    row, events = state()
+    check(row.id == first.id and row.poll_error is None and row.unprocessable_reason
+          and events == 1, "retried, it becomes unprocessable on the SAME row, poll_error "
+          "cleared, one audit event", f"poll_error={row.poll_error} events={events}")
+
+    poller.resolve_unprocessable(engine, row.id, by="Kiko Test", note="re-sent as files", now=NOW)
+    envelope = {"id": "msg-tainan-005", "subject": "x", "receivedDateTime": "2026-08-10T04:30:00Z"}
+    again = poller._record_unprocessable(engine, MAILBOX, "msg-tainan-005", envelope,
+                                         row.received_at, NOW, "a second recording", [{}])
+    row2, events2 = state()
+    check(again and row2.unprocessable_resolved_at is not None
+          and row2.unprocessable_reason == row.unprocessable_reason and events2 == 1,
+          "recording it again (a concurrent poll) writes nothing: still cleared, same reason, "
+          "no second audit event", f"resolved={row2.unprocessable_resolved_at} events={events2}")
+
+    poller._record_failure(engine, MAILBOX, "msg-tainan-005", envelope, row.received_at,
+                           NOW, "a concurrent ordinary failure")
+    row3, _ = state()
+    check(row3.poll_error is None,
+          "an ordinary failure never writes a poll_error onto an unprocessable row, which "
+          "would make the next poll retry it", str(row3.poll_error))
+
+    client = _ItemAttachmentClient("msg-tainan-005")
+    poller.poll_once(engine, client, MAILBOX, store, now=NOW)
+    row4, events4 = state()
+    check(client.calls.get("msg-tainan-005", 0) == 0 and row4.unprocessable_resolved_at
+          is not None and events4 == 1,
+          "and a later poll does not fetch it, un-clear it, or record it again")
+
+
 def test_extraction_seam(tmp: Path) -> None:
     section("the seam: extraction runs over STORED rows, never over Graph")
     engine, store = fresh_db(), poller.BlobStore(tmp / "blobs")

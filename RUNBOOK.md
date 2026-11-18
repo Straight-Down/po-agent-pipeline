@@ -4,7 +4,7 @@
 
 **Audience:** assumes general technical competence, no prior context on this specific project. Where more depth exists elsewhere, this doc points to it rather than repeating it — `PO-Update-Automation-Architecture.md` is the full design rationale; this doc is the "how do I actually run/fix/hand this off" companion.
 
-**Last updated:** 2026-11-18: §2, §3 item 1, §5 and §11 brought up to date. Other sections carry their own dates. Migrations run 0001-0017, and 0017 is head.
+**Last updated:** 2026-11-18: §2, §3 item 1, §5 and §11 brought up to date. Other sections carry their own dates. Migrations run 0001-0018, and 0018 is head.
 
 ---
 
@@ -24,7 +24,7 @@ Paula (Supply Chain Manager) gets emails from vendors when a shipment goes out, 
 | **Extraction** (`claude_extractor.py`, `document_parsers.py`, `parse_packing_slip.py`) | **Built.** The Anthropic API is the primary path, because every vendor's layout differs. A free deterministic parser handles Inprotex. Validated against five real vendors (§11). |
 | **Carton verification** (`carton_backing.py`) | **Built.** A quantity row counts as shipped only if cartons in the selected documents add up to it. Unbacked rows are removed and named, and losing more than a third of a shipment's lines is escalated. A medium-confidence flag is cleared only when every field is proven from the grid (CLAUDE.md gotchas). |
 | **Matching and proposal rules** (`matcher.py`) | **Built.** Matches exactly on NetSuite's custom fields, resolving sizes and colours. When several open lines match, a human chooses. Quantities accumulate onto this tool's own write record, and lines with earlier receipts are compared, never added to. Nothing is proposed below ordered except the factory's final count (§4). |
-| **Persistence** (`ingest.py`, `schema.py`, migrations 0001-0017) | **Built.** Runs on SQLite and on Azure SQL (§5; testing policy in §7). |
+| **Persistence** (`ingest.py`, `schema.py`, migrations 0001-0018) | **Built.** Runs on SQLite and on Azure SQL (§5; testing policy in §7). |
 | **Review screen** (`review_app/`) | **Built, and runs locally only:** FastAPI on 127.0.0.1, no login, with the reviewer named by `PO_AGENT_REVIEWER`. That name is an unauthenticated label, so **the approval record is not yet trustworthy**. A sign-in that establishes the reviewer is a cutover prerequisite (§12 item 8). Approve and Reject are per PO. Lines that can't be changed are left out of Approve, and Reject confirms what it covers first (§11). **There is no picker** for a line that matches several NetSuite lines (`NEEDS_RESOLUTION` / `NEEDS_ASSIGNMENT`); such lines are left out, to be fixed in NetSuite. |
 | **Write path** (`write_path.py`) | **Built.** Approve writes `quantity` and nothing else, in one batch PATCH per PO, re-reading the PO before and after, while the reviewer waits (§11 decision 2). It refuses a production account unless `PO_AGENT_ALLOW_PRODUCTION_WRITES` names it. Rehearsed end to end on Sandbox 2 on 2026-11-09: 17 lines written (§11). |
 | **Hosting** (Azure Functions, Key Vault, monitoring) | **Not built.** Azure SQL exists (§5); nothing else is provisioned. Every run is started by hand on Kiko's laptop, and nothing monitors it. |
@@ -692,6 +692,27 @@ Ranked by how much they matter. Items struck through are resolved, with the reso
       3. Name a second person who can make the call when she is away.
 
     None of these is built or arranged. **Until one is, treat the thresholds as provisional.** That matters most at production cutover (§12), the first time a proposed reduction would be written to a real PO.
+
+33. **NEW 2026-11-18 -- what a forwarded email changes, and what it does not.** Checked against the code on 2026-11-18.
+    - **The envelope decides nothing.**
+      - The sender (`from_address`) and the subject are stored on the `messages` row, and only the subject is shown, on the PO page.
+      - Neither identifies the vendor, routes a document or picks a parser. The vendor name comes from the document, and the parser is chosen by the workbook's content (`document_parsers.looks_like_inprotex`).
+      - The email body is never fetched (`graph_client.MESSAGE_FIELDS`), so anything a vendor writes only in the email text is invisible to the tool.
+    - **`messages.forwarded_by` is a column nothing ever fills.** Its schema comment says it is "set when Paula forwards", but the poller never writes it and `extract_pending` never passes it, so it is NULL on every row. Do not read it as "this message was not forwarded". If the forwarder is ever needed, it has to be built.
+    - **Processing order follows the FORWARD's received time, not the vendor's send time.**
+      - The watermark runs on `receivedDateTime`, and `extract_pending` works the queue oldest-received first. `received_at` and `sent_at` are the forward's.
+      - Nothing reads the vendor's original date, which sits in the body or the forwarded headers, and neither is fetched.
+      - **So a batch forwarded out of order is processed out of order.** That can make the wrong slip count as a line's FIRST shipment.
+      - **It decides whether the final-count exception applies (§4).** The exception is for a first shipment on a line the tool has never seen. The slip processed first gets it; a slip seen later is "seen before" and never does. It also decides which slip's figure is proposed first.
+      - Forward a split shipment's slips in the order the vendor sent them. A batch already forwarded out of order needs a person to check which slip came first before approving.
+    - **A forwarded email attached AS AN ATTACHMENT (.eml/.msg) is now an unprocessable message, recorded and shown** (2026-11-18, migration 0018).
+      - Graph has no file bytes for an item attachment (or a cloud link), so the message's intake failed on every poll and held the watermark behind it forever.
+      - Permanence is decided by the attachment's TYPE (`graph_client.NON_FILE_ATTACHMENT_TYPES`). A file attachment that arrives without bytes stays an ordinary, retried failure.
+      - It is now recorded with its reason (`messages.unprocessable_reason`, `MESSAGE_UNPROCESSABLE` audit event). None of its attachments is stored.
+      - It is never retried and never extracted, and it does not hold the watermark.
+      - **It is shown on every review-app page until a person clears it** (§9).
+      - If recording it fails, it falls back to an ordinary, retried `poll_error` that holds the watermark. It is never silently skipped.
+    - **A normal forward is fine.** It re-attaches the files, so their bytes are unchanged and re-forwarding the same slip is still caught as a duplicate. Signature images the forwarder's mail adds arrive as extra attachments, and are excluded as unreadable.
 
 
 ## 7. Design constraints discovered by testing
@@ -1721,6 +1742,7 @@ The SD-219 email was the first input to meet all three conditions, and it is als
 | Anthropic API calls fail or stop working | Key revoked/expired, or spend limit hit | Check console.anthropic.com under the Straight Down org, Settings -> API Keys and -> Billing |
 | A vendor's file produces low-confidence or no extraction | New/unfamiliar layout, or a corrupted/encrypted file | Check the flagged reason in the output — the system is designed to flag rather than guess, so a flag here is expected behavior, not necessarily a bug |
 | Every review page says "N changes reached (or may have reached) NetSuite, but the tool couldn't record them" | A write landed, or timed out after sending, and its `write_attempts` row could not be written, usually the database link dropping mid-record. The entries are in the unrecorded-writes file (`PO_AGENT_UNRECORDED_WRITES`, default `~/.po-agent/unrecorded-writes.jsonl`), with a CRITICAL log line for each | Check each listed line in NetSuite against the entry's `new_quantity`. **Do not re-approve or retry it**: the retry is refused as "already shows". ALREADY_PRESENT (§11 decision 2) settles a line only when an EARLIER attempt of the same proposal, for exactly that value, is on record in `write_attempts`, and the attempt in the file is the one whose row is missing. If such an earlier attempt exists, retrying settles the line as ALREADY_PRESENT and is safe; if not, the retry is refused as "already shows". The file entry is not a substitute for a row, and a row must never be hand-inserted to make one qualify. A line no retry can settle has its next slip flagged DISPUTED, which is safe, and is resolved there, by a person, against NetSuite. Archive the file once every entry is dealt with; the banner goes with it |
+| Every review page says "N emails couldn't be read, so their shipments aren't in this list" | The poller found an attachment it cannot read as a file, usually a forwarded email attached inside the email (an item attachment, .eml/.msg), sometimes a cloud link. The message is recorded as unprocessable (`messages.unprocessable_reason`, migration 0018; §6 item 33). None of it was taken in, and it is never retried | Ask the sender for the documents as ordinary attachments. When they arrive they are a new message and are processed normally. Then clear the old one: `python poller.py --db <url> --resolve-unprocessable <id> --by <name> --note <what was done>`. The id is in the banner's Details, or run `--list-unprocessable`. Clearing records who and why in `audit_log` and keeps the reason; only the banner goes. **Do not clear one whose documents have not arrived some other way:** that shipment is in no queue |
 | Nothing has run in a while and you're not sure if it's broken or just quiet | No monitoring exists yet (this is flagged in the build plan as a hard requirement before production) | Currently must be checked manually — this is exactly the gap Phase 4's monitoring work is meant to close |
 
 ## 10. Access and ownership inventory

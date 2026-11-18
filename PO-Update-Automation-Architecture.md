@@ -173,7 +173,7 @@ The reasoning for a managed database still holds. Azure Functions' compute is st
 
 ## 5. Data model (draft)
 
-*Corrected 2026-11-18: this is the scoping-era draft, kept for the record.* The built schema is `schema.py`, at migration 0017, with its reasoning in `PO-Update-Automation-Schema-Rationale.md`. In particular, the `proposed_*_date` and `proposed_override_flag` fields below were never built: no date is proposed or written (§6.3).
+*Corrected 2026-11-18: this is the scoping-era draft, kept for the record.* The built schema is `schema.py`, at migration 0018, with its reasoning in `PO-Update-Automation-Schema-Rationale.md`. In particular, the `proposed_*_date` and `proposed_override_flag` fields below were never built: no date is proposed or written (§6.3).
 
 ```
 shipments

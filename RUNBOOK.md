@@ -1765,6 +1765,7 @@ See `PO-Update-Automation-Build-Plan.md` for full phase detail. **Restructured 2
   - the production role's Purchase Order permission is View, as reported on 2026-10-21 and not re-read since (§12 items 5 and 6);
   - `write_path` refuses a production account unless `PO_AGENT_ALLOW_PRODUCTION_WRITES` names it, and that variable is not set in `.env`.
 - **No sign-in on the review app.** The reviewer recorded on an approval is an unauthenticated label from `PO_AGENT_REVIEWER`. A sign-in that establishes who approved is a cutover prerequisite (§12 item 8; decision 2).
+- **The hosting plan is drafted, not built:** `PO-Update-Automation-Deployment-Plan.md` (2026-11-18). It covers a Function App on Flex Consumption, the poller on a timer, and the review app behind Entra sign-in. It carries the code changes, the configuration map, the item 8 identity design, and what still needs checking in the portal.
 - **The §12 checklist has one of its eight items ticked.** Item 4, re-reading every affected PO from production before anything is approved for real, is the gate. Sandbox 2's figures are known to disagree with production's (§8 lesson 31).
 - **Three production re-verification items** (tranId, colour resolution and the size vocabulary; build plan Phase 4 items 3-5) share one shape: §8 lesson 16.
 
@@ -2094,6 +2095,7 @@ Added 2026-10-21. Do these in order and tick each one only once it is verified. 
     - a test fails if a verdict can be recorded without an authenticated reviewer.
 
     Today's rule that `review_app` refuses to start without `PO_AGENT_REVIEWER` stays until then: no default name, ever.
+  - **The design for it** is in `PO-Update-Automation-Deployment-Plan.md` §4: Easy Auth with Microsoft Entra, an in-app approver list, and the reviewer taken from the request.
   - **Who may sign in is part of the item.** Paula is the sole approver, with no delegation (her ruling of 2026-09-16; §6 item 30). A sign-in that admits anyone in the tenant would authenticate the name but not enforce the ruling.
   - **Item 7's recommendation rests on this item.** Option (a) keeps NetSuite showing the integration's employee and leaves who approved to this tool's records. Without this item, nothing anywhere shows who approved a change.
   - **Recorded in §11, Phase 4 decision 2,** because that decision is what makes Approve write to NetSuite.

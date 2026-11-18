@@ -159,7 +159,7 @@ Straight Down is already an M365/Entra ID shop — that's a hard requirement any
 - `sqldb-po-agent`, production, ring-fenced until cutover;
 - `sqldb-po-agent-test`, the `--mssql` test target, measured at Basic, 5 DTU (`RUNBOOK.md` §5 and §8 lesson 33).
 
-Basic does not auto-pause. The production database's tier is as stated by Kiko on 2026-11-18, not measured in the repo. The serverless compute tier planned here (auto-pause when idle, auto-resume on the next query) is not what was provisioned.
+Basic does not auto-pause. The production database's tier was confirmed in the portal on 2026-11-18: Basic, 2 GB maximum, West US 2 (`RUNBOOK.md` §5). The serverless compute tier planned here (auto-pause when idle, auto-resume on the next query) is not what was provisioned.
 
 The reasoning for a managed database still holds. Azure Functions' compute is stateless and ephemeral between invocations, so a locally stored SQLite file isn't a good fit: there's no durable disk to keep it on between runs. A small managed relational database fits the data model (§5) without redesign. Locally, SQLite remains the fast test loop and the format of the run databases.
 

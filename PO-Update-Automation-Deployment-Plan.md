@@ -8,6 +8,18 @@
 
 **Why do this at all.** RUNBOOK §12 item 8: today `verdict_by` is whatever `PO_AGENT_REVIEWER` was set to when the app started. So nothing anywhere shows who approved a change, and item 7's recommendation rests entirely on fixing that. **A sign-in that puts the reviewer's own identity into `verdict_by` is the main point of hosting** (§4 below). Running unattended is the second.
 
+**Where it goes, and with what rights (confirmed 2026-11-18, Kiko):**
+- **Location:** resource group **`PO-Agent-Prod`**, subscription **`SLR-Pipeline-Production`**, region **West US 2**. The production database `sqldb-po-agent` and its server `sql-po-agent-prod` are already there (RUNBOOK §5).
+- **Kiko holds Contributor on the resource group.** That covers creating and configuring every resource this plan needs inside `PO-Agent-Prod`. It does **not** cover:
+  - assigning RBAC roles (no `Microsoft.Authorization/roleAssignments/write`);
+  - anything in Entra ID;
+  - anything at subscription scope.
+- **So the plan avoids role assignments.** Revised 2026-11-18. It previously assumed the Function App's managed identity reached SQL, storage and Key Vault through role assignments, in §1, §2.5, §3, §3.4, §5 and §9. Now:
+  - **Azure SQL:** a contained database user, with its connection string in Function App configuration;
+  - **Storage:** connection strings and container-scoped SAS;
+  - **Key Vault:** the vault-access-policy model, which Contributor can configure.
+- **Everything that still needs more than Contributor** is gathered in §10 as **one request to IT**.
+
 **How to read the flags.** Every point that cannot be settled from the repo is marked **CHECK IN PORTAL**, or **DECISION (Kiko)** where it is a choice rather than a fact. Section 10 gathers them all. Platform facts were checked against Microsoft Learn on 2026-11-18 (sources at the end). Platform behaviour changes, so re-check anything marked from the docs before relying on it.
 
 ---
@@ -23,7 +35,7 @@
  │  http:  review app (FastAPI via AsgiFunctionApp) ── Approve ─► write_path.write_po_batch ──┘
  │         ▲ Easy Auth (Microsoft Entra), only assigned users reach it                          │
  └─────────┼──────────────────────────────┬─────────────────────────┬─────────────────────────┘
-           │ browser (Paula)             │ managed identity        │ managed identity
+           │ browser (Paula)             │ SQL login (KV)          │ key / SAS (KV)  
            │                             ▼                         ▼
            │                  Azure SQL sqldb-po-agent     Storage account: attachments container,
            │                  (system of record)           unrecorded-writes append blob, host storage
@@ -128,16 +140,23 @@ The library code (`poller.poll_once`, `extract_pending.extract_pending`, `ingest
   - leave the harness's engines untouched.
 - **DECISION (Kiko):** confirm that this reading of the rule is acceptable before it is built.
 - **Authentication:**
-  - The test database is reached as a contained SQL user with a password in the URL.
-  - For production, use the Function App's **managed identity**: a contained user created from the external provider, with ODBC Driver 18's `Authentication=ActiveDirectoryMsi`. `PO_AGENT_DB_URL` then carries no secret.
-  - Give the runtime identity data rights only (read and write), not DDL. Migrations are run by hand with a separate identity (§8).
+  - **Production uses a contained database user with a password,** the same pattern as the test database's `po_agent_test_runner`. Its connection string goes in Function App configuration as `PO_AGENT_DB_URL`, through a Key Vault reference (§3).
+    - *Changed 2026-11-18:* this said to use the Function App's managed identity (an Entra user created from the external provider, with `Authentication=ActiveDirectoryMsi`). That needs the SQL server to have an Entra admin set, which is an Entra and RBAC-adjacent step beyond Contributor. A contained SQL user needs neither.
+  - **The production database needs its own contained user.** Contained users belong to one database, and the repo records one only in the test database (RUNBOOK §8 lesson 25). **Never point production at the test user.**
+    - It is created by connecting as the server admin login (`poagentadmin`, RUNBOOK §8 lesson 25). That is a SQL-level action, not an Azure permission, so it needs nothing from IT.
+    - **CHECK:** that the admin credential is to hand. Lesson 25 records it was once in `.env`, which now holds only the test runner's. A Contributor can also reset the server admin password in the portal.
+    - **CHECK:** whether a contained user already exists in `sqldb-po-agent`.
+  - **Give it data rights only** (`db_datareader` and `db_datawriter`), not DDL.
+    - Migrations are run by hand as a separate login with DDL rights (§8). The server admin works for that, but a dedicated contained user with `db_ddladmin` is the tidier choice.
+    - The harness's "never as `dbo`" refusal stays the rule for tests (CLAUDE.md).
+  - **The password is a secret to rotate.** It lives only in Key Vault, and changing it means updating the vault and nothing else.
 
 ### 2.6 Python version and the ODBC driver
 
 - **The local venv is Python 3.14.6.**
   - Microsoft Learn currently lists Python 3.10-3.14 as GA on Flex Consumption, with 3.15 in preview.
   - A mid-2026 Q&A thread reported remote builds failing for 3.14 on Flex.
-  - **CHECK IN PORTAL:** `az functionapp list-flexconsumption-runtimes --location <region> --runtime python`, for the region `sql-po-agent-prod` is in.
+  - **CHECK IN PORTAL:** `az functionapp list-flexconsumption-runtimes --location westus2 --runtime python`. West US 2 is where `sqldb-po-agent` is (RUNBOOK §5, confirmed 2026-11-18).
   - Pick the highest GA version that builds there. Run the **full suite on that exact version** before deploying, on SQLite and once on `--mssql` (RUNBOOK §7).
 - **The ODBC driver:**
   - Microsoft pairs Python 3.11+ with **ODBC Driver 18**.
@@ -151,7 +170,11 @@ The library code (`poller.poll_once`, `extract_pending.extract_pending`, `ingest
 
 **Rules:**
 - No values in this document, the repo or any log.
-- Secrets go in **Key Vault**, reached from app settings by Key Vault references through the Function App's managed identity.
+- Secrets go in **Key Vault**, reached from app settings by Key Vault references.
+  - The reference is resolved by the Function App's system-assigned identity. Enabling that identity is within Contributor.
+  - It is granted read access by a **vault access policy**, not an RBAC role: the access-policy model is configured on the vault itself, which Contributor can do. Choose **"Vault access policy"** as the permission model when creating the vault. Newer vaults default to Azure RBAC, which would need a role assignment.
+  - **CHECK:** that no Azure Policy in `SLR-Pipeline-Production` requires the RBAC model.
+  - **Fallback if it does:** keep secrets as plain app settings. They are encrypted at rest, but readable by anyone with Contributor on the resource group, and there is no audit of reads.
 - Non-secret identifiers are plain app settings.
 - **No `.env` file is deployed.** The code's `.env` loading is a harmless no-op only while the file is absent.
 - GUID-shaped values (tenant, client and object ids) go only in app settings, **never in tracked files**. `test_no_credentials_in_tracked_files` refuses them, rightly (CLAUDE.md gotchas).
@@ -177,9 +200,9 @@ The library code (`poller.poll_once`, `extract_pending.extract_pending`, `ingest
 | `NS_HTTP_TIMEOUT` | `NetSuiteConfig` | App setting `60`, or left unset | Defaults to 60 s. §6 is computed on 60. Do not lower it to fit the HTTP limit; that is what the write deadline is for. |
 | `ANTHROPIC_API_KEY` | `claude_extractor` (via `~/.po-agent/.env`) | Key Vault reference | |
 | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CONFIG_DIR` | `claude_extractor.credentials_available` | Not set | Alternatives to the API key. Unused here. |
-| `PO_AGENT_DB_URL` | `review_app/__main__`, `migrations/env.py` | App setting | `mssql+pyodbc://` to `sqldb-po-agent`, with managed-identity authentication (no password, §2.5). It is deliberately unset in `.env` today (RUNBOOK §12 item 3), and this is where §12 item 3 is discharged. |
+| `PO_AGENT_DB_URL` | `review_app/__main__`, `migrations/env.py` | **Key Vault reference** | `mssql+pyodbc://` to `sqldb-po-agent` as the production contained user, password included (§2.5). That is why it is a secret. It is deliberately unset in `.env` today (RUNBOOK §12 item 3), and this is where §12 item 3 is discharged. |
 | `PO_AGENT_ALLOW_PRODUCTION_WRITES` | `write_path` | **Unset until §12 item 5**, then the production account id | Leaving it unset keeps every production write refused in code. |
-| `PO_AGENT_UNRECORDED_WRITES` | `config`, used by `write_path` and the review app | App setting: the append blob's URL (§5) | One setting read by both, in one app. That is RUNBOOK §11's "the writer and the review app must see the same file", satisfied structurally. |
+| `PO_AGENT_UNRECORDED_WRITES` | `config`, used by `write_path` and the review app | **Key Vault reference:** a SAS URL for the unrecorded-writes container (§5) | One setting read by both, in one app. That is RUNBOOK §11's "the writer and the review app must see the same file", satisfied structurally. |
 | `PO_AGENT_REVIEWER` | `review_app.settings` | **Must NOT be set** | Replaced by §4. The hosted app refuses to start if it is set (§4.4), so a leftover cannot silently name the reviewer. |
 | `PO_AGENT_TEST_DB_URL` | `dialect_target` | **Never set in hosting** | The harness drops every table on whatever it names. |
 | `PO_AGENT_MIGRATE_CONFIRM` | `migrations/env.py` | **Never set in hosting** | Migrations are run by hand (§8). |
@@ -191,7 +214,7 @@ The library code (`poller.poll_once`, `extract_pending.extract_pending`, `ingest
 | `PO_AGENT_AUTH_MODE` | App setting `easyauth` | Selects identity from the sign-in (§4). Absent means local mode, which serves only on 127.0.0.1 with `PO_AGENT_REVIEWER`. |
 | `PO_AGENT_APPROVERS` | App setting | Entra **object ids** allowed to record a verdict (§4.3). Values never go in tracked files. |
 | `PO_AGENT_CSRF_KEY` | Key Vault reference | Key for the per-user CSRF token (§2.2). |
-| `PO_AGENT_ATTACHMENT_STORE` | App setting | The attachments container's URL. Access is through the managed identity. |
+| `PO_AGENT_ATTACHMENT_STORE` | **Key Vault reference** | The attachments container's URL with a **container-scoped SAS** (§3.4). |
 | `PO_AGENT_POLL_SINCE` | App setting, used for the first run only | The cold-start boundary (§2.4, §8).<br><br>**The timer wrapper must pass it as `since` ONLY when no watermark exists.** `poll_once(since=...)` overrides the watermark entirely, on every run (`poller.py`). Passed unconditionally, it re-reads from the cutover moment every hour, silently, because dedup makes the re-read look clean.<br><br>Test the effect, not the acceptance (CLAUDE.md, the `--from-beginning` gotcha): with a watermark present, the setting must not change the window. |
 | `PO_AGENT_EXTRACT_LIMIT` | App setting | Messages extracted per timer run (§6). |
 | `NS_PRIVATE_KEY_PEM`, `GRAPH_CERT_PEM`, `GRAPH_CERT_PUBLIC_PEM` | As in §3.1 | Replace the three path settings. |
@@ -199,19 +222,37 @@ The library code (`poller.poll_once`, `extract_pending.extract_pending`, `ingest
 ### 3.3 Platform settings (not read by this code)
 
 These are set by the platform or the deployment:
-- `AzureWebJobsStorage`, identity-based. The timer's single-instance lock lives here, and the app's identity needs **Storage Blob Data Owner** on it.
+- `AzureWebJobsStorage`: a **connection string** (account key) for host storage, not identity-based. The timer's single-instance lock lives here.
+  - *Changed 2026-11-18:* the identity-based form needs a **Storage Blob Data Owner** role assignment.
+  - Contributor can read the account key (`listKeys`).
+  - **CHECK IN PORTAL:**
+    - whether this setting can itself be a Key Vault reference on Flex;
+    - that the **deployment storage** is set to "connection string" authentication when the app is created, because the identity options there create role assignments.
 - the Application Insights connection string;
 - the Flex runtime and version, which are set on the plan, not as `FUNCTIONS_WORKER_RUNTIME`.
 
 **CHECK IN PORTAL:** which classic app settings Flex rejects, when the app is created.
 
-### 3.4 What the Function App's managed identity needs
+### 3.4 What the Function App needs, each granted without a role assignment
 
-- **Key Vault Secrets User** on the vault.
-- **Storage Blob Data Owner** on host storage.
-- **Storage Blob Data Contributor** on the attachments and unrecorded-writes containers.
-- **A contained database user in `sqldb-po-agent`** with data rights only.
-- **Nothing for NetSuite or Graph.** Both keep their certificate credentials, now loaded from Key Vault.
+*Revised 2026-11-18. This listed four RBAC role assignments to the app's managed identity, none of which Contributor can make.*
+
+| Access | How it is granted | Who can do it |
+|---|---|---|
+| Key Vault secrets | A vault **access policy** for the app's system-assigned identity (get secrets) | Kiko (Contributor) |
+| Host storage (`AzureWebJobsStorage`, timer lock) | The storage account's **connection string** | Kiko (Contributor can list keys) |
+| Attachments container | A **container-scoped SAS** issued under a stored access policy, so it can be revoked without rotating the account key. Read, write, create; no delete | Kiko |
+| Unrecorded-writes container | A **container-scoped SAS** under its own stored access policy. Add, create, write and read; no delete, so the app can append but not erase | Kiko |
+| Azure SQL | The production **contained database user** (§2.5), data rights only | Kiko, as server admin (SQL-level, not Azure) |
+| NetSuite, Graph | Their existing certificate credentials, loaded from Key Vault | No change |
+
+**The costs of this approach, accepted, and named so nobody "fixes" them by accident:**
+- **More secrets to rotate:** the SQL password, the storage account key, and the SAS expiries. A SAS expiry is a hard outage for intake or for the unrecorded-writes record.
+  - Set long expiries under the stored access policies.
+  - Record each expiry in the RUNBOOK.
+  - Alert ahead of each one (§9).
+- **Shared-key access must stay enabled on the storage account.** **CHECK:** that no Azure Policy denies it.
+- **A managed identity with RBAC would be cleaner,** with no keys and no expiries. If IT prefers to make those assignments, the alternative is listed in §10's request.
 
 ---
 
@@ -288,7 +329,7 @@ For the hosted rehearsal against Sandbox 2 (§9), the approver list is Kiko, set
 - **The existing last resort stays.** If the append also fails, `write_path` logs the entry in full at CRITICAL. In hosting that line lands in Application Insights, so **an alert on it is part of this plan** (§9). It is the only record in that case.
 - **Protect the blob:**
   - turn on soft delete and versioning on its container;
-  - grant the app's identity data rights on that container only;
+  - give the app a SAS scoped to that container only, with add, create, write and read, but no delete (§3.4);
   - "clear it by archiving" (RUNBOOK §9) becomes copy-then-reset, done by hand, unless decision 10 moves clearing into the review app (§2.4).
 
 **CHECK IN PORTAL:** whether the storage account should be separate from the Function App's host storage. Recommendation: one account is acceptable, with separate containers and separate permissions.
@@ -378,7 +419,7 @@ For the hosted rehearsal against Sandbox 2 (§9), the approver list is Kiko, set
 
 ### 8.2 Stays local
 
-- **Development and the tests.** SQLite for the fast loop; the full `--mssql` suite against `sqldb-po-agent-test` before a merge (RUNBOOK §7). The `-test` and not-`dbo` harness guards are unchanged.
+- **Development and the SQLite tests.** SQLite stays the fast local loop. **The SQL Server suite should move to Azure** (§8.5). Until it does, the full `--mssql` run is still made from a workstation before a merge (RUNBOOK §7). The `-test` and not-`dbo` harness guards are unchanged wherever it runs.
 - **Migrations, run by hand.** From a workstation, with `PO_AGENT_DB_URL` and `PO_AGENT_MIGRATE_CONFIRM=sqldb-po-agent` set for that one command, as a database user with DDL rights. That is a separate identity from the app's data-only user. **Never from the Function App:** an app that can change its own schema at start-up has no human check on it.
 - **The read-only scripts:** `scripts/probe_graph_auth.py`, `scripts/read_po_line_states.py` (the production re-read, §12 item 4) and `scripts/estimate_pre_existing_receipts.py`.
 - **Key generation** (`generate_m2m_keypair.py`). Its outputs are imported into Key Vault, and the local copies stay outside OneDrive as now.
@@ -400,13 +441,52 @@ For the hosted rehearsal against Sandbox 2 (§9), the approver list is Kiko, set
 - **DECISION (Kiko):** alternatively, empty the mailbox of test mail before cutover. Doing both is the safest.
 - How vendor mail reaches `shipments@` (vendors redirected, or Paula forwarding) is still open (RUNBOOK §6 item 11). It needs settling before cutover, or the hosted poller has nothing to read.
 
+### 8.5 The SQL Server test suite should run in Azure, not from a workstation
+
+**Recommendation (Kiko, 2026-11-18): run the `--mssql` suite from a machine in Azure, in West US 2, not over the workstation's internet path.**
+
+**The evidence** (RUNBOOK §8 lesson 33, full `--mssql` runs). The last two full runs were from Kiko's laptop on 2026-11-18, one on Basic and one with the test database scaled to S1. Neither was clean, and every failure and re-run in both was the database link, not the database.
+- **Basic (`39e4d48`):** 2 failed, 7 connection retries, 16 re-runs, 38 minutes. The errors were:
+  - `08S01`, an established connection dropping mid-statement (on `DROP VIEW` and `INSERT`);
+  - "This Connection is closed" while a connection was being set up.
+- **S1 (`a1693d2`):** 2 failed, 2 connection retries, 11 re-runs, 33 minutes. The errors were:
+  - `08001` login timeouts ("could not open a connection");
+  - "This Connection is closed" during set-up.
+- **Neither log contains a resource-limit error** (10928, 40501, 40613) or an assertion failure. Quadrupling the tier's capacity reduced the counts somewhat, but did not remove the failures.
+- **Where the logs don't reach:** they record the errors of the tests that FAILED. Tests that passed on a re-run left no traceback, so their errors are known only to be link-class (the harness re-runs nothing else).
+- **What it points at:** a link that cannot be opened, or drops once open, while the server is not short of capacity, points at the network path between the workstation and Azure. That is an inference from two runs, not a measurement. **Step 1 below is what turns it into one.**
+
+**Why it matters beyond the test suite:**
+- **A slow, noisy server run discourages running it.** The policy needs it before every merge (RUNBOOK §7).
+- **Re-runs hide things.** The harness re-runs link failures, and a run with many re-runs is one in which a real failure is easier to miss. The policy's rule ("a run with re-runs is not a clean run") then costs an isolated re-run of every listed test, which is more time over the same link.
+- **It doubles as a rehearsal of production's own path.** The hosted Function App will reach `sql-po-agent-prod` from inside Azure, in the same region. A suite run from there tests the network path production will use, which a laptop run cannot.
+
+**The steps:**
+1. **Measure first.** Run the full suite once from an Azure machine in West US 2 against `sqldb-po-agent-test`, at Basic, and compare it with the two laptop rows in lesson 33: retries, re-runs, failures, wall time.
+   - **If it is clean, or near it,** the inference holds: adopt the Azure runner and update RUNBOOK §7 and CLAUDE.md ("Dual-dialect runs") to say where the run is made.
+   - **If it fails the same way,** the cause is not the workstation's path. Look at the server side instead, starting with its connection logs, before spending more on tiers.
+   - Scale the test database back to Basic for that comparison, so it tests one change at a time. **CHECK:** whether it is still S1.
+2. **What to run it on, all within Contributor on `PO-Agent-Prod`** (no IT request needed):
+   - **(A) A small Linux VM** (burstable B-series), deallocated when not in use. The simplest option: clone the repo, install ODBC Driver 18 and the venv, and run the same commands as today. **Recommended for the measurement**, and possibly to keep.
+   - **(B) A container job** (Azure Container Instances, or a Container Apps job) built from an image with ODBC Driver 18. Cleaner to repeat, but more to build.
+     - Pulling from a registry needs either the registry's admin user, or an `AcrPull` role assignment. The role assignment is beyond Contributor, so use the admin user.
+   - **(C) A GitHub Actions self-hosted runner** on (A). This would run the suite automatically before a merge, but registering a runner is a GitHub repository-admin action, not an Azure one.
+   - **Azure Cloud Shell is not suitable.** Its sessions end when idle, well short of a 30-minute run, and they do not run in this resource group's network.
+3. **Rules that move with it:**
+   - **The connection string stays out of the repo.** `PO_AGENT_TEST_DB_URL` carries the test runner's password: on the machine, it is read from Key Vault or a protected environment file, never from a tracked file.
+   - **The harness guards are unchanged:** `*-test` names only, never as `dbo`.
+   - **The repo holds third-party vendor data** (RUNBOOK §5: it must stay private), so the machine's disk holds it too. Keep the machine in `PO-Agent-Prod`, with no public inbound access beyond what is needed to reach it. Prefer Bastion, or a just-in-time SSH rule.
+   - **Allow the machine through the SQL server's firewall** (within Contributor). With the VM in a VNet, a VNet rule or private endpoint is better than an IP rule, and it is the same choice production faces (§10, CHECK item 5).
+   - **Run it on the hosting Python version** (§2.6). The same machine then also answers "does the suite pass on the Python version Flex will run".
+4. **Keep logging every full run in lesson 33's table,** with where it was run from, so laptop rows and Azure rows can be told apart.
+
 ---
 
 ## 9. Order of work (when it is built)
 
 1. **Spike, in a throwaway Function App in the target region.** Confirm, before writing the real thing:
    - the Python version builds remotely;
-   - ODBC Driver 18 is present and connects to `sqldb-po-agent-test` with the app's managed identity;
+   - ODBC Driver 18 is present and connects to `sqldb-po-agent-test` as a contained database user (the test runner), with the connection string in app settings;
    - Easy Auth works on Flex in this tenant, and the principal header arrives;
    - `AsgiFunctionApp` takes a timer trigger beside the ASGI app;
    - temporary storage is writable, and how large it is.
@@ -428,14 +508,15 @@ For the hosted rehearsal against Sandbox 2 (§9), the approver list is Kiko, set
    - storage account (host storage, deployment container, attachments container, unrecorded-writes container);
    - Key Vault;
    - Application Insights;
-   - the Function App with its managed identity;
-   - the role assignments in §3.4;
-   - the contained database user;
-   - Easy Auth and the enterprise application's assignment.
+   - the Function App, with its system-assigned identity enabled for Key Vault references only;
+   - the Key Vault access policy, the storage connection string and the two container SAS (§3.4), with **no role assignments**;
+   - the production contained database user, created as server admin (§2.5);
+   - Easy Auth's configuration on the app (Contributor). The Entra side (app registration, assignment) is in the IT request (§10).
 4. **Alerts, which are part of the first deploy, not later** (build plan Phase 4 item 8):
    - the CRITICAL unrecorded-write log line;
    - a timer run that logs an ERROR, including the cold-start refusal;
-   - no successful timer run for, say, three hours.
+   - no successful timer run for, say, three hours;
+   - a SAS or the SQL password approaching its expiry or rotation date (§3.4). An expired SAS stops intake or the unrecorded-writes record outright.
 5. **Hosted rehearsal on Sandbox 2:**
    - NetSuite settings point at `1321665-sb2`;
    - **a separate rehearsal database**, never `sqldb-po-agent`, which stays ring-fenced (RUNBOOK §5). **DECISION (Kiko):** a third Basic database for staging, dropped after cutover (recommended), or rehearse in `sqldb-po-agent` and rebuild it empty before cutover;
@@ -456,18 +537,56 @@ For the hosted rehearsal against Sandbox 2 (§9), the approver list is Kiko, set
 ## 10. To check in the portal, and decisions for Kiko
 
 **CHECK IN PORTAL (facts the repo cannot give):**
-1. **The region** of `sql-po-agent-prod`, Flex availability there, and the Python versions with remote build (`az functionapp list-flexconsumption-runtimes`).
-2. **The production database's tier.** RUNBOOK §5 records Basic "as stated by Kiko", not measured. Confirm it, and its idle-connection behaviour, for `pool_recycle`.
+1. **Flex availability, and the Python versions with remote build,** in **West US 2**: `sqldb-po-agent`'s region, confirmed 2026-11-18 (RUNBOOK §5). Use `az functionapp list-flexconsumption-runtimes --location westus2 --runtime python`.
+2. **The production database's idle-connection behaviour,** for `pool_recycle`. Its tier is now confirmed: Basic, 2 GB maximum, in resource group `PO-Agent-Prod`, subscription `SLR-Pipeline-Production`, West US 2 (RUNBOOK §5, 2026-11-18).
 3. **ODBC Driver 18 on the Flex Python image.** Sources conflict. Settled by the spike.
 4. **Easy Auth on Flex in this tenant.** Sources conflict on Flex specifically. Also:
-   - who holds the Entra role needed to create the enterprise application and set assignment;
+   - the Entra side is in the IT request below;
    - **the user object ids** for `PO_AGENT_APPROVERS` (app settings only, never in the repo).
 5. **Azure SQL network access.** The current firewall rules; whether "allow Azure services" is on; and whether a private endpoint with VNet integration is wanted (Flex supports VNet integration). Flex outbound addresses are not fixed.
+   - The server is in `PO-Agent-Prod`, so its firewall rules are within Contributor.
+   - A VNet and private endpoint created inside `PO-Agent-Prod` are within Contributor too. Only a VNet or private DNS zone owned elsewhere is an IT item (below).
 6. **Whether a Key Vault and an Application Insights or Log Analytics workspace already exist,** and who receives alerts.
-7. **Conditional Access for workload identities** on the Graph app registration's service principal: would calls from Azure be blocked?
+7. **Conditional Access for workload identities** on the Graph app registration's service principal: would calls from Azure be blocked? This is an IT question (request item 5).
 8. **NetSuite:** any IP-address restriction on the integration record, the role or the account that would refuse calls from Azure's outbound addresses.
 9. **Which classic app settings Flex rejects,** and the instance memory size and temporary storage per size.
-10. **Whether Mail.Send has been granted** (Phase 4 decision 1). Not needed for this plan, but it decides when the digest can follow.
+10. **Whether Mail.Send has been granted** (Phase 4 decision 1). Not needed for this plan, but it decides when the digest can follow. Already with IT since 2026-10-21 (request item 6).
+
+**ONE REQUEST TO IT: everything this plan needs beyond Contributor on `PO-Agent-Prod`.**
+
+The plan is built to need as little as possible here (§3.4). Every Azure resource is created and configured with Contributor, and no RBAC role assignment is needed. What is left is mostly Entra and subscription scope. Send it as one request.
+
+1. **Entra app registration for the review app's sign-in (Easy Auth).** Easy Auth's "create new app registration" uses the creator's own Entra rights. Needed: either confirm Kiko may register applications in the tenant, or IT creates it.
+   - **Redirect URI:** the Function App's `/.auth/login/aad/callback`.
+   - **Delegated permission:** `User.Read`. Admin consent is needed if user consent is restricted.
+2. **The enterprise application behind it: "Assignment required = Yes",** and assignment of the named users. In production that is Paula alone. For the Sandbox 2 rehearsal it is Kiko (§4.2).
+   - If Kiko is made an owner of that enterprise application, he can manage the assignments afterwards without coming back to IT. **Ask for that.**
+3. **Subscription-scope checks on `SLR-Pipeline-Production`:**
+   - **Resource providers** `Microsoft.Web`, `Microsoft.Storage`, `Microsoft.KeyVault`, `Microsoft.Insights` and `Microsoft.OperationalInsights` are registered. Registering one is a subscription-level action.
+   - **Flex Consumption quota in West US 2** for this subscription. There are community reports of `ServerFarmCreationNotAllowed` on new subscriptions.
+4. **Azure Policy:** confirm nothing assigned to the subscription or resource group blocks this plan, or grant exemptions:
+   - **storage shared-key access**, needed for the connection string and SAS (§3.4);
+   - **the Key Vault access-policy model**, needed if a policy requires the RBAC model (§3);
+   - **public network access** on SQL, storage or Key Vault, if a policy denies it. That would force the private-endpoint route in CHECK item 5.
+5. **Conditional Access for workload identities:** does any policy restrict the Graph app registration's service principal by location or network? It will call Graph from Azure, not from Kiko's laptop (CHECK item 7).
+6. **Graph `Mail.Send`,** scoped to `shipments@`. Already requested on 2026-10-21 (Phase 4 decision 1). Not needed to host. It decides when the daily digest can follow.
+7. **Networking, only if the private-endpoint route is chosen and the VNet or private DNS zone lives outside `PO-Agent-Prod`:** Network Contributor on that VNet, or IT creates the endpoint.
+8. **Only if IT prefers managed identity to keys, SAS and a SQL password.** That is cleaner, with no secrets to rotate, but these are the role assignments Contributor cannot make, and the steps beyond Contributor that come with them:
+   - **Key Vault Secrets User** on the vault, if the vault uses the RBAC model;
+   - **Storage Blob Data Owner** on host storage;
+   - **Storage Blob Data Contributor** on the attachments and unrecorded-writes containers;
+   - **an Entra admin on `sql-po-agent-prod`,** so that a contained user can be created from the app's identity.
+
+   If IT agrees, §2.5, §3 and §3.4 revert to the identity-based form.
+
+**Not needed from IT (so nobody asks):**
+- **Creating the Function App, storage account, Key Vault, Application Insights and alerts** in `PO-Agent-Prod`.
+- **Enabling the app's system-assigned identity, and the vault access policy.**
+- **SQL firewall rules on the existing server.**
+- **The production contained database user:** SQL-level, as server admin.
+- **A machine in `PO-Agent-Prod` to run the SQL Server suite from** (§8.5): a VM or a container job, with a firewall rule on the SQL server.
+- **Deploying the code from Kiko's workstation with his own sign-in** (`func azure functionapp publish`).
+  - A CI pipeline deploying from GitHub with workload-identity federation would need an app registration and a role assignment. It would be a later, separate request.
 
 **DECISION (Kiko):**
 1. **Approve beyond 230 s:** option A, a write deadline (recommended), or option B, asynchronous writes, which reverses Phase 4 decision 2 (§6).
@@ -484,6 +603,7 @@ For the hosted rehearsal against Sandbox 2 (§9), the approver list is Kiko, set
     - (B) Banners addressed explicitly, so the approver knows which part is hers, with clearing staying an operator action through a sanctioned route to production.
 
     Settle "who may clear" together with the view-only question (decision 3).
+11. **Where the SQL Server test suite runs** (§8.5). First, one measured run from an Azure VM in West US 2, compared with the laptop runs. Then a VM (recommended to start), a container job, or a GitHub self-hosted runner. And whether the test database goes back to Basic for the comparison.
 
 ---
 
